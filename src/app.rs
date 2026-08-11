@@ -4,7 +4,7 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentKind, Mode,
-    session::{AgentSession, Result, SessionStatus},
+    session::{AgentSession, Result},
 };
 
 pub struct AgentEntry {
@@ -156,13 +156,6 @@ pub fn pty_size(rows: u16, cols: u16) -> PtySize {
 
 fn path_label(path: &Path) -> &str {
     path.to_str().unwrap_or("workspace")
-}
-
-pub fn status_label(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Running => "running",
-        SessionStatus::Exited => "exited",
-    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~"].concat()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 pub fn encode_key(event: KeyEvent) -> Option<Vec<u8>> {
     if event.kind == KeyEventKind::Release {
         return None;
@@ -153,5 +161,14 @@ mod tests {
             encode_key(key(KeyCode::Left, KeyModifiers::ALT)),
             Some(b"\x1b[1;3D".to_vec())
         );
+    }
+
+    #[test]
+    fn wraps_bracketed_paste() {
+        assert_eq!(
+            encode_paste("hello", true),
+            b"\x1b[200~hello\x1b[201~".to_vec()
+        );
+        assert_eq!(encode_paste("hello", false), b"hello".to_vec());
     }
 }
