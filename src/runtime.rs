@@ -298,7 +298,9 @@ impl TerminalSession {
             return Err(error.into());
         }
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        let mut session = Self { terminal };
+        session.terminal.clear()?;
+        Ok(session)
     }
 }
 
