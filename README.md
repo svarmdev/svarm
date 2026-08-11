@@ -36,7 +36,8 @@ Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, relea
 
 The Menu control at the bottom of the sidebar is also clickable. Its Keybinds and
 Settings entries work with the mouse or with arrows and Enter. Settings currently
-contains the Sele theme palettes; the selected theme lives in memory for this run only.
+contains the Sele theme palettes; the selected theme is saved in
+`$XDG_CONFIG_HOME/svarm/settings.json` (or `~/.config/svarm/settings.json`).
 
 Pasting respects the focused application's bracketed-paste mode. Mouse events requested
 by the focused application, `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through

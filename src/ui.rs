@@ -321,7 +321,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  Left/right changes theme for this run.",
+                "  Left/right changes and saves the theme.",
                 theme.muted(),
             )),
             Line::from(""),

@@ -5,6 +5,7 @@ use portable_pty::PtySize;
 use crate::{
     AgentKind, Mode,
     session::{AgentSession, Result, SessionStatus, TerminalPalette},
+    settings::{Settings, settings_path},
     theme::ThemeName,
 };
 
@@ -36,6 +37,7 @@ pub struct App {
     next_id: u64,
     pty_size: PtySize,
     terminal_palette: Option<TerminalPalette>,
+    settings_path: Option<PathBuf>,
 }
 
 impl App {
@@ -45,6 +47,17 @@ impl App {
         pty_size: PtySize,
         terminal_palette: Option<TerminalPalette>,
     ) -> Result<Self> {
+        let settings_path = settings_path();
+        let (theme, settings_error) = match settings_path.as_deref() {
+            Some(path) => match Settings::load(path) {
+                Ok(settings) => (settings.theme, None),
+                Err(error) => (
+                    ThemeName::default(),
+                    Some(format!("could not load {}: {error}", path.display())),
+                ),
+            },
+            None => (ThemeName::default(), None),
+        };
         let mut app = Self {
             agents: Vec::new(),
             selected: 0,
@@ -55,18 +68,33 @@ impl App {
             },
             sidebar_visible: true,
             menu_selected: 0,
-            theme: ThemeName::default(),
+            theme,
             notice: None,
             quit: false,
             cwd,
             next_id: 1,
             pty_size,
             terminal_palette,
+            settings_path,
         };
         if let Some(kind) = kind {
             app.spawn(kind)?;
         }
+        app.notice = settings_error;
         Ok(app)
+    }
+
+    pub fn cycle_theme(&mut self, delta: isize) {
+        self.theme.cycle(delta);
+        let Some(path) = &self.settings_path else {
+            self.notice = Some("could not save settings: HOME is not set".into());
+            return;
+        };
+        if let Err(error) = (Settings { theme: self.theme }).save(path) {
+            self.notice = Some(format!("could not save {}: {error}", path.display()));
+        } else {
+            self.notice = None;
+        }
     }
 
     pub fn spawn(&mut self, kind: AgentKind) -> Result<()> {

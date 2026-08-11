@@ -5,6 +5,7 @@ pub mod cli;
 pub mod input;
 pub mod runtime;
 pub mod session;
+pub mod settings;
 pub mod theme;
 pub mod ui;
 

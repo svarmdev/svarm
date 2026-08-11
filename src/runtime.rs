@@ -142,8 +142,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<(bool, bool)> {
             }
         }
         Mode::Settings => match key.code {
-            KeyCode::Char('h') | KeyCode::Left => app.theme.cycle(-1),
-            KeyCode::Char('l') | KeyCode::Right => app.theme.cycle(1),
+            KeyCode::Char('h') | KeyCode::Left => app.cycle_theme(-1),
+            KeyCode::Char('l') | KeyCode::Right => app.cycle_theme(1),
             KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Menu,
             _ => {}
         },

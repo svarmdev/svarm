@@ -1,8 +1,10 @@
 use ratatui::style::{Color, Modifier, Style};
+use serde::{Deserialize, Serialize};
 
-// Sele's palettes, kept local because Svarm only needs in-memory UI preferences.
+// Sele's palettes, kept local because Svarm only needs a theme preference.
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ThemeName {
     #[default]
     Dark,
