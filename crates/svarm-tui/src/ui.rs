@@ -21,7 +21,7 @@ const COMPACT_MODAL_WIDTH: u16 = 64;
 const COMPACT_MODAL_HEIGHT: u16 = 12;
 const STANDARD_MODAL_WIDTH: u16 = 72;
 const STANDARD_MODAL_HEIGHT: u16 = 18;
-pub const SIDEBAR_WIDTH: u16 = 34;
+pub const SIDEBAR_WIDTH: u16 = 28;
 const AGENT_CARD_HEIGHT: u16 = 3;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
@@ -353,9 +353,7 @@ fn render_sidebar(
             let content_width = usize::from(agents_area.width.saturating_sub(2));
             let number = format!("{} · ", index + 1);
             let title = end_truncate(
-                agent
-                    .conversation_title()
-                    .unwrap_or("Untitled conversation"),
+                agent.conversation_title().unwrap_or("Unnamed conversation"),
                 usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
             );
             let mut lines = vec![
@@ -976,7 +974,11 @@ mod tests {
     #[test]
     fn menu_hit_areas_stay_at_the_bottom_of_the_sidebar() {
         let area = Rect::new(0, 0, 120, 40);
-        assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 33, 1)));
+        assert_eq!(
+            new_agent_button_area(area, true),
+            Some(Rect::new(0, 38, 27, 1))
+        );
+        assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 27, 1)));
         assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
         assert_eq!(menu_item_at(area, 50, 36), None);
@@ -1241,7 +1243,7 @@ mod tests {
             completed_generation: if id == 2 { output_generation } else { 0 },
             terminal_sequence: TerminalSequence(0),
             read_error: None,
-            conversation_title: Some(format!("Conversation {id}")),
+            conversation_title: (id != 1).then(|| format!("Conversation {id}")),
             activity: AgentActivity::Idle,
             recognition: None,
             git: (id == 2).then_some(GitContext {
@@ -1263,12 +1265,12 @@ mod tests {
             None,
         );
         let rendered = render_app_text(&app);
-        assert!(rendered.contains("● 1 · Conversation 1"));
+        assert!(rendered.contains("● 1 · Unnamed conversation"));
         assert!(rendered.contains("● 2 · Conversation 2"));
         assert!(!rendered.contains("failed"));
         assert!(!rendered.contains("done"));
         assert!(!rendered.contains("/tmp/project-eight"));
-        assert!(rendered.contains("project-eight · feature/side…"));
+        assert!(rendered.contains("project-e… · feature/s…"));
 
         let theme = crate::theme::ThemeName::CatppuccinMocha.theme(true);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

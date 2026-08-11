@@ -23,10 +23,11 @@ use crate::{
     ipc::unix::UnixListenerGuard,
     protocol::{
         AgentActivity, AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event,
-        GitContext, LeaseToken, Message, MouseEncoding, MouseProtocol, ProtocolError,
-        ProtocolRange, RecognitionEvidence, Request, RequestId, Response, ServerCapabilities,
-        ServerInstanceId, ServerStatusSnapshot, SessionId, SessionSummary, StopSummary,
-        SvarmSessionSnapshot, TerminalDiff, TerminalFull, TerminalModes, TerminalSequence, Welcome,
+        GitContext, KeyCode, KeyInput, LeaseToken, Message, MouseEncoding, MouseProtocol,
+        ProtocolError, ProtocolRange, RecognitionEvidence, Request, RequestId, Response,
+        ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId, SessionSummary,
+        StopSummary, SvarmSessionSnapshot, TerminalDiff, TerminalFull, TerminalModes,
+        TerminalSequence, Welcome,
     },
     pty_size,
     recognition::{self, ScreenRecognition},
@@ -295,6 +296,7 @@ struct SessionRuntime {
     state: ServerSessionState,
     agents: AgentManager,
     previous: HashMap<AgentId, ObservedAgent>,
+    input_drafts: HashMap<AgentId, InputDraft>,
     git_checked: HashMap<AgentId, Instant>,
     frame_bases: HashMap<AgentId, FrameBasis>,
 }
@@ -308,6 +310,85 @@ struct ObservedAgent {
     completed_generation: u64,
     recognition: Option<RecognitionEvidence>,
     git: Option<GitContext>,
+}
+
+#[derive(Default)]
+struct InputDraft {
+    chars: Vec<char>,
+    cursor: usize,
+    title: Option<String>,
+}
+
+impl InputDraft {
+    fn apply_key(&mut self, input: &KeyInput) {
+        if self.title.is_some() {
+            return;
+        }
+        let control = input.modifiers.control;
+        let alt = input.modifiers.alt;
+        match &input.code {
+            KeyCode::Character('c') if control => self.clear(),
+            KeyCode::Character('u') if control => self.clear(),
+            KeyCode::Character('a') if control => self.cursor = 0,
+            KeyCode::Character('e') if control => self.cursor = self.chars.len(),
+            KeyCode::Character(character) if !control && !alt => self.insert(*character),
+            KeyCode::Enter if input.modifiers.shift => self.insert('\n'),
+            KeyCode::Enter => self.submit(),
+            KeyCode::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.chars.remove(self.cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.chars.len() {
+                    self.chars.remove(self.cursor);
+                }
+            }
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.chars.len()),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.chars.len(),
+            KeyCode::Up | KeyCode::Down | KeyCode::Escape => self.clear(),
+            _ => {}
+        }
+    }
+
+    fn apply_paste(&mut self, text: &str) {
+        if self.title.is_some() {
+            return;
+        }
+        for character in text.chars() {
+            self.insert(character);
+        }
+        if text.ends_with('\n') || text.ends_with('\r') {
+            self.submit();
+        }
+    }
+
+    fn insert(&mut self, character: char) {
+        self.chars.insert(self.cursor, character);
+        self.cursor += 1;
+    }
+
+    fn submit(&mut self) {
+        let title = self.chars.iter().collect::<String>();
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !title.is_empty() {
+            self.title = Some(title);
+        }
+        self.chars.clear();
+        self.cursor = 0;
+    }
+
+    fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
 }
 
 struct FrameBasis {
@@ -332,6 +413,7 @@ impl SessionRuntime {
             state,
             agents,
             previous: HashMap::new(),
+            input_drafts: HashMap::new(),
             git_checked: HashMap::new(),
             frame_bases: HashMap::new(),
         }
@@ -356,6 +438,7 @@ impl SessionRuntime {
 
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
+        self.input_drafts.insert(snapshot.id, InputDraft::default());
         let observed = self.observe(snapshot.clone(), Instant::now(), true);
         self.previous.insert(snapshot.id, observed);
         Ok(snapshot)
@@ -364,6 +447,7 @@ impl SessionRuntime {
     fn close(&mut self, id: AgentId, now_ms: u64) -> AgentResult<()> {
         self.agents.close(id)?;
         self.previous.remove(&id);
+        self.input_drafts.remove(&id);
         self.git_checked.remove(&id);
         self.frame_bases.remove(&id);
         self.state.remove_agent(id, self.agents.agent_ids(), now_ms);
@@ -446,18 +530,16 @@ impl SessionRuntime {
         let (title, screen_recognition) =
             screen.unwrap_or((String::new(), ScreenRecognition::Unknown));
         let title_recognition = recognition::recognize_title(session.kind, &title);
-        let conversation_title = if let Some(title) = title_recognition
+        // Provider titles still contribute status evidence, but thread names come from the first
+        // user message below.
+        let _ = title_recognition
             .as_ref()
-            .and_then(|recognized| recognized.conversation_title.clone())
-        {
-            Some(title)
-        } else if title.is_empty() || title_recognition.is_some() {
-            previous
-                .as_ref()
-                .and_then(|agent| agent.conversation_title.clone())
-        } else {
-            Some(title)
-        };
+            .and_then(|recognized| recognized.conversation_title.as_ref());
+        let conversation_title = self
+            .input_drafts
+            .get(&session.id)
+            .and_then(InputDraft::title)
+            .map(str::to_owned);
         let recognition = match screen_recognition {
             ScreenRecognition::Recognized(evidence) => Some(evidence),
             ScreenRecognition::Preserve => previous
@@ -517,6 +599,18 @@ impl SessionRuntime {
             keyboard_disambiguate: disambiguate,
             ..terminal_modes(screen)
         })
+    }
+
+    fn record_key(&mut self, id: AgentId, input: &KeyInput) {
+        if let Some(draft) = self.input_drafts.get_mut(&id) {
+            draft.apply_key(input);
+        }
+    }
+
+    fn record_paste(&mut self, id: AgentId, text: &str) {
+        if let Some(draft) = self.input_drafts.get_mut(&id) {
+            draft.apply_paste(text);
+        }
     }
 
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
@@ -1133,6 +1227,7 @@ impl Server {
                 let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
                 let bytes = encode_key(&event, modes).unwrap_or_default();
                 runtime.send_input(agent_id, &bytes, now)?;
+                runtime.record_key(agent_id, &event);
                 Ok(Outcome::new(Response::Ok))
             }
             Request::Paste {
@@ -1146,6 +1241,7 @@ impl Server {
                 let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
                 let bytes = encode_paste(&text, modes);
                 runtime.send_input(agent_id, &bytes, now)?;
+                runtime.record_paste(agent_id, &text);
                 Ok(Outcome::new(Response::Ok))
             }
             Request::Mouse {
@@ -1810,7 +1906,68 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshots_carry_terminal_title_recognition_and_git_context() {
+    fn first_submitted_message_becomes_the_thread_title() {
+        let mut draft = InputDraft::default();
+        for character in "  refactor   the sidebar  ".chars() {
+            draft.apply_key(&KeyInput {
+                code: KeyCode::Character(character),
+                modifiers: Default::default(),
+            });
+        }
+        draft.apply_key(&KeyInput {
+            code: KeyCode::Enter,
+            modifiers: Default::default(),
+        });
+
+        assert_eq!(draft.title(), Some("refactor the sidebar"));
+
+        draft.apply_paste("a later message");
+        assert_eq!(draft.title(), Some("refactor the sidebar"));
+    }
+
+    #[test]
+    fn empty_submissions_keep_the_thread_unnamed() {
+        let mut draft = InputDraft::default();
+        draft.apply_key(&KeyInput {
+            code: KeyCode::Enter,
+            modifiers: Default::default(),
+        });
+        assert_eq!(draft.title(), None);
+    }
+
+    #[test]
+    fn runtime_publishes_the_first_message_title_with_agent_updates() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 1"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        runtime.record_paste(snapshot.id, "name this thread");
+        runtime.record_key(
+            snapshot.id,
+            &KeyInput {
+                code: KeyCode::Enter,
+                modifiers: Default::default(),
+            },
+        );
+        let events = runtime.poll_events();
+
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("name this thread")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::AgentChanged { agent, .. }
+                if agent.conversation_title.as_deref() == Some("name this thread")
+        )));
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn runtime_snapshots_carry_activity_and_git_context() {
         let cwd = std::env::current_dir().unwrap();
         let expected_git = git::context(&cwd).unwrap();
         let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
@@ -1829,9 +1986,8 @@ mod tests {
             runtime.poll_events();
             let snapshot = runtime.snapshot();
             let agent = &snapshot.agents[0];
-            if agent.activity == AgentActivity::Working
-                && agent.conversation_title.as_deref() == Some("Initial conversation")
-            {
+            if agent.activity == AgentActivity::Working {
+                assert_eq!(agent.conversation_title, None);
                 assert_eq!(
                     agent
                         .recognition
@@ -1845,28 +2001,6 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "agent metadata was not observed");
-            thread::sleep(Duration::from_millis(5));
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let events = runtime.poll_events();
-            let snapshot = runtime.snapshot();
-            let agent = &snapshot.agents[0];
-            if agent.conversation_title.as_deref() == Some("Refactor sidebar") {
-                assert!(events.iter().any(|event| {
-                    matches!(
-                        event,
-                        Event::AgentChanged { agent, .. }
-                            if agent.conversation_title.as_deref() == Some("Refactor sidebar")
-                    )
-                }));
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "conversation title update was not observed"
-            );
             thread::sleep(Duration::from_millis(5));
         }
 
