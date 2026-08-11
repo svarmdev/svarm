@@ -401,6 +401,7 @@ pub struct TerminalFull {
     pub cols: u16,
     pub output_generation: u64,
     pub sequence: TerminalSequence,
+    #[serde(with = "crate::base64")]
     pub formatted_screen: Vec<u8>,
     pub modes: TerminalModes,
 }
@@ -413,6 +414,7 @@ pub struct TerminalDiff {
     pub output_generation: u64,
     pub base_sequence: TerminalSequence,
     pub sequence: TerminalSequence,
+    #[serde(with = "crate::base64")]
     pub formatted_changes: Vec<u8>,
     pub modes: TerminalModes,
 }

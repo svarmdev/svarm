@@ -2,6 +2,7 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+mod base64;
 pub mod framing;
 pub mod input;
 #[cfg(unix)]

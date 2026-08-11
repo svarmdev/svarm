@@ -24,6 +24,11 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 /// immediately instead of discovering the output on its next poll.
 pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
 
+/// Svarm shows only the active screen: nothing sets a scrollback offset, and frames transport the
+/// visible grid alone, so retained rows could never be displayed. They would still be copied on
+/// every frame, which is why the buffer is empty. Raise this if scrollback becomes navigable.
+const SCROLLBACK_ROWS: usize = 0;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -121,7 +126,7 @@ impl AgentSession {
         let parser = Arc::new(Mutex::new(Parser::new(
             size.rows.max(1),
             size.cols.max(1),
-            10_000,
+            SCROLLBACK_ROWS,
         )));
         let generation = Arc::new(AtomicU64::new(0));
         let read_error = Arc::new(Mutex::new(None));
@@ -161,6 +166,13 @@ impl AgentSession {
         TerminalSnapshot {
             screen: self.parser().screen().clone(),
         }
+    }
+
+    /// Reads the live screen in place. Callers that only need to measure or serialize it should
+    /// use this rather than [`Self::terminal_snapshot`]: copying the screen is the most expensive
+    /// thing on the output path, and doing it under the lock stalls the agent's reader thread.
+    pub fn with_screen<T>(&self, read: impl FnOnce(&tui_term::vt100::Screen) -> T) -> T {
+        read(self.parser().screen())
     }
 
     pub fn set_terminal_palette(&self, palette: Option<TerminalPalette>) {

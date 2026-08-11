@@ -301,6 +301,14 @@ struct FrameBasis {
     screen: Screen,
 }
 
+enum FramePayload {
+    Full(Vec<u8>),
+    Diff {
+        base_sequence: TerminalSequence,
+        bytes: Vec<u8>,
+    },
+}
+
 impl SessionRuntime {
     fn new(state: ServerSessionState, wake: Option<crate::session::OutputNotifier>) -> Self {
         let (rows, cols) = state.dimensions();
@@ -404,36 +412,47 @@ impl SessionRuntime {
 
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
         let snapshot = self.agents.snapshot(id)?;
-        let terminal = self.agents.terminal_snapshot(id)?;
-        let screen = terminal.screen();
+        let previous = self.frame_bases.get(&id).filter(|_| !force_full);
+        // Serialize against the basis and take the next basis in a single visit to the live
+        // screen, so emitting a frame costs one copy rather than a snapshot plus a basis copy.
+        let (payload, screen) = self.agents.with_screen(id, |screen| {
+            let previous = previous.filter(|basis| basis.screen.size() == screen.size());
+            let payload = match previous {
+                Some(basis) => FramePayload::Diff {
+                    base_sequence: basis.sequence,
+                    bytes: screen.state_diff(&basis.screen),
+                },
+                None => FramePayload::Full(screen.state_formatted()),
+            };
+            (payload, screen.clone())
+        })?;
+
         let (rows, cols) = screen.size();
-        let basis = self.frame_bases.get(&id);
-        let full = force_full
-            || basis.is_none()
-            || basis.is_some_and(|basis| basis.screen.size() != screen.size());
+        let modes = terminal_modes(&screen);
         let sequence = self.state.next_terminal_sequence(id).ok()?;
-        let event = if full {
-            Event::TerminalFull(TerminalFull {
+        let event = match payload {
+            FramePayload::Full(formatted_screen) => Event::TerminalFull(TerminalFull {
                 agent_id: id,
                 rows,
                 cols,
                 output_generation: snapshot.output_generation,
                 sequence,
-                formatted_screen: screen.state_formatted(),
-                modes: terminal_modes(screen),
-            })
-        } else {
-            let basis = basis.expect("non-full terminal frame has a basis");
-            Event::TerminalDiff(TerminalDiff {
+                formatted_screen,
+                modes,
+            }),
+            FramePayload::Diff {
+                base_sequence,
+                bytes,
+            } => Event::TerminalDiff(TerminalDiff {
                 agent_id: id,
                 rows,
                 cols,
                 output_generation: snapshot.output_generation,
-                base_sequence: basis.sequence,
+                base_sequence,
                 sequence,
-                formatted_changes: screen.state_diff(&basis.screen),
-                modes: terminal_modes(screen),
-            })
+                formatted_changes: bytes,
+                modes,
+            }),
         };
         let acknowledged = self
             .frame_bases
@@ -444,7 +463,7 @@ impl SessionRuntime {
             FrameBasis {
                 sequence,
                 acknowledged,
-                screen: screen.clone(),
+                screen,
             },
         );
         Some(event)

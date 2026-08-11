@@ -21,7 +21,9 @@ use svarm_agent::{
 use tui_term::vt100::{Parser, Screen};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
-const SCROLLBACK_ROWS: usize = 10_000;
+/// Mirrors the server's screen, which carries the visible grid only; see the matching constant in
+/// `svarm-agent`'s session module.
+const SCROLLBACK_ROWS: usize = 0;
 
 #[derive(Clone, Debug)]
 pub enum InitialSession {
