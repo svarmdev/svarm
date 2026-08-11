@@ -15,8 +15,8 @@ pub struct Cli {
     pub new_session: bool,
 
     /// Target a server-lifetime Svarm session ID.
-    #[arg(long, requires = "attach")]
-    pub workspace: Option<u64>,
+    #[arg(long, alias = "workspace", requires = "attach")]
+    pub session: Option<u64>,
 
     /// Deliberately disconnect an existing interactive client.
     #[arg(long, requires = "attach")]
@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub agent: Option<AgentKind>,
 
-    /// Workspace path used for creation or attach filtering.
+    /// Initial workspace for a new agent.
     pub path: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -40,13 +40,11 @@ pub enum Command {
     /// Stop one Svarm session.
     Stop {
         /// Target a server-lifetime session ID.
-        #[arg(long)]
-        workspace: Option<u64>,
+        #[arg(long, alias = "workspace")]
+        session: Option<u64>,
         /// Confirm an unambiguous ID target without a terminal prompt.
-        #[arg(long, requires = "workspace")]
+        #[arg(long, requires = "session")]
         yes: bool,
-        /// Filter sessions by canonical workspace path.
-        path: Option<PathBuf>,
     },
     /// Inspect or stop the per-user Svarm server.
     Server {
@@ -96,7 +94,7 @@ mod tests {
             "claude",
         ])
         .unwrap();
-        assert_eq!(cli.workspace, Some(17));
+        assert_eq!(cli.session, Some(17));
         assert!(cli.takeover);
         assert_eq!(cli.agent, Some(AgentKind::Claude));
     }
@@ -119,5 +117,14 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Stop { yes: true, .. })));
         let cli = Cli::try_parse_from(["svarm", "__server"]).unwrap();
         assert!(matches!(cli.command, Some(Command::InternalServer)));
+    }
+
+    #[test]
+    fn session_flag_and_hidden_workspace_alias_both_parse() {
+        let current = Cli::try_parse_from(["svarm", "--attach", "--session", "7"]).unwrap();
+        let alias = Cli::try_parse_from(["svarm", "--attach", "--workspace", "8"]).unwrap();
+
+        assert_eq!(current.session, Some(7));
+        assert_eq!(alias.session, Some(8));
     }
 }

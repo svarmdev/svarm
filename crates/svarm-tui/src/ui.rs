@@ -151,7 +151,7 @@ pub(crate) fn render_session_chooser(
 fn session_row(
     session: &svarm_agent::protocol::SessionSummary,
     now_ms: u64,
-    width: u16,
+    _width: u16,
     theme: Theme,
 ) -> Line<'static> {
     let state = if session.attachment.is_some() {
@@ -160,22 +160,6 @@ fn session_row(
         "detached"
     };
     let age = format_age(now_ms.saturating_sub(session.last_user_activity_ms));
-    let fixed = format!(
-        "{}  {}  {}/{} running  {}  ",
-        session.id.0, state, session.running_agents, session.total_agents, age
-    );
-    let available = usize::from(width).saturating_sub(fixed.chars().count());
-    let separator_width = available.min(2);
-    let content_width = available.saturating_sub(separator_width);
-    let name_width = session
-        .display_name
-        .chars()
-        .count()
-        .min(16)
-        .min(content_width);
-    let path_width = content_width.saturating_sub(name_width);
-    let name = middle_truncate(&session.display_name, name_width);
-    let path = middle_truncate(&session.canonical_path.display().to_string(), path_width);
     Line::from(vec![
         Span::styled(format!("{}  ", session.id.0), accent(theme)),
         Span::styled(
@@ -189,27 +173,7 @@ fn session_row(
                 theme.muted()
             },
         ),
-        Span::styled(name, text(theme)),
-        Span::raw(" ".repeat(separator_width)),
-        Span::styled(path, theme.muted()),
     ])
-}
-
-fn middle_truncate(value: &str, width: usize) -> String {
-    let characters = value.chars().collect::<Vec<_>>();
-    if characters.len() <= width {
-        return value.to_owned();
-    }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let left = (width - 1) / 2;
-    let right = width - 1 - left;
-    characters[..left]
-        .iter()
-        .chain(['…'].iter())
-        .chain(characters[characters.len() - right..].iter())
-        .collect()
 }
 
 fn format_age(age_ms: u64) -> String {
@@ -281,10 +245,7 @@ fn menu_popup_area(button: Rect) -> Rect {
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let title = Line::from(vec![
-        Span::styled(" svarm", accent(theme).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {} ", app.workspace_name()), theme.muted()),
-    ]);
+    let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
     let block = Block::new()
         .title(title)
         .borders(Borders::TOP | Borders::RIGHT)
@@ -321,10 +282,23 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                 (_, true) => warning(theme),
                 _ => success(theme),
             };
+            let fixed_width = 3
+                + (index + 1).to_string().chars().count()
+                + 1
+                + agent.kind().label().chars().count()
+                + 3
+                + 1
+                + marker.chars().count();
+            let workspace = end_truncate(
+                &agent.workspace_name(),
+                usize::from(agents_area.width).saturating_sub(fixed_width),
+            );
             let mut line = Line::from(vec![
                 Span::styled(if selected { " ▌ " } else { "   " }, accent(theme)),
                 Span::styled(format!("{} ", index + 1), theme.muted()),
                 Span::styled(agent.kind().label(), text(theme)),
+                Span::styled(" · ", theme.muted()),
+                Span::styled(workspace, theme.muted()),
                 Span::raw(" "),
                 Span::styled(marker, status_style),
             ]);
@@ -361,6 +335,16 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .style(button_style),
         button,
     );
+}
+
+fn end_truncate(value: &str, width: usize) -> String {
+    let mut characters = value.chars();
+    let mut truncated = characters.by_ref().take(width).collect::<String>();
+    if characters.next().is_some() && width > 0 {
+        truncated.pop();
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -455,11 +439,6 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let session = app
         .session_id()
         .map_or_else(|| "local".into(), |id| id.0.to_string());
-    let path = app.workspace_path().map_or_else(
-        || app.workspace_name().into(),
-        |path| path.display().to_string(),
-    );
-    let path = middle_truncate(&path, 58);
     let running = app
         .agents()
         .iter()
@@ -470,15 +449,13 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         theme,
         " Stop Svarm session? ",
         64,
-        9,
+        8,
         vec![
             Line::from(""),
             Line::from(Span::styled(
                 format!("  Session {session} · {running} running agents"),
                 warning(theme),
             )),
-            Line::from(format!("  {path}")),
-            Line::from(""),
             Line::from("  This terminates every agent in the session."),
             Line::from(""),
             Line::from("  [y] Stop session    [Esc] Cancel"),
@@ -672,10 +649,6 @@ mod tests {
         let chooser = SessionChooser::new(
             vec![SessionSummary {
                 id: SessionId(42),
-                canonical_path: PathBuf::from(
-                    "/a/very/long/workspace/path/that/must/be/middle/truncated/project",
-                ),
-                display_name: "project-with-an-extremely-long-display-name".into(),
                 running_agents: 1,
                 total_agents: 2,
                 attachment: Some(AttachmentSummary {
@@ -712,7 +685,6 @@ mod tests {
         assert!(rendered.contains("Open Svarm session"));
         assert!(rendered.contains("42"));
         assert!(rendered.contains("attached"));
-        assert!(rendered.contains('…'));
         assert!(rendered.contains("[Enter] open  [j/k] select  [Esc] cancel  [n] new"));
     }
 
@@ -739,8 +711,6 @@ mod tests {
     fn stop_confirmation_names_target_and_running_agents_at_80x24() {
         let summary = SessionSummary {
             id: SessionId(7),
-            canonical_path: PathBuf::from("/tmp/project-seven"),
-            display_name: "project-seven".into(),
             running_agents: 1,
             total_agents: 1,
             attachment: None,
@@ -750,7 +720,7 @@ mod tests {
         let agent = AgentSnapshot {
             id: svarm_agent::AgentId::new(1),
             kind: svarm_agent::AgentKind::Codex,
-            launch_directory: summary.canonical_path.clone(),
+            launch_directory: PathBuf::from("/tmp/project-seven"),
             status: SessionStatus::Running,
             exit: None,
             output_generation: 0,
@@ -773,7 +743,7 @@ mod tests {
         app.set_mode(Mode::ConfirmQuit);
         let rendered = render_app_text(&app);
         assert!(rendered.contains("Session 7 · 1 running agents"));
-        assert!(rendered.contains("/tmp/project-seven"));
+        assert!(!rendered.contains("/tmp/project-seven"));
         assert!(rendered.contains("terminates every agent"));
     }
 
@@ -781,8 +751,6 @@ mod tests {
     fn reattached_exit_and_unseen_states_have_monochrome_symbols() {
         let summary = SessionSummary {
             id: SessionId(8),
-            canonical_path: PathBuf::from("/tmp/project-eight"),
-            display_name: "project-eight".into(),
             running_agents: 1,
             total_agents: 2,
             attachment: None,
@@ -792,7 +760,7 @@ mod tests {
         let agent = |id, status, output_generation, seen_generation| AgentSnapshot {
             id: svarm_agent::AgentId::new(id),
             kind: svarm_agent::AgentKind::Codex,
-            launch_directory: summary.canonical_path.clone(),
+            launch_directory: PathBuf::from("/tmp/project-eight"),
             status,
             exit: None,
             output_generation,

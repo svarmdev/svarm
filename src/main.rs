@@ -8,11 +8,9 @@ use clap::Parser;
 use svarm_agent::{
     Result, logging,
     paths::RuntimePaths,
-    protocol::{
-        ConnectionRole, Request, Response, SessionId, SessionSummary, SessionTarget, StopSummary,
-    },
+    protocol::{ConnectionRole, Request, Response, SessionId, SessionSummary, StopSummary},
 };
-use svarm_tui::{InitialSession, StartupChoice};
+use svarm_tui::{InitialAgentRequest, InitialSession, StartupChoice};
 
 mod cli;
 mod client;
@@ -22,7 +20,7 @@ use cli::{Cli, Command, ServerCommand};
 use client::{ControlClient, Probe};
 
 const NONINTERACTIVE_CHOICE_ERROR: &str =
-    "session choice requires a terminal; use `--attach --workspace ID` or `--new-session`";
+    "session choice requires a terminal; use `--attach --session ID` or `--new-session`";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -46,11 +44,7 @@ fn main() -> Result<()> {
             command: ServerCommand::Stop { yes },
         }) => stop_server(&paths, yes),
         Some(Command::List) => list_sessions(&paths),
-        Some(Command::Stop {
-            workspace,
-            yes,
-            path,
-        }) => stop_session(&paths, workspace, path, yes),
+        Some(Command::Stop { session, yes }) => stop_session(&paths, session, yes),
         None => launch(&paths, cli),
     };
     if !internal_server {
@@ -69,54 +63,42 @@ fn main() -> Result<()> {
 fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {
     server_start::ensure_server(paths)?;
     let sessions = running_sessions(paths)?;
-    let requested_path = requested_path(&cli)?;
+    let initial_agent = InitialAgentRequest {
+        kind: cli.agent,
+        workspace: requested_workspace(&cli)?,
+    };
     let target = if cli.new_session {
-        InitialSession::Create(requested_path.expect("new sessions require a workspace path"))
+        InitialSession::Create
     } else if cli.attach {
-        if let Some(id) = cli.workspace {
+        if let Some(id) = cli.session {
             InitialSession::Attach {
                 session_id: SessionId(id),
                 takeover: cli.takeover,
             }
         } else {
-            let eligible = if let Some(requested_path) = requested_path.as_deref() {
-                sessions_for_path(sessions, requested_path)
-            } else {
-                sessions
-            };
-            let Some(target) =
-                select_launch_target(eligible, false, requested_path.as_deref(), cli.takeover)?
-            else {
+            let Some(target) = select_launch_target(sessions, false, cli.takeover)? else {
                 return Ok(());
             };
             target
         }
     } else if sessions.is_empty() {
-        InitialSession::Create(requested_path.expect("normal startup requires a workspace path"))
+        InitialSession::Create
     } else {
-        let Some(target) = select_launch_target(sessions, true, requested_path.as_deref(), false)?
-        else {
+        let Some(target) = select_launch_target(sessions, true, false)? else {
             return Ok(());
         };
         target
     };
-    svarm_tui::run(cli.agent, paths.socket.clone(), target)
+    svarm_tui::run(initial_agent, paths.socket.clone(), target)
 }
 
 fn select_launch_target(
     sessions: Vec<SessionSummary>,
     allow_new: bool,
-    requested_path: Option<&Path>,
     takeover: bool,
 ) -> Result<Option<InitialSession>> {
     match discovery_route(&sessions, allow_new) {
-        DiscoveryRoute::Create => {
-            return Ok(Some(InitialSession::Create(
-                requested_path
-                    .expect("create route requires a workspace path")
-                    .to_owned(),
-            )));
-        }
+        DiscoveryRoute::Create => return Ok(Some(InitialSession::Create)),
         DiscoveryRoute::Attach(session_id) => {
             return Ok(Some(InitialSession::Attach {
                 session_id,
@@ -135,20 +117,13 @@ fn select_launch_target(
             session_id,
             takeover,
         })),
-        StartupChoice::NewSession => Ok(Some(InitialSession::Create(
-            requested_path
-                .expect("new-session choice requires a workspace path")
-                .to_owned(),
-        ))),
+        StartupChoice::NewSession => Ok(Some(InitialSession::Create)),
         StartupChoice::Cancel => Ok(None),
     }
 }
 
-fn requested_path(cli: &Cli) -> Result<Option<PathBuf>> {
-    if cli.attach && (cli.workspace.is_some() || cli.path.is_none()) {
-        return Ok(None);
-    }
-    canonicalize(cli.path.as_deref().unwrap_or_else(|| Path::new("."))).map(Some)
+fn requested_workspace(cli: &Cli) -> Result<Option<PathBuf>> {
+    cli.path.as_deref().map(canonicalize).transpose()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,56 +157,42 @@ fn list_sessions(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
-fn stop_session(
-    paths: &RuntimePaths,
-    workspace: Option<u64>,
-    path: Option<PathBuf>,
-    yes: bool,
-) -> Result<()> {
+fn stop_session(paths: &RuntimePaths, session: Option<u64>, yes: bool) -> Result<()> {
     if ControlClient::probe(&paths.socket)?.is_none() {
         return Err("no running Svarm sessions".into());
     }
     let sessions = running_sessions(paths)?;
-    let target = if let Some(id) = workspace {
+    let target = if let Some(id) = session {
         sessions
             .iter()
             .find(|session| session.id == SessionId(id))
             .cloned()
             .ok_or("Svarm session was not found")?
     } else {
-        let path = canonicalize(path.as_deref().unwrap_or_else(|| Path::new(".")))?;
-        let eligible = sessions_for_path(sessions, &path);
-        match eligible.as_slice() {
-            [session] => session.clone(),
-            [] => return Err("no Svarm session uses that workspace path".into()),
-            _ if !io::stdin().is_terminal() || !io::stdout().is_terminal() => {
-                print_session_summaries(&eligible);
-                return Err("multiple sessions match; use `svarm stop --workspace ID`".into());
-            }
-            _ => match svarm_tui::choose_session(eligible.clone(), false)? {
-                StartupChoice::Session(id) => eligible
-                    .into_iter()
-                    .find(|session| session.id == id)
-                    .expect("chooser returns an eligible session"),
-                StartupChoice::Cancel => return Ok(()),
-                StartupChoice::NewSession => unreachable!("stop chooser cannot create"),
-            },
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            print_session_summaries(&sessions);
+            return Err("choose a session with `svarm stop --session ID`".into());
+        }
+        match svarm_tui::choose_session(sessions.clone(), false)? {
+            StartupChoice::Session(id) => sessions
+                .into_iter()
+                .find(|session| session.id == id)
+                .expect("chooser returns a listed session"),
+            StartupChoice::Cancel => return Ok(()),
+            StartupChoice::NewSession => unreachable!("stop chooser cannot create"),
         }
     };
     if !yes
         && !confirm(&format!(
-            "Stop Svarm session {} at {} and terminate {} running agents ({} total)?",
-            target.id.0,
-            target.canonical_path.display(),
-            target.running_agents,
-            target.total_agents
+            "Stop Svarm session {} and terminate {} running agents ({} total)?",
+            target.id.0, target.running_agents, target.total_agents
         ))?
     {
         return Ok(());
     }
     let mut client = ControlClient::connect(&paths.socket, ConnectionRole::Control)?;
     match client.request(Request::StopSession {
-        target: SessionTarget::Id(target.id),
+        session_id: target.id,
         confirmed: true,
     })? {
         Response::Stopped(summary) => print_stop_summary(summary),
@@ -330,29 +291,20 @@ fn running_sessions(paths: &RuntimePaths) -> Result<Vec<SessionSummary>> {
     }
 }
 
-fn sessions_for_path(sessions: Vec<SessionSummary>, path: &Path) -> Vec<SessionSummary> {
-    sessions
-        .into_iter()
-        .filter(|session| session.canonical_path == path)
-        .collect()
-}
-
 fn print_session_summaries(sessions: &[SessionSummary]) {
     let now = unix_time_ms();
     for session in sessions {
         println!(
-            "{}  {}  {}/{} running  {}  {}  {}",
+            "{}  {}  {}/{} running  {}",
             session.id.0,
-            session.display_name,
-            session.running_agents,
-            session.total_agents,
             if session.attachment.is_some() {
                 "attached"
             } else {
                 "detached"
             },
-            format_age(now.saturating_sub(session.last_user_activity_ms)),
-            session.canonical_path.display()
+            session.running_agents,
+            session.total_agents,
+            format_age(now.saturating_sub(session.last_user_activity_ms))
         );
     }
 }
@@ -395,7 +347,7 @@ fn confirm(prompt: &str) -> Result<bool> {
 fn canonicalize(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|error| {
         format!(
-            "could not resolve workspace {}: {error}; use `svarm list` and target an existing session by ID",
+            "could not resolve agent workspace {}: {error}",
             path.display()
         )
         .into()
@@ -451,49 +403,29 @@ mod tests {
     }
 
     #[test]
-    fn path_filter_keeps_duplicate_path_sessions_distinct() {
-        let shared = PathBuf::from("/tmp/shared");
-        let mut first = summary(1);
-        first.canonical_path = shared.clone();
-        let mut second = summary(2);
-        second.canonical_path = shared.clone();
-
-        let eligible = sessions_for_path(vec![first, summary(3), second], &shared);
-        assert_eq!(
-            eligible
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            vec![SessionId(1), SessionId(2)]
-        );
-        assert_eq!(discovery_route(&eligible, false), DiscoveryRoute::Choose);
-    }
-
-    #[test]
     fn noninteractive_choice_error_names_both_deterministic_remedies() {
-        assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--attach --workspace ID"));
+        assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--attach --session ID"));
         assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--new-session"));
     }
 
     #[test]
-    fn direct_id_attach_does_not_resolve_an_irrelevant_path() {
+    fn explicit_path_is_an_agent_workspace_even_for_id_attachment() {
+        let workspace = std::env::current_dir().unwrap();
         let cli = Cli::try_parse_from([
             "svarm",
             "--attach",
-            "--workspace",
+            "--session",
             "7",
-            "/path/that/does/not/exist",
+            workspace.to_str().unwrap(),
         ])
         .unwrap();
 
-        assert_eq!(requested_path(&cli).unwrap(), None);
+        assert_eq!(requested_workspace(&cli).unwrap(), Some(workspace));
     }
 
     fn summary(id: u64) -> SessionSummary {
         SessionSummary {
             id: SessionId(id),
-            canonical_path: PathBuf::from(format!("/tmp/project-{id}")),
-            display_name: format!("project-{id}"),
             running_agents: 0,
             total_agents: 0,
             attachment: None,

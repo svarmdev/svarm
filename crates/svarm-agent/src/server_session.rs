@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
 
 use crate::{
     AgentId, TerminalPalette,
@@ -31,8 +31,6 @@ struct AgentState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerSessionState {
     id: SessionId,
-    canonical_path: PathBuf,
-    display_name: String,
     selected_agent_id: Option<AgentId>,
     agents: BTreeMap<AgentId, AgentState>,
     rows: u16,
@@ -47,22 +45,14 @@ pub struct ServerSessionState {
 impl ServerSessionState {
     pub fn new(
         id: SessionId,
-        canonical_path: PathBuf,
         rows: u16,
         cols: u16,
         terminal_palette: Option<TerminalPalette>,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
         validate_dimensions(rows, cols)?;
-        let display_name = canonical_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_else(|| canonical_path.to_str().unwrap_or("workspace"))
-            .to_owned();
         Ok(Self {
             id,
-            canonical_path,
-            display_name,
             selected_agent_id: None,
             agents: BTreeMap::new(),
             rows,
@@ -260,8 +250,6 @@ impl ServerSessionState {
     pub fn summary(&self, running_agents: usize, total_agents: usize) -> SessionSummary {
         SessionSummary {
             id: self.id,
-            canonical_path: self.canonical_path.clone(),
-            display_name: self.display_name.clone(),
             running_agents,
             total_agents,
             attachment: self.attachment.as_ref().map(|lease| AttachmentSummary {
@@ -277,10 +265,6 @@ impl ServerSessionState {
 
     pub const fn id(&self) -> SessionId {
         self.id
-    }
-
-    pub fn canonical_path(&self) -> &PathBuf {
-        &self.canonical_path
     }
 
     pub const fn selected_agent_id(&self) -> Option<AgentId> {
@@ -360,15 +344,7 @@ mod tests {
     use super::*;
 
     fn session(id: u64) -> ServerSessionState {
-        ServerSessionState::new(
-            SessionId(id),
-            PathBuf::from(format!("/tmp/project-{id}")),
-            24,
-            80,
-            None,
-            10,
-        )
-        .unwrap()
+        ServerSessionState::new(SessionId(id), 24, 80, None, 10).unwrap()
     }
 
     #[test]
@@ -473,7 +449,7 @@ mod tests {
     #[test]
     fn zero_dimensions_are_rejected_before_reaching_pty_code() {
         assert_eq!(
-            ServerSessionState::new(SessionId(1), "/tmp".into(), 0, 80, None, 0)
+            ServerSessionState::new(SessionId(1), 0, 80, None, 0)
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidDimensions

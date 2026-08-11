@@ -27,11 +27,17 @@ const SCROLLBACK_ROWS: usize = 0;
 
 #[derive(Clone, Debug)]
 pub enum InitialSession {
-    Create(PathBuf),
+    Create,
     Attach {
         session_id: SessionId,
         takeover: bool,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InitialAgentRequest {
+    pub kind: Option<AgentKind>,
+    pub workspace: Option<PathBuf>,
 }
 
 pub(crate) enum RemoteUpdate {
@@ -117,8 +123,7 @@ impl RemoteAgents {
         }
 
         let request = match target {
-            InitialSession::Create(canonical_path) => Request::CreateSession {
-                canonical_path,
+            InitialSession::Create => Request::CreateSession {
                 rows,
                 cols,
                 palette,

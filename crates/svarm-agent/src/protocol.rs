@@ -109,13 +109,6 @@ pub struct Welcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "target", content = "value", rename_all = "snake_case")]
-pub enum SessionTarget {
-    Id(SessionId),
-    CanonicalPath(PathBuf),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     AttachSession {
@@ -126,7 +119,6 @@ pub enum Request {
         takeover: bool,
     },
     CreateSession {
-        canonical_path: PathBuf,
         rows: u16,
         cols: u16,
         palette: Option<TerminalPalette>,
@@ -193,10 +185,10 @@ pub enum Request {
     ServerStatus,
     ListSessions,
     GetSession {
-        target: SessionTarget,
+        session_id: SessionId,
     },
     StopSession {
-        target: SessionTarget,
+        session_id: SessionId,
         confirmed: bool,
     },
     StopServer {
@@ -327,8 +319,6 @@ pub struct AttachmentSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,
-    pub canonical_path: PathBuf,
-    pub display_name: String,
     pub running_agents: usize,
     pub total_agents: usize,
     pub attachment: Option<AttachmentSummary>,
@@ -512,7 +502,6 @@ pub struct StopSummary {
 pub enum ErrorCode {
     IncompatibleProtocol,
     SessionNotFound,
-    SessionTargetAmbiguous,
     SessionAlreadyAttached,
     SessionStopped,
     AgentNotFound,
@@ -611,6 +600,34 @@ mod tests {
                 "lease_token": "lease",
                 "kind": "codex",
                 "launch_directory": "/tmp/workspace"
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_three_session_requests_are_workspace_neutral_and_id_targeted() {
+        assert_eq!(
+            serde_json::to_value(Request::CreateSession {
+                rows: 24,
+                cols: 80,
+                palette: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "request": "create_session",
+                "rows": 24,
+                "cols": 80,
+                "palette": null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Request::GetSession {
+                session_id: SessionId(7),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "request": "get_session",
+                "session_id": 7
             })
         );
     }

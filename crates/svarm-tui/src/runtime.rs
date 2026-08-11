@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerEvent};
 
 use crate::{
-    agents::{ClientEvent, InitialSession, RemoteAgents, RemoteUpdate},
+    agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
     app::{App, ExitIntent, MenuItem, Mode},
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     settings::SettingsStore,
@@ -17,8 +17,11 @@ use crate::{
 
 const EVENT_QUEUE: usize = 1_024;
 
-pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession) -> Result<()> {
-    let target = canonicalize_target(target)?;
+pub fn run(
+    initial_agent: InitialAgentRequest,
+    socket_path: PathBuf,
+    target: InitialSession,
+) -> Result<()> {
     let palette = TerminalPalette::detect();
     let colors_enabled = colors_enabled();
     let settings = SettingsStore::discover();
@@ -35,11 +38,10 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
         events_tx.clone(),
     )?;
     let mut app = App::hydrate(snapshot, theme, settings_notice);
-    if let Some(kind) = kind {
-        let launch_directory = app
-            .workspace_path()
-            .cloned()
-            .ok_or("new session did not provide an agent workspace")?;
+    if let Some(workspace) = initial_agent.workspace.clone() {
+        app.set_workspace_hint(workspace);
+    }
+    if let (Some(kind), Some(launch_directory)) = (initial_agent.kind, initial_agent.workspace) {
         agents.spawn(kind, launch_directory)?;
     }
 
@@ -103,21 +105,6 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
         ExitIntent::None => {}
     }
     Ok(())
-}
-
-fn canonicalize_target(target: InitialSession) -> Result<InitialSession> {
-    match target {
-        InitialSession::Create(path) => {
-            let canonical = path.canonicalize().map_err(|error| {
-                format!(
-                    "could not open workspace {}: {error}",
-                    path.to_string_lossy()
-                )
-            })?;
-            Ok(InitialSession::Create(canonical))
-        }
-        target => Ok(target),
-    }
 }
 
 fn handle_host_event(
@@ -427,7 +414,7 @@ fn connection_failure_message(reason: &str, session_id: u64) -> String {
         first_line.push('…');
     }
     format!(
-        "{first_line}\nAgents may still be running.\nReattach: svarm --attach --workspace {session_id}"
+        "{first_line}\nAgents may still be running.\nReattach: svarm --attach --session {session_id}"
     )
 }
 
@@ -457,7 +444,7 @@ mod tests {
     fn connection_notices_fit_at_80_columns_and_include_reattach_command() {
         let message = connection_failure_message(&"connection lost ".repeat(20), 42);
         assert!(message.lines().all(|line| line.chars().count() <= 80));
-        assert!(message.contains("Reattach: svarm --attach --workspace 42"));
+        assert!(message.contains("Reattach: svarm --attach --session 42"));
 
         let revoked = connection_failure_message(
             "another client explicitly took over this Svarm session",

@@ -158,6 +158,7 @@ impl MenuItem {
 pub(crate) struct AgentState {
     id: AgentId,
     kind: AgentKind,
+    launch_directory: PathBuf,
     status: SessionStatus,
     output_generation: u64,
     seen_generation: u64,
@@ -169,6 +170,7 @@ impl AgentState {
         Self {
             id: snapshot.id,
             kind: snapshot.kind,
+            launch_directory: snapshot.launch_directory.clone(),
             status: snapshot.status,
             output_generation: snapshot.output_generation,
             seen_generation: snapshot.output_generation,
@@ -179,6 +181,7 @@ impl AgentState {
         Self {
             id: snapshot.id,
             kind: snapshot.kind,
+            launch_directory: snapshot.launch_directory.clone(),
             status: snapshot.status,
             output_generation: snapshot.output_generation,
             seen_generation: snapshot.seen_generation,
@@ -187,16 +190,20 @@ impl AgentState {
 
     #[cfg(test)]
     fn update(&mut self, snapshot: &SessionSnapshot) -> bool {
-        let changed =
-            self.status != snapshot.status || self.output_generation != snapshot.output_generation;
+        let changed = self.status != snapshot.status
+            || self.output_generation != snapshot.output_generation
+            || self.launch_directory != snapshot.launch_directory;
+        self.launch_directory = snapshot.launch_directory.clone();
         self.status = snapshot.status;
         self.output_generation = snapshot.output_generation;
         changed
     }
 
     fn update_remote(&mut self, snapshot: &AgentSnapshot) -> bool {
-        let changed =
-            self.status != snapshot.status || self.output_generation != snapshot.output_generation;
+        let changed = self.status != snapshot.status
+            || self.output_generation != snapshot.output_generation
+            || self.launch_directory != snapshot.launch_directory;
+        self.launch_directory = snapshot.launch_directory.clone();
         self.status = snapshot.status;
         self.output_generation = snapshot.output_generation;
         self.seen_generation = self.seen_generation.max(snapshot.seen_generation);
@@ -219,6 +226,14 @@ impl AgentState {
         self.kind
     }
 
+    pub fn workspace_name(&self) -> String {
+        self.launch_directory
+            .file_name()
+            .unwrap_or(self.launch_directory.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub const fn status(&self) -> SessionStatus {
         self.status
     }
@@ -237,7 +252,6 @@ pub(crate) struct App {
     theme: ThemeName,
     notice: Option<String>,
     exit_intent: ExitIntent,
-    workspace_name: String,
     session_id: Option<SessionId>,
     workspace_path: Option<PathBuf>,
 }
@@ -245,7 +259,7 @@ pub(crate) struct App {
 impl App {
     #[cfg(test)]
     pub fn new(
-        workspace_name: String,
+        _workspace_name: String,
         theme: ThemeName,
         choose_agent: bool,
         notice: Option<String>,
@@ -263,7 +277,6 @@ impl App {
             theme,
             notice,
             exit_intent: ExitIntent::None,
-            workspace_name,
             session_id: None,
             workspace_path: None,
         }
@@ -278,6 +291,10 @@ impl App {
             .selected_agent_id
             .and_then(|id| snapshot.agents.iter().position(|agent| agent.id == id))
             .unwrap_or(0);
+        let workspace_path = snapshot
+            .agents
+            .get(selected)
+            .map(|agent| agent.launch_directory.clone());
         Self {
             agents: snapshot
                 .agents
@@ -291,9 +308,8 @@ impl App {
             theme,
             notice,
             exit_intent: ExitIntent::None,
-            workspace_name: snapshot.summary.display_name,
             session_id: Some(snapshot.summary.id),
-            workspace_path: Some(snapshot.summary.canonical_path),
+            workspace_path,
         }
     }
 
@@ -467,16 +483,16 @@ impl App {
         self.exit_intent
     }
 
-    pub fn workspace_name(&self) -> &str {
-        &self.workspace_name
-    }
-
     pub const fn session_id(&self) -> Option<SessionId> {
         self.session_id
     }
 
     pub fn workspace_path(&self) -> Option<&PathBuf> {
         self.workspace_path.as_ref()
+    }
+
+    pub fn set_workspace_hint(&mut self, path: PathBuf) {
+        self.workspace_path = Some(path);
     }
 }
 
@@ -582,7 +598,7 @@ mod tests {
         assert_eq!(app.mode(), Mode::Terminal);
         assert!(app.sidebar_visible());
         assert_eq!(app.exit_intent(), ExitIntent::None);
-        assert_eq!(app.workspace_path(), Some(&PathBuf::from("/tmp/project-7")));
+        assert_eq!(app.workspace_path(), Some(&PathBuf::from("/tmp")));
         assert!(app.agents()[1].has_unseen_output());
     }
 
@@ -638,8 +654,6 @@ mod tests {
     fn summary(id: u64, activity: u64) -> SessionSummary {
         SessionSummary {
             id: SessionId(id),
-            canonical_path: PathBuf::from(format!("/tmp/project-{id}")),
-            display_name: format!("project-{id}"),
             running_agents: 1,
             total_agents: 1,
             attachment: None,

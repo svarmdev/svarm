@@ -24,8 +24,8 @@ use crate::{
         AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event, LeaseToken,
         Message, MouseEncoding, MouseProtocol, ProtocolError, ProtocolRange, Request, RequestId,
         Response, ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId,
-        SessionSummary, SessionTarget, StopSummary, SvarmSessionSnapshot, TerminalDiff,
-        TerminalFull, TerminalModes, TerminalSequence, Welcome,
+        SessionSummary, StopSummary, SvarmSessionSnapshot, TerminalDiff, TerminalFull,
+        TerminalModes, TerminalSequence, Welcome,
     },
     pty_size,
     server_session::{ServerSessionState, sort_session_summaries},
@@ -787,11 +787,10 @@ impl Server {
         self.check_role(id, &request)?;
         match request {
             Request::CreateSession {
-                canonical_path,
                 rows,
                 cols,
                 palette,
-            } => self.create_session(id, canonical_path, rows, cols, palette),
+            } => self.create_session(id, rows, cols, palette),
             Request::AttachSession {
                 session_id,
                 rows,
@@ -972,15 +971,19 @@ impl Server {
                 sort_session_summaries(&mut sessions);
                 Ok(Outcome::new(Response::Sessions { sessions }))
             }
-            Request::GetSession { target } => {
-                let session_id = self.resolve_target(target)?;
+            Request::GetSession { session_id } => {
+                let runtime = self.sessions.get(&session_id).ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::SessionNotFound, "Svarm session was not found")
+                })?;
                 Ok(Outcome::new(Response::Session {
-                    session: Some(self.sessions[&session_id].snapshot()),
+                    session: Some(runtime.snapshot()),
                 }))
             }
-            Request::StopSession { target, confirmed } => {
+            Request::StopSession {
+                session_id,
+                confirmed,
+            } => {
                 require_confirmation(confirmed)?;
-                let session_id = self.resolve_target(target)?;
                 self.stop_session_runtime(session_id, Some(id))
             }
             Request::StopServer { confirmed } => {
@@ -1059,7 +1062,6 @@ impl Server {
     fn create_session(
         &mut self,
         id: ConnectionId,
-        path: PathBuf,
         rows: u16,
         cols: u16,
         palette: Option<crate::TerminalPalette>,
@@ -1070,7 +1072,6 @@ impl Server {
                 "connection is already attached to a Svarm session",
             ));
         }
-        let canonical_path = canonicalize(&path)?;
         let session_id = SessionId(self.next_session_id);
         self.next_session_id = self
             .next_session_id
@@ -1078,7 +1079,7 @@ impl Server {
             .ok_or_else(|| ProtocolError::new(ErrorCode::InternalError, "session IDs exhausted"))?;
         let now = self.now_ms();
         let mut runtime = SessionRuntime::new(
-            ServerSessionState::new(session_id, canonical_path, rows, cols, palette, now)?,
+            ServerSessionState::new(session_id, rows, cols, palette, now)?,
             Some(self.output_wake.notifier()),
         );
         let token = self.lease_token();
@@ -1255,37 +1256,6 @@ impl Server {
         })?;
         self.sessions[&session_id].state.validate_lease(token)?;
         Ok(session_id)
-    }
-
-    fn resolve_target(&self, target: SessionTarget) -> Result<SessionId, ProtocolError> {
-        match target {
-            SessionTarget::Id(id) if self.sessions.contains_key(&id) => Ok(id),
-            SessionTarget::Id(_) => Err(ProtocolError::new(
-                ErrorCode::SessionNotFound,
-                "Svarm session was not found",
-            )),
-            SessionTarget::CanonicalPath(path) => {
-                let path = canonicalize(&path)?;
-                let matches = self
-                    .sessions
-                    .iter()
-                    .filter_map(|(id, runtime)| {
-                        (runtime.state.canonical_path() == &path).then_some(*id)
-                    })
-                    .collect::<Vec<_>>();
-                match matches.as_slice() {
-                    [id] => Ok(*id),
-                    [] => Err(ProtocolError::new(
-                        ErrorCode::SessionNotFound,
-                        "no Svarm session uses that canonical workspace path",
-                    )),
-                    _ => Err(ProtocolError::new(
-                        ErrorCode::SessionTargetAmbiguous,
-                        "multiple Svarm sessions use that workspace path; target a session ID",
-                    )),
-                }
-            }
-        }
     }
 
     fn poll_sessions(&mut self) {
@@ -1549,18 +1519,6 @@ fn require_confirmation(confirmed: bool) -> Result<(), ProtocolError> {
     }
 }
 
-fn canonicalize(path: &Path) -> Result<PathBuf, ProtocolError> {
-    path.canonicalize().map_err(|error| {
-        ProtocolError::new(
-            ErrorCode::SessionNotFound,
-            format!(
-                "could not resolve workspace {}: {error}; use `svarm list` and target an existing session by ID",
-                path.display()
-            ),
-        )
-    })
-}
-
 fn canonicalize_agent_directory(path: &Path) -> Result<PathBuf, ProtocolError> {
     let canonical = path.canonicalize().map_err(|error| {
         ProtocolError::new(
@@ -1749,7 +1707,6 @@ mod tests {
 
         let mut client = Client::connect(&socket, ConnectionRole::Interactive);
         let (_, created) = client.request(Request::CreateSession {
-            canonical_path: directory.clone(),
             rows: 10,
             cols: 40,
             palette: None,
@@ -1787,9 +1744,7 @@ mod tests {
         }
 
         let mut control = Client::connect(&socket, ConnectionRole::Control);
-        let (_, response) = control.request(Request::GetSession {
-            target: SessionTarget::Id(session_id),
-        });
+        let (_, response) = control.request(Request::GetSession { session_id });
         let Response::Session {
             session: Some(snapshot),
         } = response
@@ -1822,7 +1777,6 @@ mod tests {
 
         let mut client = Client::connect(&socket, ConnectionRole::Interactive);
         let (_, created) = client.request(Request::CreateSession {
-            canonical_path: directory.clone(),
             rows: 10,
             cols: 40,
             palette: None,
@@ -1984,7 +1938,6 @@ mod tests {
 
         let mut old = Client::connect(&socket, ConnectionRole::Interactive);
         let (_, created) = old.request(Request::CreateSession {
-            canonical_path: directory.clone(),
             rows: 10,
             cols: 40,
             palette: None,
@@ -2021,9 +1974,7 @@ mod tests {
         assert!(error.context.contains_key("connection_id"));
         assert!(error.context.contains_key("attachment_age_ms"));
         let mut inspector = Client::connect(&socket, ConnectionRole::Control);
-        let (_, session) = inspector.request(Request::GetSession {
-            target: SessionTarget::Id(session_id),
-        });
+        let (_, session) = inspector.request(Request::GetSession { session_id });
         let snapshot = match session {
             Response::Session {
                 session: Some(snapshot),
@@ -2088,7 +2039,6 @@ mod tests {
 
         let mut client = Client::connect(&socket, ConnectionRole::Interactive);
         let (_, created) = client.request(Request::CreateSession {
-            canonical_path: directory.clone(),
             rows: 10,
             cols: 40,
             palette: None,
