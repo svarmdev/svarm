@@ -526,14 +526,14 @@ fn handle_new_agent_key(
         NewAgentPage::Form => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
-            KeyCode::Char('w') => app.open_workspace_choices(),
-            KeyCode::Char('a') => app.open_agent_choices(),
-            KeyCode::Enter => match app.new_agent().map(|state| state.draft.selected_field) {
-                Some(NewAgentField::Workspace) => app.open_workspace_choices(),
-                Some(NewAgentField::Agent) => app.open_agent_choices(),
-                Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
-                None => {}
-            },
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                match app.new_agent().map(|state| state.draft.selected_field) {
+                    Some(NewAgentField::Workspace) => app.open_workspace_choices(),
+                    Some(NewAgentField::Agent) => app.open_agent_choices(),
+                    Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
+                    None => {}
+                }
+            }
             KeyCode::Esc => app.cancel_new_agent(),
             _ => {}
         },

@@ -464,7 +464,7 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  [j/k] move  [Enter] select  [w] workspace  [a] agent  [Esc] cancel",
+                "  [j/k] move  [Enter/Space] select  [Esc] cancel",
                 theme.muted(),
             )),
         ],
