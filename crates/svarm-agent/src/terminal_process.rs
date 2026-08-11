@@ -94,6 +94,28 @@ impl TerminalProcess {
         Self::spawn_command(command, cwd, size, palette, notify)
     }
 
+    pub fn spawn_with_environment(
+        program: &OsStr,
+        args: &[OsString],
+        cwd: &Path,
+        size: PtySize,
+        palette: Option<TerminalPalette>,
+        environment: &[(OsString, Option<OsString>)],
+        notify: Option<TerminalNotifier>,
+    ) -> Result<Self> {
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
+        command.cwd(cwd);
+        for (name, value) in environment {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else {
+                command.env_remove(name);
+            }
+        }
+        Self::spawn_command(command, cwd, size, palette, notify)
+    }
+
     pub(crate) fn spawn_command(
         command: CommandBuilder,
         cwd: &Path,
@@ -495,5 +517,43 @@ mod tests {
 
         rx.recv_timeout(Duration::from_secs(1))
             .expect("EOF did not wake the owner");
+    }
+
+    #[test]
+    fn public_spawn_passes_literal_arguments_and_environment_without_a_shell_command() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut process = TerminalProcess::spawn_with_environment(
+            OsStr::new("sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from("printf '%s:%s' \"$1\" \"$SVARM_TEST_VALUE\""),
+                OsString::from("sh"),
+                OsString::from("path with spaces;$()"),
+            ],
+            &cwd,
+            size(),
+            None,
+            &[(
+                OsString::from("SVARM_TEST_VALUE"),
+                Some(OsString::from("literal value")),
+            )],
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process.with_screen(|screen| screen.contents().contains("literal value"))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process.with_screen(|screen| {
+            screen
+                .contents()
+                .contains("path with spaces;$():literal value")
+        }));
+        while process.poll().unwrap() == SessionStatus::Running && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
