@@ -370,6 +370,9 @@ pub struct TerminalModes {
     pub application_cursor: bool,
     pub application_keypad: bool,
     pub bracketed_paste: bool,
+    /// The agent enabled the kitty keyboard protocol's "disambiguate escape codes" mode, so keys
+    /// the legacy encoding cannot express are reported as `CSI ... u` instead.
+    pub keyboard_disambiguate: bool,
     pub mouse_protocol: MouseProtocol,
     pub mouse_encoding: MouseEncoding,
 }

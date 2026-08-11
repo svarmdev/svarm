@@ -16,8 +16,8 @@ use vt100::Parser;
 use crate::{
     AgentId, AgentKind,
     terminal::{
-        ColorQueryDetector, ControlDetector, CursorStyle, Recognized, TerminalPalette,
-        color_query_responses,
+        ColorQueryDetector, ControlDetector, CursorStyle, KeyboardState, Recognized,
+        TerminalPalette, color_query_responses,
     },
 };
 
@@ -80,6 +80,7 @@ pub struct AgentSession {
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
+    keyboard: Arc<Mutex<KeyboardState>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,6 +137,7 @@ impl AgentSession {
         let read_error = Arc::new(Mutex::new(None));
         let terminal_palette = Arc::new(Mutex::new(palette));
         let cursor_style = Arc::new(Mutex::new(CursorStyle::default()));
+        let keyboard = Arc::new(Mutex::new(KeyboardState::default()));
         spawn_reader(
             reader,
             ReaderState {
@@ -146,6 +148,7 @@ impl AgentSession {
                 generation: generation.clone(),
                 read_error: read_error.clone(),
                 cursor_style: cursor_style.clone(),
+                keyboard: keyboard.clone(),
                 notify,
             },
         );
@@ -163,7 +166,16 @@ impl AgentSession {
             generation,
             read_error,
             cursor_style,
+            keyboard,
         })
+    }
+
+    /// Whether the agent asked for keys that the legacy encoding cannot express.
+    pub fn keyboard_disambiguates(&self) -> bool {
+        self.keyboard
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .disambiguates()
     }
 
     /// The cursor the agent last asked for. Frames carry it because the emulated screen cannot.
@@ -311,6 +323,7 @@ struct ReaderState {
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
+    keyboard: Arc<Mutex<KeyboardState>>,
     notify: Option<OutputNotifier>,
 }
 
@@ -323,6 +336,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
         generation,
         read_error,
         cursor_style,
+        keyboard,
         notify,
     } = state;
     thread::spawn(move || {
@@ -367,6 +381,12 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                                 let cursor = parser.screen().cursor_position();
                                 drop(parser);
                                 reply(query.response(cursor).as_bytes());
+                            }
+                            Recognized::Keyboard(change) => {
+                                keyboard
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .apply(change);
                             }
                         }
                     }

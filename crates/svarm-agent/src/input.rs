@@ -5,6 +5,11 @@ use crate::protocol::{
 
 pub fn encode_key(input: &KeyInput, modes: TerminalModes) -> Option<Vec<u8>> {
     let modifiers = input.modifiers;
+    if modes.keyboard_disambiguate
+        && let Some(bytes) = disambiguated_key(input)
+    {
+        return Some(bytes);
+    }
     let mut bytes = match input.code {
         KeyCode::Character(character) if modifiers.control => vec![encode_control(character)?],
         KeyCode::Character(character) => character.to_string().into_bytes(),
@@ -29,6 +34,32 @@ pub fn encode_key(input: &KeyInput, modes: TerminalModes) -> Option<Vec<u8>> {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+/// The `CSI codepoint ; modifiers u` form, for agents that enabled the kitty keyboard protocol's
+/// "disambiguate escape codes" mode.
+///
+/// Only the keys that mode exists to rescue are encoded this way. `Shift+Enter` is the reason it
+/// matters: the legacy encoding sends a bare carriage return for it, identical to `Enter`, so an
+/// agent that binds the two differently cannot tell them apart. `Escape` is reported even
+/// unmodified, because otherwise it cannot be distinguished from the start of another sequence.
+/// Everything else keeps its legacy encoding, which this mode leaves unambiguous.
+fn disambiguated_key(input: &KeyInput) -> Option<Vec<u8>> {
+    let modifiers = input.modifiers;
+    let modified = modifiers.shift || modifiers.alt || modifiers.control;
+    let codepoint = match input.code {
+        KeyCode::Escape => 27,
+        KeyCode::Enter if modified => 13,
+        KeyCode::Tab if modified => 9,
+        KeyCode::Backspace if modified => 127,
+        _ => return None,
+    };
+    let parameter = modifier_parameter(modifiers);
+    Some(if parameter == 1 {
+        format!("\x1b[{codepoint}u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{parameter}u").into_bytes()
+    })
 }
 
 pub fn encode_paste(text: &str, modes: TerminalModes) -> Vec<u8> {
@@ -218,6 +249,78 @@ mod tests {
                 }
             ),
             Some(b"\x1bOA".to_vec())
+        );
+    }
+
+    fn shifted(code: KeyCode) -> KeyInput {
+        KeyInput {
+            code,
+            modifiers: InputModifiers {
+                shift: true,
+                ..InputModifiers::default()
+            },
+        }
+    }
+
+    const DISAMBIGUATING: TerminalModes = TerminalModes {
+        keyboard_disambiguate: true,
+        application_cursor: false,
+        application_keypad: false,
+        bracketed_paste: false,
+        mouse_protocol: MouseProtocol::None,
+        mouse_encoding: MouseEncoding::Default,
+    };
+
+    #[test]
+    fn shift_enter_is_distinguishable_only_once_the_agent_asks_for_it() {
+        // The legacy encoding has no room for the modifier, so both keys are a carriage return.
+        assert_eq!(
+            encode_key(&shifted(KeyCode::Enter), TerminalModes::default()),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Enter), TerminalModes::default()),
+            Some(b"\r".to_vec())
+        );
+
+        assert_eq!(
+            encode_key(&shifted(KeyCode::Enter), DISAMBIGUATING),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Enter), DISAMBIGUATING),
+            Some(b"\r".to_vec()),
+            "an unmodified Enter is not ambiguous and keeps its legacy encoding"
+        );
+    }
+
+    #[test]
+    fn disambiguation_covers_the_ambiguous_keys_and_leaves_the_rest_alone() {
+        assert_eq!(
+            encode_key(&key(KeyCode::Escape), DISAMBIGUATING),
+            Some(b"\x1b[27u".to_vec()),
+            "Escape is reported even unmodified, since a bare 0x1b starts other sequences"
+        );
+        assert_eq!(
+            encode_key(&shifted(KeyCode::Tab), DISAMBIGUATING),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        assert_eq!(
+            encode_key(&shifted(KeyCode::Backspace), DISAMBIGUATING),
+            Some(b"\x1b[127;2u".to_vec())
+        );
+
+        assert_eq!(
+            encode_key(&key(KeyCode::Character('a')), DISAMBIGUATING),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Up), DISAMBIGUATING),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Tab), DISAMBIGUATING),
+            Some(b"\t".to_vec())
         );
     }
 

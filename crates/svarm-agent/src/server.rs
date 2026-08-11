@@ -410,6 +410,16 @@ impl SessionRuntime {
         }
     }
 
+    /// The modes the agent's input has to be encoded against. Read in place: this runs on every
+    /// keystroke, and copying the screen for it would put the copy in the input path.
+    fn input_modes(&self, id: AgentId) -> Option<TerminalModes> {
+        let disambiguate = self.agents.keyboard_disambiguates(id);
+        self.agents.with_screen(id, |screen| TerminalModes {
+            keyboard_disambiguate: disambiguate,
+            ..terminal_modes(screen)
+        })
+    }
+
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
         let snapshot = self.agents.snapshot(id)?;
         let previous = self.frame_bases.get(&id).filter(|_| !force_full);
@@ -1010,12 +1020,8 @@ impl Server {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
-                let terminal = runtime
-                    .agents
-                    .terminal_snapshot(agent_id)
-                    .ok_or_else(agent_not_found)?;
-                let bytes =
-                    encode_key(&event, terminal_modes(terminal.screen())).unwrap_or_default();
+                let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
+                let bytes = encode_key(&event, modes).unwrap_or_default();
                 runtime.send_input(agent_id, &bytes, now)?;
                 Ok(Outcome::new(Response::Ok))
             }
@@ -1027,11 +1033,8 @@ impl Server {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
-                let terminal = runtime
-                    .agents
-                    .terminal_snapshot(agent_id)
-                    .ok_or_else(agent_not_found)?;
-                let bytes = encode_paste(&text, terminal_modes(terminal.screen()));
+                let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
+                let bytes = encode_paste(&text, modes);
                 runtime.send_input(agent_id, &bytes, now)?;
                 Ok(Outcome::new(Response::Ok))
             }
@@ -1043,12 +1046,8 @@ impl Server {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
-                let terminal = runtime
-                    .agents
-                    .terminal_snapshot(agent_id)
-                    .ok_or_else(agent_not_found)?;
-                let bytes =
-                    encode_mouse(&event, terminal_modes(terminal.screen())).unwrap_or_default();
+                let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
+                let bytes = encode_mouse(&event, modes).unwrap_or_default();
                 runtime.send_input(agent_id, &bytes, now)?;
                 Ok(Outcome::new(Response::Ok))
             }
@@ -1510,6 +1509,7 @@ fn start_connection(
 
 fn terminal_modes(screen: &Screen) -> TerminalModes {
     TerminalModes {
+        keyboard_disambiguate: false,
         application_cursor: screen.application_cursor(),
         application_keypad: screen.application_keypad(),
         bracketed_paste: screen.bracketed_paste(),

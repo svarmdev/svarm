@@ -2,9 +2,15 @@ use std::io;
 
 use crossterm::{
     cursor::{SetCursorStyle, Show},
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use svarm_agent::{CursorStyle, Result};
@@ -14,6 +20,7 @@ pub(crate) type SvarmTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 pub(crate) struct TerminalSession {
     terminal: SvarmTerminal,
     cursor_style: CursorStyle,
+    keyboard_enhanced: bool,
 }
 
 impl TerminalSession {
@@ -31,10 +38,21 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
+        // Without this the host terminal reports Shift+Enter as a plain Enter, and no amount of
+        // care further down can recover the difference. Only disambiguation is requested: key
+        // release and repeat events would multiply the input Svarm forwards without adding
+        // anything an agent asked for.
+        let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false)
+            && execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .is_ok();
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         let mut session = Self {
             terminal,
             cursor_style: CursorStyle::default(),
+            keyboard_enhanced,
         };
         session.terminal.clear()?;
         Ok(session)
@@ -72,6 +90,9 @@ const fn cursor_style(style: CursorStyle) -> SetCursorStyle {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.keyboard_enhanced {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             self.terminal.backend_mut(),
             SetCursorStyle::DefaultUserShape,

@@ -104,10 +104,67 @@ impl DeviceQuery {
     }
 }
 
+/// A change to the keyboard protocol, from the "kitty keyboard" extension.
+///
+/// This matters because the legacy encoding has no way to say `Shift+Enter`: it collapses to the
+/// same carriage return as a plain `Enter`. An agent that wants to tell them apart enables this
+/// protocol, and Svarm has to notice, because Svarm is what encodes the user's keystrokes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyboardProtocol {
+    /// `CSI > flags u` — enter a new mode, keeping the previous one to return to.
+    Push(u8),
+    /// `CSI < count u` — return to a previous mode.
+    Pop(u16),
+    /// `CSI = flags ; mode u` — change the current mode in place.
+    Set(u8, u8),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Recognized {
     CursorStyle(CursorStyle),
     Query(DeviceQuery),
+    Keyboard(KeyboardProtocol),
+}
+
+/// Tracks the keyboard mode an agent has asked for, including the stack the protocol maintains.
+#[derive(Debug, Default)]
+pub struct KeyboardState {
+    stack: Vec<u8>,
+    flags: u8,
+}
+
+impl KeyboardState {
+    /// `CSI ... u` reporting is requested by bit 0, "disambiguate escape codes". Without it the
+    /// agent expects the legacy encoding and must keep getting it.
+    const DISAMBIGUATE: u8 = 0b1;
+
+    pub(crate) fn apply(&mut self, change: KeyboardProtocol) {
+        match change {
+            KeyboardProtocol::Push(flags) => {
+                // Bounded so a misbehaving agent cannot grow this without limit.
+                if self.stack.len() < 32 {
+                    self.stack.push(self.flags);
+                }
+                self.flags = flags;
+            }
+            KeyboardProtocol::Pop(count) => {
+                for _ in 0..count.max(1) {
+                    self.flags = self.stack.pop().unwrap_or_default();
+                }
+            }
+            // Mode 1 sets, 2 adds, 3 clears; anything else is not a request Svarm understands.
+            KeyboardProtocol::Set(flags, mode) => match mode {
+                1 => self.flags = flags,
+                2 => self.flags |= flags,
+                3 => self.flags &= !flags,
+                _ => {}
+            },
+        }
+    }
+
+    pub const fn disambiguates(&self) -> bool {
+        self.flags & Self::DISAMBIGUATE != 0
+    }
 }
 
 /// Recognizes the `CSI` sequences Svarm has to act on itself, because the emulator models neither
@@ -127,76 +184,141 @@ enum Scan {
     #[default]
     Idle,
     Escape,
-    /// Inside `CSI`, accumulating the parameter and remembering a leading `?`.
+    /// Inside `CSI`: the private prefix if one was given, and the parameters seen so far.
     Csi {
-        private: bool,
-        parameter: u16,
+        prefix: Option<u8>,
+        first: u16,
+        second: Option<u16>,
     },
     /// A space intermediate has been seen, so `q` would end a cursor-style request.
     Space(u16),
+}
+
+impl Scan {
+    const fn csi(prefix: Option<u8>) -> Self {
+        Self::Csi {
+            prefix,
+            first: 0,
+            second: None,
+        }
+    }
 }
 
 impl ControlDetector {
     pub(crate) fn process(&mut self, bytes: &[u8]) -> Vec<(usize, Recognized)> {
         let mut recognized = Vec::new();
         for (offset, byte) in bytes.iter().enumerate() {
+            let mut report = |item| recognized.push((offset + 1, item));
             self.scan = match (self.scan, byte) {
                 (_, 0x1b) => Scan::Escape,
-                (Scan::Escape, b'[') => Scan::Csi {
-                    private: false,
-                    parameter: 0,
-                },
+                (Scan::Escape, b'[') => Scan::csi(None),
                 (
                     Scan::Csi {
-                        private: false,
-                        parameter: 0,
+                        prefix: None,
+                        first: 0,
+                        second: None,
                     },
-                    b'?',
+                    b'?' | b'>' | b'<' | b'=',
+                ) => Scan::csi(Some(*byte)),
+                (
+                    Scan::Csi {
+                        prefix,
+                        first,
+                        second,
+                    },
+                    b'0'..=b'9',
+                ) => {
+                    let digit = u16::from(byte - b'0');
+                    match second {
+                        Some(second) => Scan::Csi {
+                            prefix,
+                            first,
+                            second: Some(second.saturating_mul(10) + digit),
+                        },
+                        None => Scan::Csi {
+                            prefix,
+                            first: first.saturating_mul(10) + digit,
+                            second: None,
+                        },
+                    }
+                }
+                (
+                    Scan::Csi {
+                        prefix,
+                        first,
+                        second: None,
+                    },
+                    b';',
                 ) => Scan::Csi {
-                    private: true,
-                    parameter: 0,
-                },
-                (Scan::Csi { private, parameter }, b'0'..=b'9') => Scan::Csi {
-                    private,
-                    parameter: parameter.saturating_mul(10) + u16::from(byte - b'0'),
+                    prefix,
+                    first,
+                    second: Some(0),
                 },
                 (
                     Scan::Csi {
-                        private: false,
-                        parameter,
+                        prefix: None,
+                        first,
+                        second: None,
                     },
                     b' ',
-                ) => Scan::Space(parameter),
+                ) => Scan::Space(first),
                 (Scan::Space(parameter), b'q') => {
-                    recognized.push((
-                        offset + 1,
-                        Recognized::CursorStyle(CursorStyle::from_parameter(parameter)),
-                    ));
+                    report(Recognized::CursorStyle(CursorStyle::from_parameter(
+                        parameter,
+                    )));
                     Scan::Idle
                 }
-                (Scan::Csi { private, parameter }, b'n') => {
-                    let query = match (private, parameter) {
-                        (false, 5) => Some(DeviceQuery::Status),
-                        (false, 6) => Some(DeviceQuery::CursorPosition),
-                        (true, 6) => Some(DeviceQuery::ExtendedCursorPosition),
+                (
+                    Scan::Csi {
+                        prefix,
+                        first,
+                        second: None,
+                    },
+                    b'n',
+                ) => {
+                    let query = match (prefix, first) {
+                        (None, 5) => Some(DeviceQuery::Status),
+                        (None, 6) => Some(DeviceQuery::CursorPosition),
+                        (Some(b'?'), 6) => Some(DeviceQuery::ExtendedCursorPosition),
                         _ => None,
                     };
                     if let Some(query) = query {
-                        recognized.push((offset + 1, Recognized::Query(query)));
+                        report(Recognized::Query(query));
                     }
                     Scan::Idle
                 }
                 (
                     Scan::Csi {
-                        private: false,
-                        parameter: 0,
+                        prefix: None,
+                        first: 0,
+                        second: None,
                     },
                     b'c',
                 ) => {
-                    recognized.push((
-                        offset + 1,
-                        Recognized::Query(DeviceQuery::PrimaryAttributes),
-                    ));
+                    report(Recognized::Query(DeviceQuery::PrimaryAttributes));
+                    Scan::Idle
+                }
+                (
+                    Scan::Csi {
+                        prefix: Some(prefix),
+                        first,
+                        second,
+                    },
+                    b'u',
+                ) => {
+                    let change = match prefix {
+                        b'>' => Some(KeyboardProtocol::Push(first as u8)),
+                        b'<' => Some(KeyboardProtocol::Pop(first)),
+                        // A missing mode means 1, per the protocol.
+                        b'=' => Some(KeyboardProtocol::Set(
+                            first as u8,
+                            second.unwrap_or(1).max(1) as u8,
+                        )),
+                        _ => None,
+                    };
+                    if let Some(change) = change {
+                        report(Recognized::Keyboard(change));
+                    }
                     Scan::Idle
                 }
                 _ => Scan::Idle,
@@ -305,7 +427,7 @@ mod tests {
             .into_iter()
             .filter_map(|(_, recognized)| match recognized {
                 Recognized::CursorStyle(style) => Some(style),
-                Recognized::Query(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -316,7 +438,7 @@ mod tests {
             .into_iter()
             .filter_map(|(_, recognized)| match recognized {
                 Recognized::Query(query) => Some(query),
-                Recognized::CursorStyle(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -395,6 +517,61 @@ mod tests {
             DeviceQuery::PrimaryAttributes.response((0, 0)),
             "\x1b[?1;2c"
         );
+    }
+
+    #[test]
+    fn keyboard_protocol_requests_are_tracked_through_push_set_and_pop() {
+        let mut detector = ControlDetector::default();
+        let mut keyboard = KeyboardState::default();
+        assert!(!keyboard.disambiguates(), "legacy encoding until asked");
+
+        let changes = |detector: &mut ControlDetector, bytes: &[u8]| {
+            detector
+                .process(bytes)
+                .into_iter()
+                .filter_map(|(_, recognized)| match recognized {
+                    Recognized::Keyboard(change) => Some(change),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            changes(&mut detector, b"\x1b[>1u"),
+            [KeyboardProtocol::Push(1)]
+        );
+        keyboard.apply(KeyboardProtocol::Push(1));
+        assert!(keyboard.disambiguates());
+
+        assert_eq!(
+            changes(&mut detector, b"\x1b[=1;3u"),
+            [KeyboardProtocol::Set(1, 3)],
+            "mode 3 clears the named flags"
+        );
+        keyboard.apply(KeyboardProtocol::Set(1, 3));
+        assert!(!keyboard.disambiguates());
+
+        keyboard.apply(KeyboardProtocol::Set(1, 2));
+        assert!(keyboard.disambiguates(), "mode 2 adds the named flags");
+
+        assert_eq!(
+            changes(&mut detector, b"\x1b[<1u"),
+            [KeyboardProtocol::Pop(1)]
+        );
+        keyboard.apply(KeyboardProtocol::Pop(1));
+        assert!(
+            !keyboard.disambiguates(),
+            "popping restores what was pushed over"
+        );
+    }
+
+    #[test]
+    fn popping_past_the_bottom_of_the_stack_returns_to_the_legacy_encoding() {
+        let mut keyboard = KeyboardState::default();
+        keyboard.apply(KeyboardProtocol::Push(1));
+        keyboard.apply(KeyboardProtocol::Pop(9));
+
+        assert!(!keyboard.disambiguates());
     }
 
     #[test]

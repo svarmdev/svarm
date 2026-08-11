@@ -109,6 +109,12 @@ impl AgentManager {
         self.sessions.get(&id).map(AgentSession::cursor_style)
     }
 
+    pub fn keyboard_disambiguates(&self, id: AgentId) -> bool {
+        self.sessions
+            .get(&id)
+            .is_some_and(AgentSession::keyboard_disambiguates)
+    }
+
     pub fn snapshot(&self, id: AgentId) -> Option<SessionSnapshot> {
         self.sessions.get(&id).map(AgentSession::snapshot)
     }
