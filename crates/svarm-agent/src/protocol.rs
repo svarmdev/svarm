@@ -495,6 +495,7 @@ pub struct ServerStatusSnapshot {
 pub struct StopSummary {
     pub session_count: usize,
     pub agent_count: usize,
+    pub cleanup_errors: usize,
     pub server_stopped: bool,
 }
 

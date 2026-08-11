@@ -163,24 +163,27 @@ fn session_row(
     };
     let age = format_age(now_ms.saturating_sub(session.last_user_activity_ms));
     let fixed = format!(
-        "{}  {}  {}/{} running  {}  {}  ",
-        session.id.0,
-        session.display_name,
-        session.running_agents,
-        session.total_agents,
-        state,
-        age
+        "{}  {}  {}/{} running  {}  ",
+        session.id.0, state, session.running_agents, session.total_agents, age
     );
     let available = usize::from(width).saturating_sub(fixed.chars().count());
-    let path = middle_truncate(&session.canonical_path.display().to_string(), available);
+    let separator_width = available.min(2);
+    let content_width = available.saturating_sub(separator_width);
+    let name_width = session
+        .display_name
+        .chars()
+        .count()
+        .min(16)
+        .min(content_width);
+    let path_width = content_width.saturating_sub(name_width);
+    let name = middle_truncate(&session.display_name, name_width);
+    let path = middle_truncate(&session.canonical_path.display().to_string(), path_width);
     Line::from(vec![
         Span::styled(format!("{}  ", session.id.0), accent(theme)),
-        Span::styled(format!("{}  ", session.display_name), text(theme)),
-        Span::styled(path, theme.muted()),
         Span::styled(
             format!(
-                "  {}/{} running  {}  {}",
-                session.running_agents, session.total_agents, state, age
+                "{}  {}/{} running  {}  ",
+                state, session.running_agents, session.total_agents, age
             ),
             if session.attachment.is_some() {
                 warning(theme)
@@ -188,6 +191,9 @@ fn session_row(
                 theme.muted()
             },
         ),
+        Span::styled(name, text(theme)),
+        Span::raw(" ".repeat(separator_width)),
+        Span::styled(path, theme.muted()),
     ])
 }
 
@@ -665,7 +671,7 @@ mod tests {
                 canonical_path: PathBuf::from(
                     "/a/very/long/workspace/path/that/must/be/middle/truncated/project",
                 ),
-                display_name: "project".into(),
+                display_name: "project-with-an-extremely-long-display-name".into(),
                 running_agents: 1,
                 total_agents: 2,
                 attachment: Some(AttachmentSummary {
@@ -702,6 +708,7 @@ mod tests {
         assert!(rendered.contains("Open Svarm session"));
         assert!(rendered.contains("42"));
         assert!(rendered.contains("attached"));
+        assert!(rendered.contains('…'));
         assert!(rendered.contains("[Enter] open  [j/k] select  [Esc] cancel  [n] new"));
     }
 
@@ -764,6 +771,48 @@ mod tests {
         assert!(rendered.contains("Session 7 · 1 running agents"));
         assert!(rendered.contains("/tmp/project-seven"));
         assert!(rendered.contains("terminates every agent"));
+    }
+
+    #[test]
+    fn reattached_exit_and_unseen_states_have_monochrome_symbols() {
+        let summary = SessionSummary {
+            id: SessionId(8),
+            canonical_path: PathBuf::from("/tmp/project-eight"),
+            display_name: "project-eight".into(),
+            running_agents: 1,
+            total_agents: 2,
+            attachment: None,
+            last_user_activity_ms: 1,
+            revision: SessionRevision(1),
+        };
+        let agent = |id, status, output_generation, seen_generation| AgentSnapshot {
+            id: svarm_agent::AgentId::new(id),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: summary.canonical_path.clone(),
+            status,
+            exit: None,
+            output_generation,
+            seen_generation,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            recognition: None,
+        };
+        let exited = agent(1, SessionStatus::Exited, 1, 1);
+        let unseen = agent(2, SessionStatus::Running, 2, 1);
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary,
+                selected_agent_id: Some(unseen.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![exited, unseen],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains('×'));
+        assert!(rendered.contains('!'));
     }
 
     fn render_app_text(app: &App) -> String {

@@ -37,9 +37,17 @@ impl RuntimePaths {
         ensure_private_directory(&directory, uid)?;
         let state_base = env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-            .unwrap_or_else(env::temp_dir);
-        let log_directory = state_base.join("svarm");
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .map(|home| home.join(".local/state"))
+            });
+        let log_directory = state_base.map_or_else(
+            || directory.join("logs"),
+            |state_base| state_base.join("svarm"),
+        );
         ensure_private_log_directory(&log_directory, uid)?;
         Ok(Self {
             socket: directory.join("server.sock"),

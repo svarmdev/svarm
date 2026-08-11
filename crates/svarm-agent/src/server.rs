@@ -913,9 +913,19 @@ impl Server {
                     .values()
                     .map(|runtime| runtime.agents.len())
                     .sum();
+                let cleanup_errors = self
+                    .sessions
+                    .values_mut()
+                    .map(|runtime| {
+                        runtime.state.stop();
+                        runtime.agents.stop_all().len()
+                    })
+                    .sum();
+                self.sessions.clear();
                 let mut outcome = Outcome::new(Response::Stopped(StopSummary {
                     session_count,
                     agent_count,
+                    cleanup_errors,
                     server_stopped: true,
                 }));
                 for connection_id in self.connections.keys().copied() {
@@ -1101,7 +1111,7 @@ impl Server {
         let agent_count = runtime.agents.len();
         let attached = runtime.state.attachment().map(|lease| lease.connection_id);
         runtime.state.stop();
-        let _errors = runtime.agents.stop_all();
+        let cleanup_errors = runtime.agents.stop_all().len();
         if let Some(connection_id) = attached
             && let Some(connection) = self.connections.get_mut(&connection_id)
         {
@@ -1110,6 +1120,7 @@ impl Server {
         let mut outcome = Outcome::new(Response::Stopped(StopSummary {
             session_count: 1,
             agent_count,
+            cleanup_errors,
             server_stopped: false,
         }));
         if let Some(connection_id) = attached
@@ -1458,7 +1469,10 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProtocolError> {
     path.canonicalize().map_err(|error| {
         ProtocolError::new(
             ErrorCode::SessionNotFound,
-            format!("could not resolve workspace {}: {error}", path.display()),
+            format!(
+                "could not resolve workspace {}: {error}; use `svarm list` and target an existing session by ID",
+                path.display()
+            ),
         )
     })
 }
@@ -1470,8 +1484,8 @@ fn agent_not_found() -> ProtocolError {
     )
 }
 
-fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
-    ProtocolError::new(ErrorCode::InternalError, error.to_string())
+fn internal_error(_error: impl std::fmt::Display) -> ProtocolError {
+    ProtocolError::new(ErrorCode::InternalError, "server operation failed")
 }
 
 fn unix_time_ms() -> u64 {
@@ -1551,6 +1565,29 @@ mod tests {
                         Message::Response(response) => (request_id, response),
                         Message::Error(error) => panic!("request failed: {error:?}"),
                         other => panic!("unexpected request response: {other:?}"),
+                    };
+                }
+            }
+        }
+
+        fn request_error(&mut self, request: Request) -> ProtocolError {
+            let request_id = RequestId(self.next_request);
+            self.next_request += 1;
+            write_frame(
+                &mut self.stream,
+                &Envelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: Some(request_id),
+                    message: Message::Request(request),
+                },
+            )
+            .unwrap();
+            loop {
+                let envelope: Envelope = read_frame(&mut self.stream).unwrap().unwrap();
+                if envelope.request_id == Some(request_id) {
+                    return match envelope.message {
+                        Message::Error(error) => error,
+                        other => panic!("expected request error, received: {other:?}"),
                     };
                 }
             }
@@ -1681,6 +1718,64 @@ mod tests {
         malformed.write_all(&[0, 0, 0, 1, b'{']).unwrap();
         drop(malformed);
 
+        let mut oversized = UnixStream::connect(&socket).unwrap();
+        oversized
+            .write_all(&((crate::framing::MAX_FRAME_LEN as u32) + 1).to_be_bytes())
+            .unwrap();
+        drop(oversized);
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let (_, status) = control.request(Request::ServerStatus);
+        assert!(matches!(status, Response::ServerStatus(_)));
+        let _ = control.request(Request::StopServer { confirmed: true });
+        drop(control);
+        server.join().unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_handshake_leaves_server_reachable() {
+        let directory = temp_dir();
+        let socket = directory.join("server.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            run_foreground(ServerConfig::new(server_socket, "test")).unwrap()
+        });
+        let probe = Client::connect(&socket, ConnectionRole::Probe);
+        drop(probe);
+
+        let mut incompatible = UnixStream::connect(&socket).unwrap();
+        incompatible
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut incompatible,
+            &Envelope {
+                protocol_version: PROTOCOL_VERSION + 1,
+                request_id: Some(RequestId(1)),
+                message: Message::Hello(Hello {
+                    application_version: "future".into(),
+                    protocol: ProtocolRange {
+                        min: PROTOCOL_VERSION + 1,
+                        max: PROTOCOL_VERSION + 1,
+                    },
+                    role: ConnectionRole::Probe,
+                    process_id: None,
+                    terminal: HostTerminalCapabilities::default(),
+                }),
+            },
+        )
+        .unwrap();
+        let response: Envelope = read_frame(&mut incompatible).unwrap().unwrap();
+        assert!(matches!(
+            response.message,
+            Message::Error(ProtocolError {
+                code: ErrorCode::IncompatibleProtocol,
+                ..
+            })
+        ));
+        drop(incompatible);
+
         let mut control = Client::connect(&socket, ConnectionRole::Control);
         let (_, status) = control.request(Request::ServerStatus);
         assert!(matches!(status, Response::ServerStatus(_)));
@@ -1711,6 +1806,19 @@ mod tests {
             other => panic!("unexpected create response: {other:?}"),
         };
         let _ = old.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+
+        let mut conflict = Client::connect(&socket, ConnectionRole::Interactive);
+        let error = conflict.request_error(Request::AttachSession {
+            session_id,
+            rows: 10,
+            cols: 40,
+            palette: None,
+            takeover: false,
+        });
+        assert_eq!(error.code, ErrorCode::SessionAlreadyAttached);
+        assert!(error.context.contains_key("connection_id"));
+        assert!(error.context.contains_key("attachment_age_ms"));
+        drop(conflict);
 
         let mut replacement = Client::connect(&socket, ConnectionRole::Interactive);
         let (_, attached) = replacement.request(Request::AttachSession {

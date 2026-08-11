@@ -95,15 +95,20 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
 
     drop(terminal);
     if let Some(error) = connection_failure {
-        return Err(format!(
-            "{error}\nAgents may still be running.\nReattach: svarm --attach --workspace {}",
-            agents.session_id().0
-        )
-        .into());
+        return Err(connection_failure_message(&error, agents.session_id().0).into());
     }
     match app.exit_intent() {
         ExitIntent::Detach => agents.detach()?,
-        ExitIntent::StopSession => agents.stop()?,
+        ExitIntent::StopSession => {
+            let summary = agents.stop()?;
+            if summary.cleanup_errors > 0 {
+                return Err(format!(
+                    "Svarm session stopped with {} agent cleanup errors",
+                    summary.cleanup_errors
+                )
+                .into());
+            }
+        }
         ExitIntent::None => {}
     }
     Ok(())
@@ -389,6 +394,18 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
+fn connection_failure_message(reason: &str, session_id: u64) -> String {
+    let reason = reason.replace(['\r', '\n'], " ");
+    let mut characters = reason.chars();
+    let mut first_line = characters.by_ref().take(79).collect::<String>();
+    if characters.next().is_some() {
+        first_line.push('…');
+    }
+    format!(
+        "{first_line}\nAgents may still be running.\nReattach: svarm --attach --workspace {session_id}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
@@ -409,5 +426,19 @@ mod tests {
             KeyCode::Char('b'),
             KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn connection_notices_fit_at_80_columns_and_include_reattach_command() {
+        let message = connection_failure_message(&"connection lost ".repeat(20), 42);
+        assert!(message.lines().all(|line| line.chars().count() <= 80));
+        assert!(message.contains("Reattach: svarm --attach --workspace 42"));
+
+        let revoked = connection_failure_message(
+            "another client explicitly took over this Svarm session",
+            42,
+        );
+        assert!(revoked.lines().all(|line| line.chars().count() <= 80));
+        assert!(revoked.starts_with("another client explicitly took over"));
     }
 }

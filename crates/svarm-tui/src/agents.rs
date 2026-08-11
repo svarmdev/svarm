@@ -14,7 +14,7 @@ use svarm_agent::{
     protocol::{
         ConnectionRole, Envelope, Event, FrameDisposition, Hello, HostTerminalCapabilities,
         KeyInput, LeaseToken, Message, MouseInput, PROTOCOL_VERSION, ProtocolRange, Request,
-        RequestId, Response, SessionId, SvarmSessionSnapshot, TerminalFrameTracker,
+        RequestId, Response, SessionId, StopSummary, SvarmSessionSnapshot, TerminalFrameTracker,
         TerminalSequence,
     },
 };
@@ -322,15 +322,21 @@ impl RemoteAgents {
     }
 
     pub fn detach(&mut self) -> Result<()> {
-        self.send_and_wait(Request::DetachSession {
+        match self.send_and_wait(Request::DetachSession {
             lease_token: self.lease_token.clone(),
-        })
+        })? {
+            Response::Ok => Ok(()),
+            _ => Err("Svarm server returned an invalid detach response".into()),
+        }
     }
 
-    pub fn stop(&mut self) -> Result<()> {
-        self.send_and_wait(Request::StopAttachedSession {
+    pub fn stop(&mut self) -> Result<StopSummary> {
+        match self.send_and_wait(Request::StopAttachedSession {
             lease_token: self.lease_token.clone(),
-        })
+        })? {
+            Response::Stopped(summary) => Ok(summary),
+            _ => Err("Svarm server returned an invalid stop response".into()),
+        }
     }
 
     pub const fn session_id(&self) -> SessionId {
@@ -417,7 +423,7 @@ impl RemoteAgents {
         Ok(())
     }
 
-    fn send_and_wait(&mut self, request: Request) -> Result<()> {
+    fn send_and_wait(&mut self, request: Request) -> Result<Response> {
         let request_id = RequestId(self.next_request_id);
         self.next_request_id = self
             .next_request_id
@@ -435,7 +441,7 @@ impl RemoteAgents {
             match self.incoming.recv_timeout(CONNECTION_TIMEOUT) {
                 Ok(Incoming::Envelope(envelope)) if envelope.request_id == Some(request_id) => {
                     return match envelope.message {
-                        Message::Response(_) => Ok(()),
+                        Message::Response(response) => Ok(response),
                         Message::Error(error) => Err(error.actionable_message().into()),
                         _ => Err("Svarm server returned an invalid response".into()),
                     };

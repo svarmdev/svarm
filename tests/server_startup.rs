@@ -100,6 +100,47 @@ fn hangup_is_ignored_and_termination_is_graceful() {
     fs::remove_dir_all(runtime_base).unwrap();
 }
 
+#[test]
+fn attach_only_uses_connect_or_start_without_creating_a_session() {
+    let runtime_base = temp_dir();
+    fs::create_dir(&runtime_base).unwrap();
+    fs::set_permissions(&runtime_base, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = runtime_base.join("svarm/server.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_svarm"))
+        .arg("--attach")
+        .env("XDG_RUNTIME_DIR", &runtime_base)
+        .env("XDG_STATE_HOME", &runtime_base)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no running Svarm sessions"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    wait_for_socket(&socket);
+    let (_, mut control) = handshake(&socket, ConnectionRole::Control);
+    write_frame(
+        &mut control,
+        &Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some(RequestId(2)),
+            message: Message::Request(Request::StopServer { confirmed: true }),
+        },
+    )
+    .unwrap();
+    let response: Envelope = read_frame(&mut control).unwrap().unwrap();
+    assert!(matches!(
+        response.message,
+        Message::Response(Response::Stopped(_))
+    ));
+    drop(control);
+    wait_for_socket_removal(&socket);
+    fs::remove_dir_all(runtime_base).unwrap();
+}
+
 fn handshake(socket: &Path, role: ConnectionRole) -> (ServerInstanceId, UnixStream) {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream
@@ -156,6 +197,17 @@ fn wait_for_children(children: &mut [Child]) {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_socket_removal(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !socket.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("server socket was not removed: {}", socket.display());
 }
 
 fn temp_dir() -> PathBuf {

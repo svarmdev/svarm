@@ -186,7 +186,7 @@ impl ServerSessionState {
         id: AgentId,
         generation: u64,
         current_generation: u64,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<(), ProtocolError> {
         let Some(agent) = self.agents.get_mut(&id) else {
             return Err(ProtocolError::new(
@@ -197,7 +197,7 @@ impl ServerSessionState {
         agent.seen_generation = agent
             .seen_generation
             .max(generation.min(current_generation));
-        self.touch(now_ms);
+        self.bump_revision();
         Ok(())
     }
 
@@ -422,6 +422,7 @@ mod tests {
         assert_eq!(session.seen_generation(id), Some(4));
         session.mark_seen(id, 99, 12, 50).unwrap();
         assert_eq!(session.seen_generation(id), Some(12));
+        assert_eq!(session.summary(1, 1).last_user_activity_ms, 20);
     }
 
     #[test]

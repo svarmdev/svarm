@@ -21,6 +21,9 @@ mod server_start;
 use cli::{Cli, Command, ServerCommand};
 use client::ControlClient;
 
+const NONINTERACTIVE_CHOICE_ERROR: &str =
+    "session choice requires a terminal; use `--attach --workspace ID` or `--new-session`";
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = RuntimePaths::discover()?;
@@ -120,10 +123,7 @@ fn select_launch_target(
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         print_session_summaries(&sessions);
-        return Err(
-            "session choice requires a terminal; use `--attach --workspace ID` or `--new-session`"
-                .into(),
-        );
+        return Err(NONINTERACTIVE_CHOICE_ERROR.into());
     }
     match svarm_tui::choose_session(sessions, allow_new)? {
         StartupChoice::Session(session_id) => Ok(Some(InitialSession::Attach {
@@ -202,16 +202,16 @@ fn stop_session(
             },
         }
     };
-    if !yes {
-        if !confirm(&format!(
+    if !yes
+        && !confirm(&format!(
             "Stop Svarm session {} at {} and terminate {} running agents ({} total)?",
             target.id.0,
             target.canonical_path.display(),
             target.running_agents,
             target.total_agents
-        ))? {
-            return Ok(());
-        }
+        ))?
+    {
+        return Ok(());
     }
     let mut client = ControlClient::connect(&paths.socket, ConnectionRole::Control)?;
     match client.request(Request::StopSession {
@@ -254,10 +254,8 @@ fn stop_server(paths: &RuntimePaths, yes: bool) -> Result<()> {
         "Stopping {} Svarm sessions containing {} agents.",
         status.session_count, agents
     );
-    if !yes {
-        if !confirm("Stop the Svarm server and every agent it owns?")? {
-            return Ok(());
-        }
+    if !yes && !confirm("Stop the Svarm server and every agent it owns?")? {
+        return Ok(());
     }
     let mut client = ControlClient::connect(&paths.socket, ConnectionRole::Control)?;
     match client.request(Request::StopServer { confirmed: true })? {
@@ -304,13 +302,18 @@ fn print_session_summaries(sessions: &[SessionSummary]) {
 
 fn print_stop_summary(summary: StopSummary) {
     println!(
-        "stopped {} sessions and {} agents{}",
+        "stopped {} sessions and {} agents{}{}",
         summary.session_count,
         summary.agent_count,
         if summary.server_stopped {
             "; server stopped"
         } else {
             ""
+        },
+        if summary.cleanup_errors == 0 {
+            String::new()
+        } else {
+            format!("; {} cleanup errors", summary.cleanup_errors)
         }
     );
 }
@@ -333,8 +336,13 @@ fn confirm(prompt: &str) -> Result<bool> {
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf> {
-    path.canonicalize()
-        .map_err(|error| format!("could not resolve workspace {}: {error}", path.display()).into())
+    path.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve workspace {}: {error}; use `svarm list` and target an existing session by ID",
+            path.display()
+        )
+        .into()
+    })
 }
 
 fn unix_time_ms() -> u64 {
@@ -402,6 +410,12 @@ mod tests {
             vec![SessionId(1), SessionId(2)]
         );
         assert_eq!(discovery_route(&eligible, false), DiscoveryRoute::Choose);
+    }
+
+    #[test]
+    fn noninteractive_choice_error_names_both_deterministic_remedies() {
+        assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--attach --workspace ID"));
+        assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--new-session"));
     }
 
     fn summary(id: u64) -> SessionSummary {
