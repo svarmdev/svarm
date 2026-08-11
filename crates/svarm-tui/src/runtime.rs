@@ -8,7 +8,7 @@ use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerE
 
 use crate::{
     agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
-    app::{App, ExitIntent, MenuItem, Mode},
+    app::{App, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage, WorkspaceChoice},
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
@@ -38,15 +38,30 @@ pub fn run(
         events_tx.clone(),
     )?;
     let mut app = App::hydrate(snapshot, settings_value.theme, settings_notice);
-    if let Some(workspace) = initial_agent.workspace.clone() {
-        app.set_workspace_hint(workspace);
-    }
-    if let (Some(kind), Some(launch_directory)) = (initial_agent.kind, initial_agent.workspace) {
+    let explicit_kind = initial_agent.kind;
+    let explicit_workspace = initial_agent.workspace;
+    let default_kind = explicit_kind.or(settings_value.last_agent);
+    let default_workspace = explicit_workspace.clone().or_else(|| {
+        settings_value
+            .workspaces
+            .iter()
+            .find(|path| path.is_dir())
+            .cloned()
+    });
+    if explicit_kind.is_some()
+        && let (Some(kind), Some(launch_directory)) = (default_kind, default_workspace.clone())
+    {
         agents.spawn(kind, launch_directory.clone(), &events)?;
         settings_value.record_successful_launch(launch_directory, kind);
         if let Err(error) = settings.save(&settings_value) {
             app.set_notice(error);
         }
+    } else if explicit_kind.is_some() || explicit_workspace.is_some() {
+        app.open_new_agent(
+            default_workspace,
+            default_kind,
+            workspace_choices(&settings_value, explicit_workspace.as_ref()),
+        );
     }
 
     let mut terminal = TerminalSession::open()?;
@@ -222,27 +237,12 @@ fn handle_key(
                 agents.key(id, event)?;
             }
         }
-        Mode::Prefix => return handle_management_command(app, agents, management_command(key)),
-        Mode::ChooseAgent => match key.code {
-            KeyCode::Char('c') => spawn(
-                app,
-                agents,
-                settings_store,
-                settings,
-                events,
-                AgentKind::Codex,
-            )?,
-            KeyCode::Char('a') => spawn(
-                app,
-                agents,
-                settings_store,
-                settings,
-                events,
-                AgentKind::Claude,
-            )?,
-            KeyCode::Esc => app.set_mode(Mode::Terminal),
-            _ => {}
-        },
+        Mode::Prefix => {
+            return handle_management_command(app, agents, settings, management_command(key));
+        }
+        Mode::NewAgent(page) => {
+            handle_new_agent_key(app, agents, settings_store, settings, events, page, key);
+        }
         Mode::ConfirmClose => match key.code {
             KeyCode::Char('y') => close_selected(app, agents)?,
             KeyCode::Char('n') | KeyCode::Esc => app.set_mode(Mode::Terminal),
@@ -287,6 +287,7 @@ fn handle_key(
 fn handle_management_command(
     app: &mut App,
     agents: &mut RemoteAgents,
+    settings: &Settings,
     command: ManagementCommand,
 ) -> Result<(bool, bool)> {
     let mut resize = false;
@@ -307,7 +308,15 @@ fn handle_management_command(
             sync_selection(app, agents)?;
             app.set_mode(Mode::Terminal);
         }
-        ManagementCommand::ChooseAgent => app.set_mode(Mode::ChooseAgent),
+        ManagementCommand::ChooseAgent => app.open_new_agent(
+            settings
+                .workspaces
+                .iter()
+                .find(|path| path.is_dir())
+                .cloned(),
+            settings.last_agent,
+            workspace_choices(settings, None),
+        ),
         ManagementCommand::CloseAgent if app.selected_agent_id().is_some() => {
             app.set_mode(Mode::ConfirmClose);
         }
@@ -400,26 +409,95 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
     Ok(())
 }
 
-fn spawn(
+fn submit_new_agent(
     app: &mut App,
     agents: &mut RemoteAgents,
     settings_store: &SettingsStore,
     settings: &mut Settings,
     events: &mpsc::Receiver<ClientEvent>,
-    kind: AgentKind,
-) -> Result<()> {
-    let launch_directory = app
-        .workspace_path()
-        .cloned()
-        .ok_or("choose a workspace before starting an agent")?;
-    agents.spawn(kind, launch_directory.clone(), events)?;
-    settings.record_successful_launch(launch_directory, kind);
-    match settings_store.save(settings) {
-        Ok(()) => app.clear_notice(),
-        Err(error) => app.set_notice(error),
+) {
+    let Some((kind, launch_directory)) = app.new_agent_submission() else {
+        return;
+    };
+    match agents.spawn(kind, launch_directory.clone(), events) {
+        Ok(()) => {
+            settings.record_successful_launch(launch_directory, kind);
+            match settings_store.save(settings) {
+                Ok(()) => app.clear_notice(),
+                Err(error) => app.set_notice(error),
+            }
+            app.finish_new_agent();
+        }
+        Err(error) => app.set_notice(error.to_string()),
     }
-    app.set_mode(Mode::Terminal);
-    Ok(())
+}
+
+fn handle_new_agent_key(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    events: &mpsc::Receiver<ClientEvent>,
+    page: NewAgentPage,
+    key: KeyEvent,
+) {
+    match page {
+        NewAgentPage::Form => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
+            KeyCode::Char('w') => app.open_workspace_choices(),
+            KeyCode::Char('a') => app.open_agent_choices(),
+            KeyCode::Enter => match app.new_agent().map(|state| state.draft.selected_field) {
+                Some(NewAgentField::Workspace) => app.open_workspace_choices(),
+                Some(NewAgentField::Agent) => app.open_agent_choices(),
+                Some(NewAgentField::Start) => {
+                    submit_new_agent(app, agents, settings_store, settings, events)
+                }
+                None => {}
+            },
+            KeyCode::Esc => app.cancel_new_agent(),
+            _ => {}
+        },
+        NewAgentPage::Workspaces => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
+            KeyCode::Enter => app.confirm_workspace(),
+            KeyCode::Esc => app.back_to_new_agent_form(),
+            _ => {}
+        },
+        NewAgentPage::Agents => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
+            KeyCode::Char('c') => app.set_agent_choice(AgentKind::Codex),
+            KeyCode::Char('a') => app.set_agent_choice(AgentKind::Claude),
+            KeyCode::Enter => app.confirm_agent(),
+            KeyCode::Esc => app.back_to_new_agent_form(),
+            _ => {}
+        },
+    }
+}
+
+fn workspace_choices(settings: &Settings, extra: Option<&PathBuf>) -> Vec<WorkspaceChoice> {
+    let mut choices = settings
+        .workspaces
+        .iter()
+        .map(|path| WorkspaceChoice {
+            path: path.clone(),
+            available: path.is_dir(),
+        })
+        .collect::<Vec<_>>();
+    if let Some(path) = extra
+        && !choices.iter().any(|choice| choice.path == *path)
+    {
+        choices.insert(
+            0,
+            WorkspaceChoice {
+                path: path.clone(),
+                available: path.is_dir(),
+            },
+        );
+    }
+    choices
 }
 
 fn sync_selection(app: &App, agents: &mut RemoteAgents) -> Result<()> {

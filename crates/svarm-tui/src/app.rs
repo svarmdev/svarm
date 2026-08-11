@@ -15,12 +15,64 @@ pub(crate) enum Mode {
     #[default]
     Terminal,
     Prefix,
-    ChooseAgent,
+    NewAgent(NewAgentPage),
     ConfirmClose,
     ConfirmQuit,
     Menu,
     Keybinds,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NewAgentPage {
+    #[default]
+    Form,
+    Workspaces,
+    Agents,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NewAgentField {
+    #[default]
+    Workspace,
+    Agent,
+    Start,
+}
+
+impl NewAgentField {
+    fn cycle(self, delta: isize) -> Self {
+        let current = match self {
+            Self::Workspace => 0,
+            Self::Agent => 1,
+            Self::Start => 2,
+        };
+        match (current + delta).rem_euclid(3) {
+            0 => Self::Workspace,
+            1 => Self::Agent,
+            _ => Self::Start,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceChoice {
+    pub path: PathBuf,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NewAgentDraft {
+    pub workspace: Option<PathBuf>,
+    pub agent: Option<AgentKind>,
+    pub selected_field: NewAgentField,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NewAgentState {
+    pub draft: NewAgentDraft,
+    pub workspaces: Vec<WorkspaceChoice>,
+    pub selected_workspace: usize,
+    pub selected_agent: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -253,7 +305,7 @@ pub(crate) struct App {
     notice: Option<String>,
     exit_intent: ExitIntent,
     session_id: Option<SessionId>,
-    workspace_path: Option<PathBuf>,
+    new_agent: Option<NewAgentState>,
 }
 
 impl App {
@@ -267,19 +319,16 @@ impl App {
         Self {
             agents: Vec::new(),
             selected: 0,
-            mode: if choose_agent {
-                Mode::ChooseAgent
-            } else {
-                Mode::Terminal
-            },
+            mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
             theme,
             notice,
             exit_intent: ExitIntent::None,
             session_id: None,
-            workspace_path: None,
+            new_agent: None,
         }
+        .with_test_new_agent(choose_agent)
     }
 
     pub fn hydrate(
@@ -291,10 +340,6 @@ impl App {
             .selected_agent_id
             .and_then(|id| snapshot.agents.iter().position(|agent| agent.id == id))
             .unwrap_or(0);
-        let workspace_path = snapshot
-            .agents
-            .get(selected)
-            .map(|agent| agent.launch_directory.clone());
         Self {
             agents: snapshot
                 .agents
@@ -309,7 +354,7 @@ impl App {
             notice,
             exit_intent: ExitIntent::None,
             session_id: Some(snapshot.summary.id),
-            workspace_path,
+            new_agent: None,
         }
     }
 
@@ -487,12 +532,147 @@ impl App {
         self.session_id
     }
 
-    pub fn workspace_path(&self) -> Option<&PathBuf> {
-        self.workspace_path.as_ref()
+    pub fn open_new_agent(
+        &mut self,
+        workspace: Option<PathBuf>,
+        agent: Option<AgentKind>,
+        workspaces: Vec<WorkspaceChoice>,
+    ) {
+        let workspace = workspace.filter(|path| {
+            workspaces
+                .iter()
+                .any(|choice| choice.available && choice.path == *path)
+        });
+        let selected_field = if workspace.is_none() {
+            NewAgentField::Workspace
+        } else if agent.is_none() {
+            NewAgentField::Agent
+        } else {
+            NewAgentField::Start
+        };
+        let selected_workspace = workspace
+            .as_ref()
+            .and_then(|path| workspaces.iter().position(|choice| choice.path == *path))
+            .unwrap_or(0);
+        let selected_agent = agent
+            .and_then(|kind| {
+                AgentKind::ALL
+                    .iter()
+                    .position(|candidate| *candidate == kind)
+            })
+            .unwrap_or(0);
+        self.new_agent = Some(NewAgentState {
+            draft: NewAgentDraft {
+                workspace,
+                agent,
+                selected_field,
+            },
+            workspaces,
+            selected_workspace,
+            selected_agent,
+        });
+        self.mode = Mode::NewAgent(NewAgentPage::Form);
     }
 
-    pub fn set_workspace_hint(&mut self, path: PathBuf) {
-        self.workspace_path = Some(path);
+    pub fn new_agent(&self) -> Option<&NewAgentState> {
+        self.new_agent.as_ref()
+    }
+
+    pub fn move_new_agent_selection(&mut self, delta: isize) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        match self.mode {
+            Mode::NewAgent(NewAgentPage::Form) => {
+                state.draft.selected_field = state.draft.selected_field.cycle(delta);
+            }
+            Mode::NewAgent(NewAgentPage::Workspaces) if !state.workspaces.is_empty() => {
+                state.selected_workspace = (state.selected_workspace as isize + delta)
+                    .rem_euclid(state.workspaces.len() as isize)
+                    as usize;
+            }
+            Mode::NewAgent(NewAgentPage::Agents) => {
+                state.selected_agent = (state.selected_agent as isize + delta)
+                    .rem_euclid(AgentKind::ALL.len() as isize)
+                    as usize;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn open_workspace_choices(&mut self) {
+        if self.new_agent.is_some() {
+            self.mode = Mode::NewAgent(NewAgentPage::Workspaces);
+        }
+    }
+
+    pub fn open_agent_choices(&mut self) {
+        if self.new_agent.is_some() {
+            self.mode = Mode::NewAgent(NewAgentPage::Agents);
+        }
+    }
+
+    pub fn confirm_workspace(&mut self) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        if let Some(choice) = state.workspaces.get(state.selected_workspace)
+            && choice.available
+        {
+            state.draft.workspace = Some(choice.path.clone());
+            self.mode = Mode::NewAgent(NewAgentPage::Form);
+        }
+    }
+
+    pub fn confirm_agent(&mut self) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        state.draft.agent = AgentKind::ALL.get(state.selected_agent).copied();
+        self.mode = Mode::NewAgent(NewAgentPage::Form);
+    }
+
+    pub fn set_agent_choice(&mut self, kind: AgentKind) {
+        if let Some(state) = &mut self.new_agent {
+            state.selected_agent = AgentKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .unwrap_or(0);
+            state.draft.agent = Some(kind);
+            self.mode = Mode::NewAgent(NewAgentPage::Form);
+        }
+    }
+
+    pub fn back_to_new_agent_form(&mut self) {
+        if self.new_agent.is_some() {
+            self.mode = Mode::NewAgent(NewAgentPage::Form);
+        }
+    }
+
+    pub fn cancel_new_agent(&mut self) {
+        self.new_agent = None;
+        self.mode = Mode::Terminal;
+    }
+
+    pub fn new_agent_submission(&self) -> Option<(AgentKind, PathBuf)> {
+        let state = self.new_agent.as_ref()?;
+        if state.draft.selected_field != NewAgentField::Start {
+            return None;
+        }
+        Some((state.draft.agent?, state.draft.workspace.clone()?))
+    }
+
+    pub fn finish_new_agent(&mut self) {
+        self.new_agent = None;
+        self.mode = Mode::Terminal;
+    }
+
+    #[cfg(test)]
+    fn with_test_new_agent(mut self, open: bool) -> Self {
+        if open {
+            self.open_new_agent(None, None, Vec::new());
+        }
+        self
     }
 }
 
@@ -580,6 +760,106 @@ mod tests {
     }
 
     #[test]
+    fn new_agent_form_focuses_the_first_missing_value_and_disables_incomplete_start() {
+        let mut app = app();
+        let workspaces = vec![WorkspaceChoice {
+            path: PathBuf::from("/tmp/one"),
+            available: true,
+        }];
+
+        app.open_new_agent(None, None, workspaces.clone());
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Workspace
+        );
+        assert_eq!(app.new_agent_submission(), None);
+
+        app.open_new_agent(Some(PathBuf::from("/tmp/one")), None, workspaces.clone());
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Agent
+        );
+
+        app.open_new_agent(
+            Some(PathBuf::from("/tmp/one")),
+            Some(AgentKind::Claude),
+            workspaces,
+        );
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Start
+        );
+        assert_eq!(
+            app.new_agent_submission(),
+            Some((AgentKind::Claude, PathBuf::from("/tmp/one")))
+        );
+    }
+
+    #[test]
+    fn nested_new_agent_choices_preserve_and_change_only_the_confirmed_field() {
+        let mut app = app();
+        app.open_new_agent(
+            Some(PathBuf::from("/tmp/one")),
+            Some(AgentKind::Codex),
+            vec![
+                WorkspaceChoice {
+                    path: PathBuf::from("/tmp/one"),
+                    available: true,
+                },
+                WorkspaceChoice {
+                    path: PathBuf::from("/tmp/two"),
+                    available: true,
+                },
+            ],
+        );
+
+        app.open_workspace_choices();
+        app.move_new_agent_selection(1);
+        app.back_to_new_agent_form();
+        assert_eq!(
+            app.new_agent().unwrap().draft.workspace,
+            Some(PathBuf::from("/tmp/one"))
+        );
+        assert_eq!(app.new_agent().unwrap().draft.agent, Some(AgentKind::Codex));
+
+        app.open_workspace_choices();
+        app.confirm_workspace();
+        assert_eq!(
+            app.new_agent().unwrap().draft.workspace,
+            Some(PathBuf::from("/tmp/two"))
+        );
+        assert_eq!(app.new_agent().unwrap().draft.agent, Some(AgentKind::Codex));
+
+        app.open_agent_choices();
+        app.move_new_agent_selection(1);
+        app.confirm_agent();
+        assert_eq!(
+            app.new_agent().unwrap().draft.agent,
+            Some(AgentKind::Claude)
+        );
+    }
+
+    #[test]
+    fn missing_saved_workspace_stays_visible_but_cannot_become_the_draft() {
+        let missing = PathBuf::from("/tmp/missing");
+        let mut app = app();
+        app.open_new_agent(
+            Some(missing.clone()),
+            Some(AgentKind::Codex),
+            vec![WorkspaceChoice {
+                path: missing,
+                available: false,
+            }],
+        );
+
+        assert_eq!(app.new_agent().unwrap().draft.workspace, None);
+        app.open_workspace_choices();
+        app.confirm_workspace();
+        assert_eq!(app.mode(), Mode::NewAgent(NewAgentPage::Workspaces));
+        assert_eq!(app.new_agent().unwrap().draft.workspace, None);
+    }
+
+    #[test]
     fn hydration_restores_server_state_and_resets_transient_ui() {
         let first = remote_agent(1, 2, 1);
         let second = remote_agent(2, 4, 3);
@@ -598,7 +878,6 @@ mod tests {
         assert_eq!(app.mode(), Mode::Terminal);
         assert!(app.sidebar_visible());
         assert_eq!(app.exit_intent(), ExitIntent::None);
-        assert_eq!(app.workspace_path(), Some(&PathBuf::from("/tmp")));
         assert!(app.agents()[1].has_unseen_output());
     }
 

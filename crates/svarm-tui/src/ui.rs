@@ -8,12 +8,12 @@ use ratatui::{
 use svarm_agent::vt100::Screen;
 
 use crate::{
-    app::{App, MenuItem, Mode, SessionChooser},
+    app::{App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
     input::MANAGEMENT_KEYBINDINGS,
     screen::TerminalScreen,
     theme::Theme,
 };
-use svarm_agent::SessionStatus;
+use svarm_agent::{AgentKind, SessionStatus};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
@@ -59,7 +59,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     );
 
     match app.mode() {
-        Mode::ChooseAgent => render_choose_agent(frame, theme),
+        Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme),
+        Mode::NewAgent(NewAgentPage::Workspaces) => render_workspace_choices(frame, app, theme),
+        Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme),
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?")
         }
@@ -402,21 +404,150 @@ fn render_terminal(
     frame.render_widget(pane, area);
 }
 
-fn render_choose_agent(frame: &mut Frame<'_>, theme: Theme) {
+fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(state) = app.new_agent() else {
+        return;
+    };
+    let workspace = state.draft.workspace.as_ref().map_or_else(
+        || "<choose workspace>".into(),
+        |path| path.display().to_string(),
+    );
+    let agent = state.draft.agent.map_or("<choose agent>", AgentKind::label);
+    let complete = state.draft.workspace.is_some() && state.draft.agent.is_some();
+    let row = |field, label: &str, value: String| {
+        let selected = state.draft.selected_field == field;
+        Line::from(vec![
+            Span::styled(if selected { " > " } else { "   " }, accent(theme)),
+            Span::styled(format!("{label:<12}"), text(theme)),
+            Span::styled(
+                end_truncate(&value, 50),
+                if selected {
+                    theme.selected()
+                } else {
+                    theme.muted()
+                },
+            ),
+        ])
+    };
     render_dialog(
         frame,
         theme,
         " New agent ",
-        42,
-        7,
+        72,
+        9,
         vec![
             Line::from(""),
-            Line::from("  [c] Codex"),
-            Line::from("  [a] Claude Code"),
+            row(NewAgentField::Workspace, "Workspace", workspace),
+            row(NewAgentField::Agent, "Agent", agent.into()),
+            Line::from(vec![
+                Span::styled(
+                    if state.draft.selected_field == NewAgentField::Start {
+                        " > "
+                    } else {
+                        "   "
+                    },
+                    accent(theme),
+                ),
+                Span::styled(
+                    if complete {
+                        "Start agent"
+                    } else {
+                        "Start agent (disabled)"
+                    },
+                    if complete { text(theme) } else { theme.muted() },
+                ),
+            ]),
             Line::from(""),
-            Line::from(Span::styled("  Esc cancels", theme.muted())),
+            Line::from(Span::styled(
+                "  [j/k] move  [Enter] select  [w] workspace  [a] agent  [Esc] cancel",
+                theme.muted(),
+            )),
         ],
     );
+}
+
+fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(state) = app.new_agent() else {
+        return;
+    };
+    let visible = 8;
+    let start = state.selected_workspace.saturating_sub(visible - 1);
+    let mut lines = vec![Line::from("")];
+    if state.workspaces.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No saved workspaces. Press b to browse.",
+            theme.muted(),
+        )));
+    } else {
+        lines.extend(
+            state
+                .workspaces
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .map(|(index, choice)| {
+                    let name = choice
+                        .path
+                        .file_name()
+                        .unwrap_or(choice.path.as_os_str())
+                        .to_string_lossy();
+                    let missing = if choice.available { "" } else { "  missing" };
+                    Line::from(vec![
+                        Span::styled(
+                            if index == state.selected_workspace {
+                                " > "
+                            } else {
+                                "   "
+                            },
+                            accent(theme),
+                        ),
+                        Span::styled(format!("{name:<16}"), text(theme)),
+                        Span::styled(
+                            end_truncate(&choice.path.display().to_string(), 45),
+                            theme.muted(),
+                        ),
+                        Span::styled(missing, warning(theme)),
+                    ])
+                }),
+        );
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "  [Enter] use  [b] browse  [j/k] move  [Esc] back",
+            theme.muted(),
+        )),
+    ]);
+    render_dialog(frame, theme, " Choose workspace ", 76, 13, lines);
+}
+
+fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(state) = app.new_agent() else {
+        return;
+    };
+    let mut lines = vec![Line::from("")];
+    lines.extend(AgentKind::ALL.iter().enumerate().map(|(index, kind)| {
+        Line::from(vec![
+            Span::styled(
+                if index == state.selected_agent {
+                    " > "
+                } else {
+                    "   "
+                },
+                accent(theme),
+            ),
+            Span::styled(kind.label(), text(theme)),
+        ])
+    }));
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "  [j/k] move  [Enter] use  [c/a] choose  [Esc] back",
+            theme.muted(),
+        )),
+    ]);
+    render_dialog(frame, theme, " Choose agent ", 44, 8, lines);
 }
 
 fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt: &str) {
@@ -785,6 +916,7 @@ mod tests {
         let rendered = render_app_text(&app);
         assert!(rendered.contains('×'));
         assert!(rendered.contains('!'));
+        assert!(rendered.contains("project"));
     }
 
     #[test]
