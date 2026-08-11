@@ -106,7 +106,7 @@ impl YaziPicker {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = fs::remove_file(&result_path);
-                return if error_is_not_found(error.as_ref(), program) {
+                return if program_not_found(program) {
                     Err(YaziLaunchError::NotFound)
                 } else {
                     Err(YaziLaunchError::Failed(format!(
@@ -208,24 +208,16 @@ fn create_result_file(runtime_directory: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-fn error_is_not_found(error: &(dyn std::error::Error + 'static), program: &OsStr) -> bool {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if error
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
-        {
-            return true;
-        }
-        current = error.source();
-    }
+fn program_not_found(program: &OsStr) -> bool {
     let path = Path::new(program);
-    if path.is_absolute() || path.components().count() > 1 {
-        return !path.exists();
-    }
-    std::env::var_os("PATH").is_none_or(|search| {
-        std::env::split_paths(&search).all(|directory| !directory.join(path).exists())
-    })
+    let program_exists = if path.is_absolute() || path.components().count() > 1 {
+        path.exists()
+    } else {
+        std::env::var_os("PATH").is_some_and(|search| {
+            std::env::split_paths(&search).any(|directory| directory.join(path).exists())
+        })
+    };
+    !program_exists
 }
 
 impl DirectoryLoader {
@@ -398,6 +390,35 @@ mod tests {
             None,
         );
         assert!(matches!(denied, Err(YaziLaunchError::Failed(_))));
+        let broken_interpreter = fake_executable(
+            &root,
+            "broken-interpreter",
+            "#! this line is ignored because the helper supplies a shebang",
+        );
+        fs::write(&broken_interpreter, b"#!/does/not/exist\n").unwrap();
+        let invalid = YaziPicker::spawn_program(
+            broken_interpreter.as_os_str(),
+            &root,
+            &root,
+            PtySize {
+                rows: 10,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            None,
+            None,
+        );
+        match invalid {
+            Err(YaziLaunchError::Failed(_)) => {}
+            Ok(mut picker) => {
+                wait_for_exit(&mut picker);
+                assert!(matches!(picker.finish(), YaziResult::Failed(_)));
+            }
+            Err(YaziLaunchError::NotFound) => {
+                panic!("an existing executable was mistaken for an absent program")
+            }
+        }
         assert!(!fs::read_dir(&root).unwrap().any(|entry| {
             entry
                 .unwrap()
