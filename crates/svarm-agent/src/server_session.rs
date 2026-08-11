@@ -93,6 +93,11 @@ impl ServerSessionState {
                 error
                     .context
                     .insert("connection_id".into(), lease.connection_id.0.to_string());
+                if let Some(process_id) = lease.process_id {
+                    error
+                        .context
+                        .insert("process_id".into(), process_id.to_string());
+                }
                 error.context.insert(
                     "attachment_age_ms".into(),
                     now_ms.saturating_sub(lease.attached_at_ms).to_string(),
@@ -376,6 +381,9 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::SessionAlreadyAttached);
+        assert_eq!(error.context["connection_id"], "1");
+        assert_eq!(error.context["process_id"], "10");
+        assert_eq!(error.context["attachment_age_ms"], "10");
         let result = session
             .attach(
                 ConnectionId(2),

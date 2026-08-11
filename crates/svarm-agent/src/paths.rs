@@ -17,6 +17,9 @@ pub struct RuntimePaths {
     pub socket: PathBuf,
     pub lock: PathBuf,
     pub pid: PathBuf,
+    pub log_directory: PathBuf,
+    pub server_log: PathBuf,
+    pub client_log: PathBuf,
 }
 
 impl RuntimePaths {
@@ -32,10 +35,19 @@ impl RuntimePaths {
             env::temp_dir().join(format!("svarm-{uid}"))
         };
         ensure_private_directory(&directory, uid)?;
+        let state_base = env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .unwrap_or_else(env::temp_dir);
+        let log_directory = state_base.join("svarm");
+        ensure_private_log_directory(&log_directory, uid)?;
         Ok(Self {
             socket: directory.join("server.sock"),
             lock: directory.join("server.lock"),
             pid: directory.join("server.pid"),
+            server_log: log_directory.join("server.log"),
+            client_log: log_directory.join("client.log"),
+            log_directory,
             directory,
         })
     }
@@ -82,6 +94,16 @@ impl RuntimePaths {
     pub fn remove_pid(&self) {
         let _ = fs::remove_file(&self.pid);
     }
+}
+
+fn ensure_private_log_directory(path: &Path, uid: u32) -> Result<()> {
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    ensure_private_directory(path, uid)
 }
 
 pub struct ServerLock {
@@ -150,6 +172,9 @@ mod tests {
             socket: directory.join("server.sock"),
             lock: directory.join("server.lock"),
             pid: directory.join("server.pid"),
+            log_directory: directory.join("logs"),
+            server_log: directory.join("logs/server.log"),
+            client_log: directory.join("logs/client.log"),
             directory: directory.clone(),
         };
         let lock = paths.acquire_server_lock().unwrap().unwrap();

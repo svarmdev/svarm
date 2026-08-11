@@ -6,6 +6,8 @@ pub mod framing;
 pub mod input;
 #[cfg(unix)]
 pub mod ipc;
+#[cfg(unix)]
+pub mod logging;
 mod manager;
 #[cfg(unix)]
 pub mod paths;

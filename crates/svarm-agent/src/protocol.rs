@@ -546,6 +546,41 @@ impl ProtocolError {
             ]),
         }
     }
+
+    pub fn actionable_message(&self) -> String {
+        match self.code {
+            ErrorCode::IncompatibleProtocol => format!(
+                "{} (client {}–{}, server {}–{}). Upgrade or restart Svarm so the client and server versions match; the live server was not stopped.",
+                self.message,
+                self.context.get("client_min").map_or("?", String::as_str),
+                self.context.get("client_max").map_or("?", String::as_str),
+                self.context.get("server_min").map_or("?", String::as_str),
+                self.context.get("server_max").map_or("?", String::as_str),
+            ),
+            ErrorCode::SessionAlreadyAttached => {
+                let connection = self
+                    .context
+                    .get("connection_id")
+                    .map_or("unknown", String::as_str);
+                let process = self
+                    .context
+                    .get("process_id")
+                    .map(|pid| format!(", process {pid}"))
+                    .unwrap_or_default();
+                let age = self
+                    .context
+                    .get("attachment_age_ms")
+                    .and_then(|age| age.parse::<u64>().ok())
+                    .map(|age| format!(", attached for {}s", age / 1_000))
+                    .unwrap_or_default();
+                format!(
+                    "{} (connection {connection}{process}{age}). Retry with `--takeover` only if you intend to disconnect it.",
+                    self.message
+                )
+            }
+            _ => self.message.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +609,9 @@ mod tests {
         assert_eq!(error.code, ErrorCode::IncompatibleProtocol);
         assert_eq!(error.context["client_max"], "2");
         assert_eq!(error.context["server_min"], "4");
+        let message = error.actionable_message();
+        assert!(message.contains("client 1–2, server 4–5"));
+        assert!(message.contains("live server was not stopped"));
     }
 
     #[test]

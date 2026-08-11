@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -34,10 +35,12 @@ const EVENT_TICK: Duration = Duration::from_millis(16);
 const EMPTY_SERVER_GRACE: Duration = Duration::from_secs(2);
 const CONNECTION_QUEUE: usize = 64;
 const INPUT_QUEUE: usize = 1_024;
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub application_version: String,
+    handle_signals: bool,
     #[cfg(test)]
     test_agent_command: Option<(String, Vec<String>)>,
 }
@@ -47,9 +50,15 @@ impl ServerConfig {
         Self {
             socket_path,
             application_version: application_version.into(),
+            handle_signals: false,
             #[cfg(test)]
             test_agent_command: None,
         }
+    }
+
+    pub const fn with_signal_handling(mut self) -> Self {
+        self.handle_signals = true;
+        self
     }
 
     #[cfg(test)]
@@ -63,7 +72,84 @@ impl ServerConfig {
 }
 
 pub fn run_foreground(config: ServerConfig) -> AgentResult<()> {
-    Server::new(config)?.run()
+    run_foreground_ready(config, || Ok(()))
+}
+
+pub fn run_foreground_ready(
+    config: ServerConfig,
+    ready: impl FnOnce() -> AgentResult<()>,
+) -> AgentResult<()> {
+    let _signals = config
+        .handle_signals
+        .then(SignalGuard::install)
+        .transpose()?;
+    let server = Server::new(config)?;
+    ready()?;
+    server.run()
+}
+
+struct SignalGuard {
+    interrupt: libc::sighandler_t,
+    terminate: libc::sighandler_t,
+    hangup: libc::sighandler_t,
+}
+
+impl SignalGuard {
+    fn install() -> io::Result<Self> {
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        // SAFETY: signal handlers only update an atomic flag or use SIG_IGN.
+        let interrupt = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                request_shutdown as *const () as libc::sighandler_t,
+            )
+        };
+        if interrupt == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: see above.
+        let terminate = unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                request_shutdown as *const () as libc::sighandler_t,
+            )
+        };
+        if terminate == libc::SIG_ERR {
+            // SAFETY: restoring the handler returned by signal is valid.
+            unsafe { libc::signal(libc::SIGINT, interrupt) };
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ignoring SIGHUP prevents a launching terminal from owning server lifetime.
+        let hangup = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        if hangup == libc::SIG_ERR {
+            // SAFETY: restoring handlers returned by signal is valid.
+            unsafe {
+                libc::signal(libc::SIGINT, interrupt);
+                libc::signal(libc::SIGTERM, terminate);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            interrupt,
+            terminate,
+            hangup,
+        })
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring handlers returned by signal is valid.
+        unsafe {
+            libc::signal(libc::SIGINT, self.interrupt);
+            libc::signal(libc::SIGTERM, self.terminate);
+            libc::signal(libc::SIGHUP, self.hangup);
+        }
+    }
+}
+
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 struct Connection {
@@ -473,6 +559,10 @@ impl Server {
 
     fn run(mut self) -> AgentResult<()> {
         while !self.stopping {
+            if self.config.handle_signals && SHUTDOWN_REQUESTED.swap(false, Ordering::SeqCst) {
+                self.begin_shutdown();
+                continue;
+            }
             self.accept_connections()?;
             match self.input_rx.recv_timeout(EVENT_TICK) {
                 Ok(input) => self.handle_input(input),
@@ -487,6 +577,14 @@ impl Server {
         }
         self.finish_shutdown();
         Ok(())
+    }
+
+    fn begin_shutdown(&mut self) {
+        let connections = self.connections.keys().copied().collect::<Vec<_>>();
+        for connection_id in connections {
+            self.send_event(connection_id, Event::ServerStopping);
+        }
+        self.stopping = true;
     }
 
     fn accept_connections(&mut self) -> AgentResult<()> {
@@ -1593,9 +1691,119 @@ mod tests {
     }
 
     #[test]
+    fn takeover_flushes_lease_revocation_before_disconnect() {
+        let directory = temp_dir();
+        let socket = directory.join("server.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            run_foreground(ServerConfig::new(server_socket, "test")).unwrap()
+        });
+
+        let mut old = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, created) = old.request(Request::CreateSession {
+            canonical_path: directory.clone(),
+            rows: 10,
+            cols: 40,
+            palette: None,
+        });
+        let session_id = match created {
+            Response::Created { session_id, .. } => session_id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let _ = old.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+
+        let mut replacement = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, attached) = replacement.request(Request::AttachSession {
+            session_id,
+            rows: 10,
+            cols: 40,
+            palette: None,
+            takeover: true,
+        });
+        let lease_token = match attached {
+            Response::Attached { lease_token, .. } => lease_token,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let revoked = old.event_until(|event| matches!(event, Event::LeaseRevoked { .. }));
+        assert!(matches!(revoked, Event::LeaseRevoked { reason } if reason.contains("took over")));
+        let _ = replacement.request(Request::StopAttachedSession { lease_token });
+        drop(old);
+        drop(replacement);
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let _ = control.request(Request::StopServer { confirmed: true });
+        drop(control);
+        server.join().unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn child_exit_while_detached_is_reaped_and_restored() {
+        let directory = temp_dir();
+        let socket = directory.join("server.sock");
+        let config = ServerConfig::new(socket.clone(), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 0.1; printf finished"]);
+        let server = thread::spawn(move || run_foreground(config).unwrap());
+
+        let mut client = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, created) = client.request(Request::CreateSession {
+            canonical_path: directory.clone(),
+            rows: 10,
+            cols: 40,
+            palette: None,
+        });
+        let (session_id, lease_token) = match created {
+            Response::Created {
+                session_id,
+                lease_token,
+            } => (session_id, lease_token),
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let _ = client.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+        let _ = client.request(Request::SpawnAgent {
+            lease_token: lease_token.clone(),
+            kind: AgentKind::Codex,
+        });
+        let _ = client.request(Request::DetachSession { lease_token });
+        drop(client);
+        thread::sleep(Duration::from_millis(250));
+
+        let mut reattached = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, attached) = reattached.request(Request::AttachSession {
+            session_id,
+            rows: 10,
+            cols: 40,
+            palette: None,
+            takeover: false,
+        });
+        let lease_token = match attached {
+            Response::Attached { lease_token, .. } => lease_token,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let snapshot = reattached.event_until(|event| {
+            matches!(event, Event::SvarmSessionSnapshot(snapshot) if snapshot.agents.iter().any(|agent| agent.status == SessionStatus::Exited))
+        });
+        assert!(
+            matches!(snapshot, Event::SvarmSessionSnapshot(snapshot) if snapshot.agents[0].exit.is_some())
+        );
+        let _ = reattached.event_until(|event| {
+            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"finished"))
+        });
+        let _ = reattached.request(Request::StopAttachedSession { lease_token });
+        drop(reattached);
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let _ = control.request(Request::StopServer { confirmed: true });
+        drop(control);
+        server.join().unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn full_and_diff_frames_reconstruct_screen_cursor_and_input_modes() {
         let mut authoritative = Parser::new(5, 30, 100);
-        authoritative.process(b"\x1b[?2004h\x1b[?1000h\x1b[31mfirst");
+        authoritative
+            .process(b"\x1b[?2004h\x1b[?1000h\x1b[31mprimary\x1b[?1049h\x1b[2J\x1b[32malternate");
         let full = authoritative.screen().state_formatted();
         let mut client = Parser::new(5, 30, 100);
         for byte in full {
@@ -1604,7 +1812,7 @@ mod tests {
         assert_screens_match(authoritative.screen(), client.screen());
 
         let previous = authoritative.screen().clone();
-        authoritative.process(b"\x1b[2;3H\x1b[32msecond\x1b[?1000l\x1b[?1003h");
+        authoritative.process(b"\x1b[?1049l\x1b[2;3H\x1b[34msecond\x1b[?1000l\x1b[?1003h");
         let diff = authoritative.screen().state_diff(&previous);
         for byte in diff {
             client.process(&[byte]);
@@ -1642,6 +1850,7 @@ mod tests {
     fn assert_screens_match(expected: &Screen, actual: &Screen) {
         assert_eq!(actual.size(), expected.size());
         assert_eq!(actual.contents(), expected.contents());
+        assert_eq!(actual.state_formatted(), expected.state_formatted());
         assert_eq!(actual.cursor_position(), expected.cursor_position());
         assert_eq!(actual.application_cursor(), expected.application_cursor());
         assert_eq!(actual.application_keypad(), expected.application_keypad());
