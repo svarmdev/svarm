@@ -1,0 +1,8 @@
+[package]
+name = "svarm"
+version = "0.1.0"
+edition = "2024"
+description = "A small terminal multiplexer for coding agents"
+
+[dependencies]
+
