@@ -17,6 +17,8 @@ use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
+const MODAL_WIDTH: u16 = 76;
+const MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = 25;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
@@ -438,8 +440,6 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " New agent ",
-        72,
-        9,
         vec![
             Line::from(""),
             row(NewAgentField::Workspace, "Workspace", workspace),
@@ -524,7 +524,7 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             theme.muted(),
         )),
     ]);
-    render_dialog(frame, theme, " Choose workspace ", 76, 13, lines);
+    render_dialog(frame, theme, " Choose workspace ", lines);
 }
 
 fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -552,7 +552,7 @@ fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             theme.muted(),
         )),
     ]);
-    render_dialog(frame, theme, " Choose agent ", 44, 8, lines);
+    render_dialog(frame, theme, " Choose agent ", lines);
 }
 
 fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -609,7 +609,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
         theme.muted(),
     )));
-    render_dialog(frame, theme, " Select workspace ", 76, 16, lines);
+    render_dialog(frame, theme, " Select workspace ", lines);
 }
 
 fn render_embedded_browser(
@@ -647,11 +647,7 @@ fn render_embedded_browser(
 }
 
 fn embedded_modal_area(area: Rect) -> Rect {
-    centered_rect(
-        area.width.saturating_sub(4).min(100),
-        area.height.saturating_sub(2).min(30),
-        area,
-    )
+    modal_area(area)
 }
 
 pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
@@ -669,8 +665,6 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
         frame,
         theme,
         title,
-        46,
-        6,
         vec![
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
@@ -693,8 +687,6 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Stop Svarm session? ",
-        64,
-        8,
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -725,14 +717,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
         Line::from(""),
         Line::from(Span::styled("  Esc closes", theme.muted())),
     ]);
-    render_dialog(
-        frame,
-        theme,
-        " Keybinds ",
-        76,
-        MANAGEMENT_KEYBINDINGS.len() as u16 + 8,
-        lines,
-    );
+    render_dialog(frame, theme, " Keybinds ", lines);
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -740,8 +725,6 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Settings ",
-        54,
-        8,
         vec![
             Line::from(""),
             Line::from(vec![
@@ -764,15 +747,8 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     );
 }
 
-fn render_dialog(
-    frame: &mut Frame<'_>,
-    theme: Theme,
-    title: &str,
-    width: u16,
-    height: u16,
-    lines: Vec<Line<'static>>,
-) {
-    let area = centered_rect(width, height, frame.area());
+fn render_dialog(frame: &mut Frame<'_>, theme: Theme, title: &str, lines: Vec<Line<'static>>) {
+    let area = modal_area(frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -788,6 +764,10 @@ fn render_dialog(
             .style(theme.surface()),
         area,
     );
+}
+
+fn modal_area(area: Rect) -> Rect {
+    centered_rect(MODAL_WIDTH, MODAL_HEIGHT, area)
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -860,6 +840,13 @@ mod tests {
             centered_rect(100, 100, Rect::new(2, 3, 20, 10)),
             Rect::new(2, 3, 20, 10)
         );
+    }
+
+    #[test]
+    fn every_modal_uses_the_same_shell() {
+        let terminal = Rect::new(0, 0, 120, 40);
+        assert_eq!(modal_area(terminal), Rect::new(22, 11, 76, 18));
+        assert_eq!(embedded_modal_area(terminal), modal_area(terminal));
     }
 
     #[test]
