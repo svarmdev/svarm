@@ -3,8 +3,9 @@ use std::{io, path::PathBuf, time::Duration};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -14,7 +15,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use crate::{
     AgentKind, Mode,
     app::{App, pty_size},
-    input::{encode_key, encode_paste},
+    input::{encode_key, encode_mouse, encode_paste},
     session::Result,
     ui,
 };
@@ -48,9 +49,9 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
-        dirty = true;
         match event::read()? {
             Event::Key(key) => {
+                dirty = true;
                 let resize = handle_key(&mut app, key)?;
                 if resize {
                     resize_agents(&mut app, terminal.terminal.size()?.into())?;
@@ -63,7 +64,11 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
                 }
             }
             Event::Resize(width, height) => {
+                dirty = true;
                 resize_agents(&mut app, Rect::new(0, 0, width, height))?;
+            }
+            Event::Mouse(mouse) => {
+                dirty |= handle_mouse(&mut app, mouse, terminal.terminal.size()?.into())?;
             }
             _ => {}
         }
@@ -103,14 +108,35 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Terminal,
             _ => {}
         },
-        Mode::Help => {
+        Mode::Menu => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.select_next_menu_item(),
+            KeyCode::Char('k') | KeyCode::Up => app.select_previous_menu_item(),
+            KeyCode::Enter => open_menu_item(app),
+            KeyCode::Char('1') => {
+                app.menu_selected = 0;
+                open_menu_item(app);
+            }
+            KeyCode::Char('2') => {
+                app.menu_selected = 1;
+                open_menu_item(app);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Terminal,
+            _ => {}
+        },
+        Mode::Keybinds => {
             if matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
             ) {
-                app.mode = Mode::Terminal;
+                app.mode = Mode::Menu;
             }
         }
+        Mode::Settings => match key.code {
+            KeyCode::Char('h') | KeyCode::Left => app.theme.cycle(-1),
+            KeyCode::Char('l') | KeyCode::Right => app.theme.cycle(1),
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Menu,
+            _ => {}
+        },
     }
     Ok(false)
 }
@@ -140,18 +166,91 @@ fn handle_prefix(app: &mut App, key: KeyEvent) -> Result<bool> {
             app.mode = Mode::Terminal;
             resize = true;
         }
-        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('m') => {
+            if !app.sidebar_visible {
+                app.sidebar_visible = true;
+                resize = true;
+            }
+            app.mode = Mode::Menu;
+        }
+        KeyCode::Char('?') => app.mode = Mode::Keybinds,
         KeyCode::Char(digit @ '1'..='9') => {
             app.select(digit as usize - '1' as usize);
             app.mode = Mode::Terminal;
         }
         KeyCode::Esc => app.mode = Mode::Terminal,
         _ => {
-            app.notice = Some("unknown Svarm command; Ctrl+B ? shows help".into());
+            app.notice = Some("unknown Svarm command; Ctrl+B m opens menu".into());
             app.mode = Mode::Terminal;
         }
     }
     Ok(resize)
+}
+
+fn open_menu_item(app: &mut App) {
+    app.mode = if app.menu_selected == 0 {
+        Mode::Keybinds
+    } else {
+        Mode::Settings
+    };
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> Result<bool> {
+    if matches!(
+        app.mode,
+        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
+    ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    {
+        if ui::menu_button_area(area, app.sidebar_visible)
+            .is_some_and(|button| contains(button, mouse.column, mouse.row))
+        {
+            app.mode = if app.mode == Mode::Menu {
+                Mode::Terminal
+            } else {
+                Mode::Menu
+            };
+            return Ok(true);
+        }
+
+        if app.mode == Mode::Menu
+            && let Some(index) = ui::menu_item_at(area, mouse.column, mouse.row)
+        {
+            app.menu_selected = index;
+            open_menu_item(app);
+            return Ok(true);
+        }
+    }
+
+    if app.mode != Mode::Terminal {
+        return Ok(false);
+    }
+    let child_area = ui::terminal_area(area, app.sidebar_visible);
+    if !contains(child_area, mouse.column, mouse.row) {
+        return Ok(false);
+    }
+    let Some(agent) = app.current() else {
+        return Ok(false);
+    };
+    let (mode, encoding) = {
+        let parser = agent.session.parser();
+        (
+            parser.screen().mouse_protocol_mode(),
+            parser.screen().mouse_protocol_encoding(),
+        )
+    };
+    let translated = MouseEvent {
+        column: mouse.column - child_area.x,
+        row: mouse.row - child_area.y,
+        ..mouse
+    };
+    if let Some(bytes) = encode_mouse(translated, mode, encoding) {
+        agent.session.send(&bytes)?;
+    }
+    Ok(false)
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
 fn spawn(app: &mut App, kind: AgentKind) {
@@ -178,7 +277,13 @@ impl TerminalSession {
     fn open() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            Hide
+        ) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -193,6 +298,7 @@ impl Drop for TerminalSession {
         let _ = execute!(
             self.terminal.backend_mut(),
             Show,
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );

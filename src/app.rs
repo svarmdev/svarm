@@ -5,6 +5,7 @@ use portable_pty::PtySize;
 use crate::{
     AgentKind, Mode,
     session::{AgentSession, Result, SessionStatus},
+    theme::ThemeName,
 };
 
 pub struct AgentEntry {
@@ -27,6 +28,8 @@ pub struct App {
     pub selected: usize,
     pub mode: Mode,
     pub sidebar_visible: bool,
+    pub menu_selected: usize,
+    pub theme: ThemeName,
     pub notice: Option<String>,
     pub quit: bool,
     pub cwd: PathBuf,
@@ -41,6 +44,8 @@ impl App {
             selected: 0,
             mode: Mode::Terminal,
             sidebar_visible: true,
+            menu_selected: 0,
+            theme: ThemeName::default(),
             notice: None,
             quit: false,
             cwd,
@@ -94,6 +99,14 @@ impl App {
             self.selected = index;
             self.mark_selected_seen();
         }
+    }
+
+    pub fn select_next_menu_item(&mut self) {
+        self.menu_selected = (self.menu_selected + 1) % 2;
+    }
+
+    pub fn select_previous_menu_item(&mut self) {
+        self.menu_selected = (self.menu_selected + 1) % 2;
     }
 
     pub fn close_selected(&mut self) -> Result<()> {

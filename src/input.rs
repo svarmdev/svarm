@@ -1,4 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -48,6 +51,96 @@ pub fn encode_key(event: KeyEvent) -> Option<Vec<u8>> {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+pub fn encode_mouse(
+    event: MouseEvent,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    let allowed = match mode {
+        MouseProtocolMode::None => false,
+        MouseProtocolMode::Press => matches!(
+            event.kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        MouseProtocolMode::PressRelease => {
+            !matches!(event.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved)
+        }
+        MouseProtocolMode::ButtonMotion => !matches!(event.kind, MouseEventKind::Moved),
+        MouseProtocolMode::AnyMotion => true,
+    };
+    if !allowed {
+        return None;
+    }
+
+    let released = matches!(event.kind, MouseEventKind::Up(_));
+    let mut code = match event.kind {
+        MouseEventKind::Down(button)
+        | MouseEventKind::Up(button)
+        | MouseEventKind::Drag(button) => mouse_button(button),
+        MouseEventKind::Moved => 3,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    if matches!(event.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved) {
+        code += 32;
+    }
+    code += 4 * u16::from(event.modifiers.contains(KeyModifiers::SHIFT));
+    code += 8 * u16::from(event.modifiers.contains(KeyModifiers::ALT));
+    code += 16 * u16::from(event.modifiers.contains(KeyModifiers::CONTROL));
+
+    let column = event.column.saturating_add(1);
+    let row = event.row.saturating_add(1);
+    match encoding {
+        MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{code};{column};{row}{}",
+                if released { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        MouseProtocolEncoding::Default => {
+            if column > 223 || row > 223 {
+                return None;
+            }
+            let code = if released { 3 } else { code };
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (code + 32) as u8,
+                (column + 32) as u8,
+                (row + 32) as u8,
+            ])
+        }
+        MouseProtocolEncoding::Utf8 => {
+            let code = if released { 3 } else { code };
+            Some(
+                format!(
+                    "\x1b[M{}{}{}",
+                    char::from_u32(u32::from(code + 32))?,
+                    char::from_u32(u32::from(column + 32))?,
+                    char::from_u32(u32::from(row + 32))?
+                )
+                .into_bytes(),
+            )
+        }
+    }
+}
+
+const fn mouse_button(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
 }
 
 fn encode_control(character: char) -> Option<u8> {
@@ -170,5 +263,27 @@ mod tests {
             b"\x1b[200~hello\x1b[201~".to_vec()
         );
         assert_eq!(encode_paste("hello", false), b"hello".to_vec());
+    }
+
+    #[test]
+    fn forwards_sgr_mouse_events_when_the_agent_requests_them() {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            encode_mouse(
+                event,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr
+            ),
+            Some(b"\x1b[<0;5;3M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(event, MouseProtocolMode::None, MouseProtocolEncoding::Sgr),
+            None
+        );
     }
 }

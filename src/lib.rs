@@ -5,6 +5,7 @@ pub mod cli;
 pub mod input;
 pub mod runtime;
 pub mod session;
+pub mod theme;
 pub mod ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,7 +22,9 @@ pub enum Mode {
     ChooseAgent,
     ConfirmClose,
     ConfirmQuit,
-    Help,
+    Menu,
+    Keybinds,
+    Settings,
 }
 
 impl AgentKind {

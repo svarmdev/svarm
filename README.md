@@ -27,12 +27,19 @@ Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, relea
 | `1`–`9` | Select an agent directly |
 | `n`, then `c` or `a` | Start Codex or Claude Code |
 | `b` | Toggle the sidebar |
+| `m` | Open the sidebar menu |
 | `x` | Close the selected agent, after confirmation |
 | `q` | Stop all agents and quit, after confirmation |
-| `?` | Show help |
+| `?` | Show keybinds directly |
 | `Ctrl+B` | Send a literal `Ctrl+B` to the agent |
 
-Pasting respects the focused application's bracketed-paste mode. `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through normally.
+The Menu control at the bottom of the sidebar is also clickable. Its Keybinds and
+Settings entries work with the mouse or with arrows and Enter. Settings currently
+contains the Sele theme palettes; the selected theme lives in memory for this run only.
+
+Pasting respects the focused application's bracketed-paste mode. Mouse events requested
+by the focused application, `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through
+normally.
 
 ## Scope
 
