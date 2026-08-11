@@ -10,17 +10,25 @@ Codex and/or Claude Code must already be installed and available on `PATH`.
 
 ```sh
 cargo install --path .
-svarm                         # Open a clean session in the current directory
-svarm --agent codex           # Codex in the current directory
+svarm                         # Open or create a workspace-neutral session
+svarm .                       # Open the new-agent form with this workspace
+svarm --agent codex .         # Start Codex here
 svarm --agent claude ../repo  # Claude Code in ../repo
-svarm --new-session ../repo   # Always create a distinct Svarm session
+svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
 ```
 
-Normal startup discovers every live session. With one or more sessions it asks whether to open an existing session or start a new one. `--attach --workspace ID` opens a listed session directly; add `--takeover` only when you deliberately want to disconnect its current UI. Multiple sessions may use the same workspace path and remain distinct by ID.
+Sessions are process groups and attachment targets, not workspaces. Agents in one
+session can run in different directories, and an empty session remains usable.
+Normal startup discovers every live session and asks whether to open one or start a
+new one. `--attach --session ID` opens a listed session directly; `--workspace ID`
+is a hidden compatibility alias for one release. Add `--takeover` only when you
+deliberately want to disconnect its current UI.
 
-If startup needs a choice but stdin or stdout is not a terminal, Svarm prints the eligible sessions and exits. Automation must choose explicitly with `--attach --workspace ID` or `--new-session`.
+If startup needs a choice but stdin or stdout is not a terminal, Svarm prints the
+eligible sessions and exits. Automation must choose explicitly with
+`--attach --session ID` or `--new-session`.
 
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
@@ -33,7 +41,7 @@ Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, relea
 | --- | --- |
 | `j`, `k`, or arrows | Select the next or previous agent |
 | `1`–`9` | Select an agent directly |
-| `n`, then `c` or `a` | Start Codex or Claude Code |
+| `n` | Open the workspace/agent/start form |
 | `b` | Toggle the sidebar |
 | `m` | Open the sidebar menu |
 | `x` | Close the selected agent, after confirmation |
@@ -51,13 +59,21 @@ Pasting respects the focused application's bracketed-paste mode. Mouse events re
 by the focused application, `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through
 normally.
 
+The new-agent form defaults to the last successfully launched workspace and agent.
+Workspace history is kept in most-recently-used order. From the workspace list,
+press `b` to open Yazi inside Svarm. If `yazi` is not installed, Svarm opens its
+keyboard-only native directory browser instead. While Yazi is focused, input belongs
+only to Yazi; `Ctrl+B, x` force-closes it and `Ctrl+B, Ctrl+B` sends a literal prefix.
+Yazi image previews are not composited, but text previews, colors, attributes, mouse,
+paste, resize, and its cursor are supported.
+
 ## Session and server lifecycle
 
 Detach, session stop, and server stop are intentionally different:
 
 - `Ctrl+B d` disconnects this UI immediately. Agents, their PTYs, terminal screens, process status, order, selection, and unseen-output generations remain live in the server.
 - `Ctrl+B q` confirms and then terminates every agent in the current Svarm session.
-- `svarm stop --workspace ID` stops one named session. `--yes` is accepted only with this unambiguous ID form.
+- `svarm stop --session ID` stops one named session. Without an ID, an interactive session chooser opens. `--yes` is accepted only with the unambiguous ID form.
 - `svarm server stop` reports affected session and agent counts, confirms, then stops every session and the server.
 - `svarm server status` reports reachability, PID, versions, socket, uptime, and client/session counts.
 
@@ -73,13 +89,18 @@ The Unix socket, singleton lock, and diagnostic PID file live in the private per
 
 Rotating `server.log` and `client.log` files live under `$XDG_STATE_HOME/svarm`, `~/.local/state/svarm`, or the private runtime fallback and are mode `0600`. Each is limited to roughly 1 MiB with two retained rotations. Default logs contain lifecycle information only: never terminal output, reconstructed screens, typed keys, pasted text, prompts, tokens, environment dumps, or full protocol payloads.
 
+Yazi cwd-result files are created with mode `0600` in the private runtime directory
+and removed after selection, cancellation, failure, force-close, or client shutdown.
+Settings persist only the theme, canonical workspace history, and last agent kind.
+
 ## Troubleshooting
 
 - Run `svarm server status`, then `svarm list`, to distinguish a missing server from a missing session.
-- If a session is already attached, the error identifies the connection/process and attachment age. Re-run with `--attach --workspace ID --takeover` only when disconnecting that UI is intentional.
-- A protocol-version mismatch leaves the live server and its agents untouched. Use matching Svarm client/server versions; do not delete the socket or kill a PID from the diagnostic file.
-- After a client connection error, Svarm restores the host terminal and prints the exact `svarm --attach --workspace ID` command. Agents may still be running.
-- If a workspace path later disappears, use `svarm list` and address the live session by ID.
+- If a session is already attached, the error identifies the connection/process and attachment age. Re-run with `--attach --session ID --takeover` only when disconnecting that UI is intentional.
+- Protocol version 3 is incompatible with older live clients and servers. A mismatch leaves the live server and its agents untouched; restart or use matching builds rather than deleting its socket.
+- After a client connection error, Svarm restores the host terminal and prints the exact `svarm --attach --session ID` command. Agents may still be running.
+- Missing remembered workspaces remain visible with a `missing` marker and cannot be selected. Press `b` to browse to another directory.
+- If Yazi cannot be found on `PATH`, the native browser opens automatically. Permission and invalid-executable errors are reported instead of being treated as absence.
 
 ## Scope
 
@@ -103,4 +124,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Before a release, manually verify Linux and macOS; local terminals and SSH; nesting in tmux or another multiplexer; keyboard-only use; `NO_COLOR` and a basic 16-color terminal; 80x24, 120x40, and a large terminal; dark and light themes across at least three terminal emulators; mouse-disabled and mouse-reporting child applications; bracketed and plain paste; abrupt terminal closure followed by attach; and sleep/wake while the operating system retains the server.
+Before a release, manually verify Linux and macOS; local terminals and SSH; nesting in
+tmux or another multiplexer; keyboard-only use; `NO_COLOR` and a basic 16-color
+terminal; 80x24, 120x40, and a large terminal; Yazi installed, absent, customized,
+cancelled, crashed, and force-closed; native browsing through hidden and symlinked
+directories; mouse-disabled and mouse-reporting children; bracketed and plain paste;
+several agents in different directories; resize while browsing; abrupt terminal
+closure followed by attach; and sleep/wake while the operating system retains the
+server.
