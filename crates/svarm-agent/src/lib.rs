@@ -1,6 +1,10 @@
 use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Serialize};
+
+pub mod framing;
 mod manager;
+pub mod protocol;
 mod session;
 mod terminal;
 
@@ -11,16 +15,22 @@ pub use session::{
 };
 pub use terminal::TerminalPalette;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct AgentId(u64);
 
 impl AgentId {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     Codex,
     Claude,

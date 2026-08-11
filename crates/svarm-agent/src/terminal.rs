@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use terminal_colorsaurus::ColorPalette;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalPalette {
     foreground: [u16; 3],
     background: [u16; 3],

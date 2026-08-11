@@ -6,5 +6,7 @@ description = "Coding-agent processes backed by pseudo-terminals"
 
 [dependencies]
 portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 terminal-colorsaurus = "1.0.3"
 tui-term = "0.3"

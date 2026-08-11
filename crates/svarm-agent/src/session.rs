@@ -10,6 +10,7 @@ use std::{
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use serde::{Deserialize, Serialize};
 use tui_term::vt100::Parser;
 
 use crate::{
@@ -19,13 +20,14 @@ use crate::{
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Running,
     Exited,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessExit {
     pub code: u32,
     pub signal: Option<String>,
@@ -66,7 +68,7 @@ pub struct AgentSession {
     read_error: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSnapshot {
     pub id: AgentId,
     pub kind: AgentKind,

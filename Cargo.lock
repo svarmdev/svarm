@@ -928,6 +928,8 @@ name = "svarm-agent"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "serde",
+ "serde_json",
  "terminal-colorsaurus",
  "tui-term",
 ]
