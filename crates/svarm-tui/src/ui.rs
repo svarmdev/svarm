@@ -17,6 +17,8 @@ use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
+const COMPACT_MODAL_WIDTH: u16 = 72;
+const COMPACT_MODAL_HEIGHT: u16 = 12;
 const MODAL_WIDTH: u16 = 76;
 const MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = 25;
@@ -440,6 +442,7 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " New agent ",
+        compact_modal_area(frame.area()),
         vec![
             Line::from(""),
             row(NewAgentField::Workspace, "Workspace", workspace),
@@ -475,7 +478,7 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let Some(state) = app.new_agent() else {
         return;
     };
-    let visible = 8;
+    let visible = 7;
     let start = state.selected_workspace.saturating_sub(visible - 1);
     let mut lines = vec![Line::from("")];
     if state.workspaces.is_empty() {
@@ -524,7 +527,13 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             theme.muted(),
         )),
     ]);
-    render_dialog(frame, theme, " Choose workspace ", lines);
+    render_dialog(
+        frame,
+        theme,
+        " Choose workspace ",
+        compact_modal_area(frame.area()),
+        lines,
+    );
 }
 
 fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -552,14 +561,22 @@ fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             theme.muted(),
         )),
     ]);
-    render_dialog(frame, theme, " Choose agent ", lines);
+    render_dialog(
+        frame,
+        theme,
+        " Choose agent ",
+        compact_modal_area(frame.area()),
+        lines,
+    );
 }
 
 fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let Some(browser) = app.native_browser() else {
         return;
     };
-    let visible = 8;
+    let area = browser_modal_area(frame.area());
+    let visible = usize::from(area.height.saturating_sub(6));
+    let content_width = usize::from(area.width.saturating_sub(8));
     let start = browser.selected.saturating_sub(visible - 1);
     let rows = std::iter::once((0, "Use this directory".into()))
         .chain(
@@ -581,14 +598,14 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                     },
                     accent(theme),
                 ),
-                Span::styled(end_truncate(&label, 66), text(theme)),
+                Span::styled(end_truncate(&label, content_width), text(theme)),
             ])
         });
     let mut lines = vec![
         Line::from(Span::styled(
             format!(
                 "  {}",
-                end_truncate(&browser.current_path.display().to_string(), 68)
+                end_truncate(&browser.current_path.display().to_string(), content_width,)
             ),
             theme.muted(),
         )),
@@ -599,7 +616,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         lines.push(Line::from(Span::styled("  Loading…", theme.muted())));
     } else if let Some(error) = &browser.error {
         lines.push(Line::from(Span::styled(
-            format!("  {}", end_truncate(error, 68)),
+            format!("  {}", end_truncate(error, content_width)),
             warning(theme),
         )));
     } else {
@@ -609,7 +626,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
         theme.muted(),
     )));
-    render_dialog(frame, theme, " Select workspace ", lines);
+    render_dialog(frame, theme, " Select workspace ", area, lines);
 }
 
 fn render_embedded_browser(
@@ -647,7 +664,7 @@ fn render_embedded_browser(
 }
 
 fn embedded_modal_area(area: Rect) -> Rect {
-    modal_area(area)
+    browser_modal_area(area)
 }
 
 pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
@@ -665,6 +682,7 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
         frame,
         theme,
         title,
+        modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
@@ -687,6 +705,7 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Stop Svarm session? ",
+        modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -717,7 +736,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
         Line::from(""),
         Line::from(Span::styled("  Esc closes", theme.muted())),
     ]);
-    render_dialog(frame, theme, " Keybinds ", lines);
+    render_dialog(frame, theme, " Keybinds ", modal_area(frame.area()), lines);
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -725,6 +744,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Settings ",
+        modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(vec![
@@ -747,8 +767,13 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     );
 }
 
-fn render_dialog(frame: &mut Frame<'_>, theme: Theme, title: &str, lines: Vec<Line<'static>>) {
-    let area = modal_area(frame.area());
+fn render_dialog(
+    frame: &mut Frame<'_>,
+    theme: Theme,
+    title: &str,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -766,8 +791,20 @@ fn render_dialog(frame: &mut Frame<'_>, theme: Theme, title: &str, lines: Vec<Li
     );
 }
 
+fn compact_modal_area(area: Rect) -> Rect {
+    centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, area)
+}
+
 fn modal_area(area: Rect) -> Rect {
     centered_rect(MODAL_WIDTH, MODAL_HEIGHT, area)
+}
+
+fn browser_modal_area(area: Rect) -> Rect {
+    centered_rect(
+        area.width.saturating_sub(4).min(100),
+        area.height.saturating_sub(2).min(30),
+        area,
+    )
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -843,10 +880,12 @@ mod tests {
     }
 
     #[test]
-    fn every_modal_uses_the_same_shell() {
+    fn agent_flow_is_compact_and_browsers_share_a_larger_shell() {
         let terminal = Rect::new(0, 0, 120, 40);
+        assert_eq!(compact_modal_area(terminal), Rect::new(24, 14, 72, 12));
         assert_eq!(modal_area(terminal), Rect::new(22, 11, 76, 18));
-        assert_eq!(embedded_modal_area(terminal), modal_area(terminal));
+        assert_eq!(browser_modal_area(terminal), Rect::new(10, 5, 100, 30));
+        assert_eq!(embedded_modal_area(terminal), browser_modal_area(terminal));
     }
 
     #[test]
