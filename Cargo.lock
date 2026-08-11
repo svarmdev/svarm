@@ -934,7 +934,7 @@ dependencies = [
  "serde",
  "serde_json",
  "terminal-colorsaurus",
- "tui-term",
+ "vt100-psmux",
 ]
 
 [[package]]
@@ -946,7 +946,6 @@ dependencies = [
  "serde",
  "serde_json",
  "svarm-agent",
- "tui-term",
 ]
 
 [[package]]
@@ -1059,17 +1058,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
-name = "tui-term"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a338ded85dbe7f9ea2298321d126244f54e531e2b2006b97abdab8e47d6f3c88"
-dependencies = [
- "ratatui-core",
- "ratatui-widgets",
- "vt100",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,10 +1093,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
-name = "vt100"
-version = "0.16.2"
+name = "vt100-psmux"
+version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+checksum = "9dbd1ea857a76ce70fff74561aa007fb39932df4c719d1edab2ff750f4590db4"
 dependencies = [
  "itoa",
  "unicode-width",

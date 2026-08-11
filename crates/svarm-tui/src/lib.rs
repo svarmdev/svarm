@@ -2,6 +2,7 @@ mod agents;
 mod app;
 mod input;
 mod runtime;
+mod screen;
 mod settings;
 mod startup;
 mod terminal;

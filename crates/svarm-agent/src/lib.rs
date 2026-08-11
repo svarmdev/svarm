@@ -3,6 +3,11 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 mod base64;
+
+/// The terminal emulator behind every agent screen, re-exported so the interface parses and
+/// renders exactly the state the agent side produced.
+pub use vt100;
+
 pub mod framing;
 pub mod input;
 #[cfg(unix)]

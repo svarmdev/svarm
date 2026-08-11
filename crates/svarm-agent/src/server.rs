@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
@@ -1586,7 +1586,7 @@ mod tests {
         CursorStyle,
         protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull},
     };
-    use tui_term::vt100::Parser;
+    use vt100::Parser;
 
     struct Client {
         stream: UnixStream,

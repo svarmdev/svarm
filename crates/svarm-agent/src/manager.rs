@@ -99,11 +99,7 @@ impl AgentManager {
         self.sessions.get(&id).map(AgentSession::terminal_snapshot)
     }
 
-    pub fn with_screen<T>(
-        &self,
-        id: AgentId,
-        read: impl FnOnce(&tui_term::vt100::Screen) -> T,
-    ) -> Option<T> {
+    pub fn with_screen<T>(&self, id: AgentId, read: impl FnOnce(&vt100::Screen) -> T) -> Option<T> {
         self.sessions
             .get(&id)
             .map(|session| session.with_screen(read))

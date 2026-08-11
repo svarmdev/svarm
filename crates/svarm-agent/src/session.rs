@@ -11,7 +11,7 @@ use std::{
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
-use tui_term::vt100::Parser;
+use vt100::Parser;
 
 use crate::{
     AgentId, AgentKind,
@@ -58,11 +58,11 @@ impl From<portable_pty::ExitStatus> for ProcessExit {
 
 #[derive(Clone, Debug)]
 pub struct TerminalSnapshot {
-    screen: tui_term::vt100::Screen,
+    screen: vt100::Screen,
 }
 
 impl TerminalSnapshot {
-    pub const fn screen(&self) -> &tui_term::vt100::Screen {
+    pub const fn screen(&self) -> &vt100::Screen {
         &self.screen
     }
 }
@@ -189,7 +189,7 @@ impl AgentSession {
     /// Reads the live screen in place. Callers that only need to measure or serialize it should
     /// use this rather than [`Self::terminal_snapshot`]: copying the screen is the most expensive
     /// thing on the output path, and doing it under the lock stalls the agent's reader thread.
-    pub fn with_screen<T>(&self, read: impl FnOnce(&tui_term::vt100::Screen) -> T) -> T {
+    pub fn with_screen<T>(&self, read: impl FnOnce(&vt100::Screen) -> T) -> T {
         read(self.parser().screen())
     }
 

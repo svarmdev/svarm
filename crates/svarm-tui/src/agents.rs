@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use svarm_agent::vt100::{Parser, Screen};
 use svarm_agent::{
     AgentId, AgentKind, CursorStyle, Result, TerminalPalette,
     framing::{read_frame, write_frame},
@@ -18,7 +19,6 @@ use svarm_agent::{
         TerminalSequence,
     },
 };
-use tui_term::vt100::{Parser, Screen};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 /// Mirrors the server's screen, which carries the visible grid only; see the matching constant in

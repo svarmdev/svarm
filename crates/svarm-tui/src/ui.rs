@@ -1,18 +1,16 @@
 use ratatui::{
     Frame,
-    layout::{Position, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
-use tui_term::{
-    vt100::Screen,
-    widget::{Cursor, PseudoTerminal},
-};
+use svarm_agent::vt100::Screen;
 
 use crate::{
     app::{App, MenuItem, Mode, SessionChooser},
     input::MANAGEMENT_KEYBINDINGS,
+    screen::AgentScreen,
     theme::Theme,
 };
 use svarm_agent::SessionStatus;
@@ -411,23 +409,13 @@ fn render_terminal(
     };
     // The cursor is the host terminal's own, placed below, so that it keeps the shape, color and
     // blink the user configured. Painting one into the buffer can only produce a static block.
-    frame.render_widget(
-        PseudoTerminal::new(screen).cursor(Cursor::default().visibility(false)),
-        area,
-    );
+    let pane = AgentScreen::new(screen);
     if mode == Mode::Terminal
-        && !screen.hide_cursor()
-        && let Some(position) = cursor_position(screen, area)
+        && let Some(position) = pane.cursor_position(area)
     {
         frame.set_cursor_position(position);
     }
-}
-
-/// The cursor's place in the frame, or `None` when the agent has it somewhere the pane cannot show
-/// — off the bottom of a screen taller than its area, for instance.
-fn cursor_position(screen: &Screen, area: Rect) -> Option<Position> {
-    let (row, column) = screen.cursor_position();
-    (row < area.height && column < area.width).then(|| Position::new(area.x + column, area.y + row))
+    frame.render_widget(pane, area);
 }
 
 fn render_choose_agent(frame: &mut Frame<'_>, theme: Theme) {
@@ -615,7 +603,7 @@ fn border(theme: Theme) -> Style {
 mod tests {
     use std::path::PathBuf;
 
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position};
     use svarm_agent::protocol::{
         AgentSnapshot, AttachmentSummary, ConnectionId, SessionId, SessionRevision, SessionSummary,
         SvarmSessionSnapshot, TerminalSequence,
@@ -833,7 +821,7 @@ mod tests {
 
     #[test]
     fn the_agent_cursor_is_the_host_terminal_cursor_not_a_painted_cell() {
-        let mut parser = tui_term::vt100::Parser::new(24, 55, 0);
+        let mut parser = svarm_agent::vt100::Parser::new(24, 55, 0);
         parser.process(b"prompt> ");
         let mut app = App::new(
             "workspace".into(),
@@ -871,7 +859,7 @@ mod tests {
 
     #[test]
     fn a_hidden_agent_cursor_leaves_the_host_cursor_hidden() {
-        let mut parser = tui_term::vt100::Parser::new(24, 55, 0);
+        let mut parser = svarm_agent::vt100::Parser::new(24, 55, 0);
         parser.process(b"working\x1b[?25l");
         let mut app = App::new(
             "workspace".into(),
