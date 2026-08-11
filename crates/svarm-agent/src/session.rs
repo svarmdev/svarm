@@ -20,6 +20,10 @@ use crate::{
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Called from an agent's reader thread every time new output lands, so the owner can wake up
+/// immediately instead of discovering the output on its next poll.
+pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -98,7 +102,7 @@ impl AgentSession {
         size: PtySize,
         command: CommandBuilder,
         palette: Option<TerminalPalette>,
-        dirty: Option<std::sync::mpsc::SyncSender<AgentId>>,
+        notify: Option<OutputNotifier>,
     ) -> Result<Self> {
         if !cwd.is_dir() {
             return Err(format!(
@@ -129,7 +133,7 @@ impl AgentSession {
             terminal_palette.clone(),
             generation.clone(),
             read_error.clone(),
-            (id, dirty),
+            (id, notify),
         );
 
         Ok(Self {
@@ -274,7 +278,7 @@ fn spawn_reader(
     terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
-    dirty: (AgentId, Option<std::sync::mpsc::SyncSender<AgentId>>),
+    notify: (AgentId, Option<OutputNotifier>),
 ) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
@@ -299,8 +303,8 @@ fn spawn_reader(
                         .unwrap_or_else(|poison| poison.into_inner())
                         .process(&buffer[..count]);
                     generation.fetch_add(1, Ordering::Release);
-                    if let Some(sender) = &dirty.1 {
-                        let _ = sender.try_send(dirty.0);
+                    if let Some(callback) = &notify.1 {
+                        callback(notify.0);
                     }
                 }
                 Err(error) => {

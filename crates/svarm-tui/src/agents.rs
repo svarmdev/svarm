@@ -3,9 +3,9 @@ use std::{
     net::Shutdown,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{Receiver, SyncSender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use svarm_agent::{
@@ -21,7 +21,6 @@ use svarm_agent::{
 use tui_term::vt100::{Parser, Screen};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
-const INCOMING_QUEUE: usize = 1_024;
 const SCROLLBACK_ROWS: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -40,9 +39,16 @@ pub(crate) enum RemoteUpdate {
     Disconnected(String),
 }
 
-enum Incoming {
-    Envelope(Envelope),
+pub(crate) enum Incoming {
+    Envelope(Box<Envelope>),
     Disconnected(String),
+}
+
+/// The single stream the interface blocks on. Host input and server frames arrive through one
+/// channel so the loop can sleep until either happens, rather than polling each in turn.
+pub(crate) enum ClientEvent {
+    Host(crossterm::event::Event),
+    Remote(Incoming),
 }
 
 struct CachedTerminal {
@@ -52,7 +58,6 @@ struct CachedTerminal {
 
 pub(crate) struct RemoteAgents {
     writer: UnixStream,
-    incoming: Receiver<Incoming>,
     next_request_id: u64,
     session_id: SessionId,
     lease_token: LeaseToken,
@@ -67,6 +72,7 @@ impl RemoteAgents {
         rows: u16,
         cols: u16,
         palette: Option<TerminalPalette>,
+        events: SyncSender<ClientEvent>,
     ) -> Result<(Self, SvarmSessionSnapshot)> {
         let mut writer = UnixStream::connect(socket_path).map_err(|error| {
             format!(
@@ -165,32 +171,31 @@ impl RemoteAgents {
         writer.set_read_timeout(None)?;
         writer.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
         let mut reader = writer.try_clone()?;
-        let (incoming_tx, incoming) = mpsc::sync_channel(INCOMING_QUEUE);
         thread::spawn(move || {
             loop {
-                match read_frame(&mut reader) {
-                    Ok(Some(envelope)) => {
-                        if incoming_tx.send(Incoming::Envelope(envelope)).is_err() {
-                            break;
-                        }
-                    }
+                let incoming = match read_frame(&mut reader) {
+                    Ok(Some(envelope)) => Incoming::Envelope(Box::new(envelope)),
                     Ok(None) => {
-                        let _ = incoming_tx.send(Incoming::Disconnected(
+                        let _ = events.send(ClientEvent::Remote(Incoming::Disconnected(
                             "Svarm server closed the connection".into(),
-                        ));
+                        )));
                         break;
                     }
                     Err(error) => {
-                        let _ = incoming_tx.send(Incoming::Disconnected(error.to_string()));
+                        let _ = events.send(ClientEvent::Remote(Incoming::Disconnected(
+                            error.to_string(),
+                        )));
                         break;
                     }
+                };
+                if events.send(ClientEvent::Remote(incoming)).is_err() {
+                    break;
                 }
             }
         });
         Ok((
             Self {
                 writer,
-                incoming,
                 next_request_id: 3,
                 session_id,
                 lease_token,
@@ -201,46 +206,43 @@ impl RemoteAgents {
         ))
     }
 
-    pub fn drain(&mut self) -> Vec<RemoteUpdate> {
-        let incoming = self.incoming.try_iter().collect::<Vec<_>>();
+    pub fn apply(&mut self, incoming: Incoming) -> Vec<RemoteUpdate> {
         let mut updates = Vec::new();
-        for incoming in incoming {
-            match incoming {
-                Incoming::Envelope(envelope) => match envelope.message {
-                    Message::Event(Event::TerminalFull(frame)) => {
-                        let id = frame.agent_id;
-                        let sequence = frame.sequence;
-                        let disposition = self.apply_full(frame);
-                        self.after_frame(id, sequence, disposition);
+        match incoming {
+            Incoming::Envelope(envelope) => match envelope.message {
+                Message::Event(Event::TerminalFull(frame)) => {
+                    let id = frame.agent_id;
+                    let sequence = frame.sequence;
+                    let disposition = self.apply_full(frame);
+                    self.after_frame(id, sequence, disposition);
+                    updates.push(RemoteUpdate::TerminalChanged);
+                }
+                Message::Event(Event::TerminalDiff(frame)) => {
+                    let id = frame.agent_id;
+                    let sequence = frame.sequence;
+                    let disposition = self.apply_diff(frame);
+                    self.after_frame(id, sequence, disposition);
+                    if disposition == FrameDisposition::Apply {
                         updates.push(RemoteUpdate::TerminalChanged);
                     }
-                    Message::Event(Event::TerminalDiff(frame)) => {
-                        let id = frame.agent_id;
-                        let sequence = frame.sequence;
-                        let disposition = self.apply_diff(frame);
-                        self.after_frame(id, sequence, disposition);
-                        if disposition == FrameDisposition::Apply {
-                            updates.push(RemoteUpdate::TerminalChanged);
-                        }
-                    }
-                    Message::Event(event) => {
-                        if let Event::AgentRemoved { agent_id, .. } = &event {
-                            self.terminals.remove(agent_id);
-                            self.pending_resync.remove(agent_id);
-                        }
-                        updates.push(RemoteUpdate::Event(event));
-                    }
-                    Message::Error(error) => {
-                        updates.push(RemoteUpdate::Error(error.actionable_message()))
-                    }
-                    Message::Response(_) => {}
-                    _ => updates.push(RemoteUpdate::Error(
-                        "Svarm server sent an unexpected message".into(),
-                    )),
-                },
-                Incoming::Disconnected(error) => {
-                    updates.push(RemoteUpdate::Disconnected(error));
                 }
+                Message::Event(event) => {
+                    if let Event::AgentRemoved { agent_id, .. } = &event {
+                        self.terminals.remove(agent_id);
+                        self.pending_resync.remove(agent_id);
+                    }
+                    updates.push(RemoteUpdate::Event(event));
+                }
+                Message::Error(error) => {
+                    updates.push(RemoteUpdate::Error(error.actionable_message()))
+                }
+                Message::Response(_) => {}
+                _ => updates.push(RemoteUpdate::Error(
+                    "Svarm server sent an unexpected message".into(),
+                )),
+            },
+            Incoming::Disconnected(error) => {
+                updates.push(RemoteUpdate::Disconnected(error));
             }
         }
         updates
@@ -321,19 +323,25 @@ impl RemoteAgents {
         })
     }
 
-    pub fn detach(&mut self) -> Result<()> {
-        match self.send_and_wait(Request::DetachSession {
-            lease_token: self.lease_token.clone(),
-        })? {
+    pub fn detach(&mut self, events: &Receiver<ClientEvent>) -> Result<()> {
+        match self.send_and_wait(
+            Request::DetachSession {
+                lease_token: self.lease_token.clone(),
+            },
+            events,
+        )? {
             Response::Ok => Ok(()),
             _ => Err("Svarm server returned an invalid detach response".into()),
         }
     }
 
-    pub fn stop(&mut self) -> Result<StopSummary> {
-        match self.send_and_wait(Request::StopAttachedSession {
-            lease_token: self.lease_token.clone(),
-        })? {
+    pub fn stop(&mut self, events: &Receiver<ClientEvent>) -> Result<StopSummary> {
+        match self.send_and_wait(
+            Request::StopAttachedSession {
+                lease_token: self.lease_token.clone(),
+            },
+            events,
+        )? {
             Response::Stopped(summary) => Ok(summary),
             _ => Err("Svarm server returned an invalid stop response".into()),
         }
@@ -423,7 +431,11 @@ impl RemoteAgents {
         Ok(())
     }
 
-    fn send_and_wait(&mut self, request: Request) -> Result<Response> {
+    fn send_and_wait(
+        &mut self,
+        request: Request,
+        events: &Receiver<ClientEvent>,
+    ) -> Result<Response> {
         let request_id = RequestId(self.next_request_id);
         self.next_request_id = self
             .next_request_id
@@ -437,17 +449,23 @@ impl RemoteAgents {
                 message: Message::Request(request),
             },
         )?;
+        let deadline = Instant::now() + CONNECTION_TIMEOUT;
         loop {
-            match self.incoming.recv_timeout(CONNECTION_TIMEOUT) {
-                Ok(Incoming::Envelope(envelope)) if envelope.request_id == Some(request_id) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(ClientEvent::Remote(Incoming::Envelope(envelope)))
+                    if envelope.request_id == Some(request_id) =>
+                {
                     return match envelope.message {
                         Message::Response(response) => Ok(response),
                         Message::Error(error) => Err(error.actionable_message().into()),
                         _ => Err("Svarm server returned an invalid response".into()),
                     };
                 }
-                Ok(Incoming::Envelope(_)) => {}
-                Ok(Incoming::Disconnected(error)) => return Err(error.into()),
+                // Host keystrokes and unrelated frames keep arriving while the session is being
+                // torn down; they no longer matter, so drop them and keep waiting.
+                Ok(ClientEvent::Remote(Incoming::Envelope(_)) | ClientEvent::Host(_)) => {}
+                Ok(ClientEvent::Remote(Incoming::Disconnected(error))) => return Err(error.into()),
                 Err(error) => return Err(format!("Svarm server did not respond: {error}").into()),
             }
         }

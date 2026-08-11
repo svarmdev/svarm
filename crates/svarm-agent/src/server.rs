@@ -257,6 +257,35 @@ impl OutgoingQueue {
 enum ServerInput {
     Frame(ConnectionId, Box<Envelope>),
     Disconnected(ConnectionId),
+    /// An agent produced output. Carries no payload: the loop polls every session anyway, and a
+    /// single pending wake stands in for any number of reads (see [`OutputWake`]).
+    AgentOutput,
+}
+
+/// Collapses the reader threads' per-read notifications into at most one queued wake-up, so a
+/// noisy agent cannot flood the input queue and delay real client requests.
+struct OutputWake {
+    input: SyncSender<ServerInput>,
+    pending: AtomicBool,
+}
+
+impl OutputWake {
+    fn notifier(self: &Arc<Self>) -> crate::session::OutputNotifier {
+        let wake = Arc::clone(self);
+        Arc::new(move |_| wake.raise())
+    }
+
+    fn raise(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel)
+            && self.input.try_send(ServerInput::AgentOutput).is_err()
+        {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+
+    fn clear(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
 }
 
 struct SessionRuntime {
@@ -273,12 +302,13 @@ struct FrameBasis {
 }
 
 impl SessionRuntime {
-    fn new(state: ServerSessionState) -> Self {
+    fn new(state: ServerSessionState, wake: Option<crate::session::OutputNotifier>) -> Self {
         let (rows, cols) = state.dimensions();
         let agents = AgentManager::new(
             state.canonical_path().clone(),
             pty_size(rows, cols),
             state.terminal_palette(),
+            wake,
         );
         Self {
             state,
@@ -532,6 +562,7 @@ struct Server {
     next_token: u64,
     input_tx: SyncSender<ServerInput>,
     input_rx: Receiver<ServerInput>,
+    output_wake: Arc<OutputWake>,
     stopping: bool,
     empty_since: Option<Instant>,
 }
@@ -541,6 +572,10 @@ impl Server {
         let listener = UnixListenerGuard::bind(&config.socket_path)?;
         let started_ms = unix_time_ms();
         let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
+        let output_wake = Arc::new(OutputWake {
+            input: input_tx.clone(),
+            pending: AtomicBool::new(false),
+        });
         Ok(Self {
             config,
             listener,
@@ -554,6 +589,7 @@ impl Server {
             next_token: 1,
             input_tx,
             input_rx,
+            output_wake,
             stopping: false,
             empty_since: Some(Instant::now()),
         })
@@ -566,6 +602,8 @@ impl Server {
                 continue;
             }
             self.accept_connections()?;
+            // Agent output raises a wake, so this blocks only while nothing is happening; the
+            // tick just paces connection accounting and the idle-shutdown check.
             match self.input_rx.recv_timeout(EVENT_TICK) {
                 Ok(input) => self.handle_input(input),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -574,6 +612,7 @@ impl Server {
             while let Ok(input) = self.input_rx.try_recv() {
                 self.handle_input(input);
             }
+            self.output_wake.clear();
             self.poll_sessions();
             self.update_lifetime();
         }
@@ -607,6 +646,9 @@ impl Server {
         match input {
             ServerInput::Frame(id, envelope) => self.handle_envelope(id, *envelope),
             ServerInput::Disconnected(id) => self.disconnect(id),
+            // Nothing to do: the wake exists only to break out of `recv_timeout` so that the
+            // `poll_sessions` call below runs now instead of up to a tick later.
+            ServerInput::AgentOutput => {}
         }
     }
 
@@ -1012,14 +1054,10 @@ impl Server {
             .checked_add(1)
             .ok_or_else(|| ProtocolError::new(ErrorCode::InternalError, "session IDs exhausted"))?;
         let now = self.now_ms();
-        let mut runtime = SessionRuntime::new(ServerSessionState::new(
-            session_id,
-            canonical_path,
-            rows,
-            cols,
-            palette,
-            now,
-        )?);
+        let mut runtime = SessionRuntime::new(
+            ServerSessionState::new(session_id, canonical_path, rows, cols, palette, now)?,
+            Some(self.output_wake.notifier()),
+        );
         let token = self.lease_token();
         runtime.state.attach(
             id,

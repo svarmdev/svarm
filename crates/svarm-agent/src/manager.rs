@@ -1,14 +1,17 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::PathBuf,
-    sync::mpsc::{Receiver, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
 };
 
 use portable_pty::PtySize;
 
 use crate::{
     AgentId, AgentKind, AgentSession, Result, SessionSnapshot, SessionStatus, TerminalPalette,
-    TerminalSnapshot,
+    TerminalSnapshot, session::OutputNotifier,
 };
 
 pub struct AgentManager {
@@ -20,10 +23,16 @@ pub struct AgentManager {
     terminal_palette: Option<TerminalPalette>,
     dirty_tx: SyncSender<AgentId>,
     dirty_rx: Receiver<AgentId>,
+    wake: Option<OutputNotifier>,
 }
 
 impl AgentManager {
-    pub fn new(cwd: PathBuf, pty_size: PtySize, terminal_palette: Option<TerminalPalette>) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        pty_size: PtySize,
+        terminal_palette: Option<TerminalPalette>,
+        wake: Option<OutputNotifier>,
+    ) -> Self {
         let (dirty_tx, dirty_rx) = sync_channel(1_024);
         Self {
             sessions: HashMap::new(),
@@ -34,7 +43,21 @@ impl AgentManager {
             terminal_palette,
             dirty_tx,
             dirty_rx,
+            wake,
         }
+    }
+
+    /// Records the agent as dirty and wakes the owner so the new output is forwarded on this
+    /// iteration of its loop rather than on its next timed tick.
+    fn notifier(&self) -> OutputNotifier {
+        let dirty_tx = self.dirty_tx.clone();
+        let wake = self.wake.clone();
+        Arc::new(move |id| {
+            let _ = dirty_tx.try_send(id);
+            if let Some(wake) = &wake {
+                wake(id);
+            }
+        })
     }
 
     pub fn spawn(&mut self, kind: AgentKind) -> Result<SessionSnapshot> {
@@ -47,7 +70,7 @@ impl AgentManager {
             self.pty_size,
             command,
             self.terminal_palette,
-            Some(self.dirty_tx.clone()),
+            Some(self.notifier()),
         )?;
         let snapshot = session.snapshot();
         self.sessions.insert(id, session);
@@ -161,7 +184,7 @@ impl AgentManager {
             self.pty_size,
             command,
             self.terminal_palette,
-            Some(self.dirty_tx.clone()),
+            Some(self.notifier()),
         )?;
         let snapshot = session.snapshot();
         self.sessions.insert(id, session);
@@ -224,7 +247,7 @@ mod tests {
 
     #[test]
     fn agent_ids_are_monotonic_and_exhaust_cleanly() {
-        let mut manager = AgentManager::new(PathBuf::new(), pty_size(1, 1), None);
+        let mut manager = AgentManager::new(PathBuf::new(), pty_size(1, 1), None, None);
         manager.next_id = Some(u64::MAX);
 
         assert_eq!(manager.allocate_id().unwrap(), AgentId::new(u64::MAX));

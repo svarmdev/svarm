@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::mpsc, thread};
 
 use crossterm::event::{
     self, Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerEvent};
 
 use crate::{
-    agents::{InitialSession, RemoteAgents, RemoteUpdate},
+    agents::{ClientEvent, InitialSession, RemoteAgents, RemoteUpdate},
     app::{App, ExitIntent, MenuItem, Mode},
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     settings::SettingsStore,
@@ -16,7 +16,7 @@ use crate::{
     ui::{self, UiModel},
 };
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const EVENT_QUEUE: usize = 1_024;
 
 pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession) -> Result<()> {
     let target = canonicalize_target(target)?;
@@ -26,12 +26,14 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
     let (theme, settings_notice) = settings.load();
     let (width, height) = crossterm::terminal::size()?;
     let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
+    let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
     let (mut agents, snapshot) = RemoteAgents::connect(
         &socket_path,
         target,
         child_area.height.max(1),
         child_area.width.max(1),
         palette,
+        events_tx.clone(),
     )?;
     let mut app = App::hydrate(snapshot, theme, settings_notice);
     if let Some(kind) = kind {
@@ -39,14 +41,10 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
     }
 
     let mut terminal = TerminalSession::open()?;
+    spawn_host_input(events_tx);
     let mut dirty = true;
     let mut connection_failure = None;
-    while app.exit_intent() == ExitIntent::None {
-        dirty |= apply_remote_updates(&mut app, &mut agents, &mut connection_failure);
-        if connection_failure.is_some() {
-            break;
-        }
-
+    while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
             let screen = app.selected_agent_id().and_then(|id| agents.screen(id));
             let model = UiModel {
@@ -61,35 +59,21 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
             dirty = false;
         }
 
-        if !event::poll(EVENT_POLL_INTERVAL)? {
-            continue;
-        }
-        match event::read()? {
-            HostEvent::Key(key) => {
-                let (resize, redraw) = handle_key(&mut app, &mut agents, &settings, key)?;
-                dirty |= redraw;
-                if resize {
-                    resize_agents(&mut agents, &app, terminal.terminal().size()?.into())?;
+        // Sleep until something actually happens, then absorb everything else already queued so a
+        // burst of agent output costs one redraw instead of one redraw per frame.
+        let Ok(first) = events.recv() else { break };
+        for event in std::iter::once(first).chain(events.try_iter()) {
+            match event {
+                ClientEvent::Remote(incoming) => {
+                    for update in agents.apply(incoming) {
+                        dirty |= apply_remote_update(&mut app, &mut connection_failure, update);
+                    }
+                }
+                ClientEvent::Host(host) => {
+                    dirty |=
+                        handle_host_event(&mut app, &mut agents, &settings, &mut terminal, host)?;
                 }
             }
-            HostEvent::Paste(text) if app.mode() == Mode::Terminal => {
-                if let Some(id) = app.selected_agent_id() {
-                    agents.paste(id, text)?;
-                }
-            }
-            HostEvent::Resize(width, height) => {
-                dirty = true;
-                resize_agents(&mut agents, &app, Rect::new(0, 0, width, height))?;
-            }
-            HostEvent::Mouse(mouse) => {
-                dirty |= handle_mouse(
-                    &mut app,
-                    &mut agents,
-                    mouse,
-                    terminal.terminal().size()?.into(),
-                )?;
-            }
-            _ => {}
         }
     }
 
@@ -98,9 +82,9 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
         return Err(connection_failure_message(&error, agents.session_id().0).into());
     }
     match app.exit_intent() {
-        ExitIntent::Detach => agents.detach()?,
+        ExitIntent::Detach => agents.detach(&events)?,
         ExitIntent::StopSession => {
-            let summary = agents.stop()?;
+            let summary = agents.stop(&events)?;
             if summary.cleanup_errors > 0 {
                 return Err(format!(
                     "Svarm session stopped with {} agent cleanup errors",
@@ -129,50 +113,93 @@ fn canonicalize_target(target: InitialSession) -> Result<InitialSession> {
     }
 }
 
-fn apply_remote_updates(
+/// Reads host input on its own thread so the interface can block on one channel carrying both
+/// keystrokes and server frames, and never has to wake up just to check whether input arrived.
+fn spawn_host_input(events: mpsc::SyncSender<ClientEvent>) {
+    thread::spawn(move || {
+        while let Ok(event) = event::read() {
+            if events.send(ClientEvent::Host(event)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn handle_host_event(
     app: &mut App,
     agents: &mut RemoteAgents,
+    settings: &SettingsStore,
+    terminal: &mut TerminalSession,
+    event: HostEvent,
+) -> Result<bool> {
+    let mut dirty = false;
+    match event {
+        HostEvent::Key(key) => {
+            let (resize, redraw) = handle_key(app, agents, settings, key)?;
+            dirty |= redraw;
+            if resize {
+                resize_agents(agents, app, terminal.terminal().size()?.into())?;
+            }
+        }
+        HostEvent::Paste(text) if app.mode() == Mode::Terminal => {
+            if let Some(id) = app.selected_agent_id() {
+                agents.paste(id, text)?;
+            }
+        }
+        HostEvent::Resize(width, height) => {
+            dirty = true;
+            resize_agents(agents, app, Rect::new(0, 0, width, height))?;
+        }
+        HostEvent::Mouse(mouse) => {
+            dirty |= handle_mouse(app, agents, mouse, terminal.terminal().size()?.into())?;
+        }
+        _ => {}
+    }
+    Ok(dirty)
+}
+
+fn apply_remote_update(
+    app: &mut App,
     connection_failure: &mut Option<String>,
+    update: RemoteUpdate,
 ) -> bool {
     let mut dirty = false;
-    for update in agents.drain() {
-        match update {
-            RemoteUpdate::Event(ServerEvent::AgentAdded { agent, .. }) => {
-                app.add_remote_agent(agent);
-                dirty = true;
-            }
-            RemoteUpdate::Event(ServerEvent::AgentChanged { agent, .. }) => {
-                dirty |= app.update_remote_agent(agent);
-            }
-            RemoteUpdate::Event(ServerEvent::AgentRemoved { agent_id, .. }) => {
-                app.remove_agent(agent_id);
-                dirty = true;
-            }
-            RemoteUpdate::Event(ServerEvent::SessionNotice(notice)) => {
-                app.set_notice(notice.message);
-                dirty = true;
-            }
-            RemoteUpdate::Event(ServerEvent::LeaseRevoked { reason }) => {
-                *connection_failure = Some(reason);
-            }
-            RemoteUpdate::Event(ServerEvent::ServerStopping) => {
-                *connection_failure = Some("Svarm server is stopping".into());
-            }
-            RemoteUpdate::Event(
-                ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_),
-            ) => {
-                dirty = true;
-            }
-            RemoteUpdate::Event(ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_)) => {
-                unreachable!("terminal frames are applied by adapter")
-            }
-            RemoteUpdate::TerminalChanged => dirty = true,
-            RemoteUpdate::Error(error) => {
-                app.set_notice(error);
-                dirty = true;
-            }
-            RemoteUpdate::Disconnected(error) => *connection_failure = Some(error),
+    match update {
+        RemoteUpdate::Event(ServerEvent::AgentAdded { agent, .. }) => {
+            app.add_remote_agent(agent);
+            dirty = true;
         }
+        RemoteUpdate::Event(ServerEvent::AgentChanged { agent, .. }) => {
+            dirty |= app.update_remote_agent(agent);
+        }
+        RemoteUpdate::Event(ServerEvent::AgentRemoved { agent_id, .. }) => {
+            app.remove_agent(agent_id);
+            dirty = true;
+        }
+        RemoteUpdate::Event(ServerEvent::SessionNotice(notice)) => {
+            app.set_notice(notice.message);
+            dirty = true;
+        }
+        RemoteUpdate::Event(ServerEvent::LeaseRevoked { reason }) => {
+            *connection_failure = Some(reason);
+        }
+        RemoteUpdate::Event(ServerEvent::ServerStopping) => {
+            *connection_failure = Some("Svarm server is stopping".into());
+        }
+        RemoteUpdate::Event(
+            ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_),
+        ) => {
+            dirty = true;
+        }
+        RemoteUpdate::Event(ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_)) => {
+            unreachable!("terminal frames are applied by adapter")
+        }
+        RemoteUpdate::TerminalChanged => dirty = true,
+        RemoteUpdate::Error(error) => {
+            app.set_notice(error);
+            dirty = true;
+        }
+        RemoteUpdate::Disconnected(error) => *connection_failure = Some(error),
     }
     dirty
 }
