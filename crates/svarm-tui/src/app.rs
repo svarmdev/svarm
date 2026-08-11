@@ -489,6 +489,7 @@ mod tests {
         SessionSnapshot {
             id: AgentId::new(id),
             kind: AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/workspace"),
             status: SessionStatus::Running,
             output_generation: generation,
             read_error: None,

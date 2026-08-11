@@ -312,12 +312,7 @@ enum FramePayload {
 impl SessionRuntime {
     fn new(state: ServerSessionState, wake: Option<crate::session::OutputNotifier>) -> Self {
         let (rows, cols) = state.dimensions();
-        let agents = AgentManager::new(
-            state.canonical_path().clone(),
-            pty_size(rows, cols),
-            state.terminal_palette(),
-            wake,
-        );
+        let agents = AgentManager::new(pty_size(rows, cols), state.terminal_palette(), wake);
         Self {
             state,
             agents,
@@ -334,12 +329,13 @@ impl SessionRuntime {
     ) -> AgentResult<SessionSnapshot> {
         #[cfg(test)]
         let snapshot = if let Some((program, args)) = &_config.test_agent_command {
-            self.agents.spawn_test_command(kind, program, args)?
+            self.agents
+                .spawn_test_command(kind, self.state.canonical_path(), program, args)?
         } else {
-            self.agents.spawn(kind)?
+            self.agents.spawn(kind, self.state.canonical_path())?
         };
         #[cfg(not(test))]
-        let snapshot = self.agents.spawn(kind)?;
+        let snapshot = self.agents.spawn(kind, self.state.canonical_path())?;
 
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
@@ -396,7 +392,7 @@ impl SessionRuntime {
         AgentSnapshot {
             id: snapshot.id,
             kind: snapshot.kind,
-            launch_directory: self.state.canonical_path().clone(),
+            launch_directory: snapshot.launch_directory,
             status: snapshot.status,
             exit: snapshot.exit,
             output_generation: snapshot.output_generation,

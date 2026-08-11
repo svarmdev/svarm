@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
+    path::Path,
     sync::{
         Arc,
         mpsc::{Receiver, SyncSender, sync_channel},
@@ -17,7 +17,6 @@ use crate::{
 pub struct AgentManager {
     sessions: HashMap<AgentId, AgentSession>,
     order: Vec<AgentId>,
-    cwd: PathBuf,
     next_id: Option<u64>,
     pty_size: PtySize,
     terminal_palette: Option<TerminalPalette>,
@@ -28,7 +27,6 @@ pub struct AgentManager {
 
 impl AgentManager {
     pub fn new(
-        cwd: PathBuf,
         pty_size: PtySize,
         terminal_palette: Option<TerminalPalette>,
         wake: Option<OutputNotifier>,
@@ -37,7 +35,6 @@ impl AgentManager {
         Self {
             sessions: HashMap::new(),
             order: Vec::new(),
-            cwd,
             next_id: Some(1),
             pty_size,
             terminal_palette,
@@ -60,13 +57,13 @@ impl AgentManager {
         })
     }
 
-    pub fn spawn(&mut self, kind: AgentKind) -> Result<SessionSnapshot> {
+    pub fn spawn(&mut self, kind: AgentKind, launch_directory: &Path) -> Result<SessionSnapshot> {
         let id = self.allocate_id()?;
-        let command = super::session::agent_command(kind, &self.cwd);
+        let command = super::session::agent_command(kind, launch_directory);
         let session = AgentSession::spawn_command(
             id,
             kind,
-            &self.cwd,
+            launch_directory,
             self.pty_size,
             command,
             self.terminal_palette,
@@ -180,6 +177,7 @@ impl AgentManager {
     pub(crate) fn spawn_test_command(
         &mut self,
         kind: AgentKind,
+        launch_directory: &Path,
         program: &str,
         args: &[String],
     ) -> Result<SessionSnapshot> {
@@ -188,11 +186,11 @@ impl AgentManager {
         let id = self.allocate_id()?;
         let mut command = CommandBuilder::new(program);
         command.args(args);
-        command.cwd(&self.cwd);
+        command.cwd(launch_directory);
         let session = AgentSession::spawn_command(
             id,
             kind,
-            &self.cwd,
+            launch_directory,
             self.pty_size,
             command,
             self.terminal_palette,
@@ -259,7 +257,7 @@ mod tests {
 
     #[test]
     fn agent_ids_are_monotonic_and_exhaust_cleanly() {
-        let mut manager = AgentManager::new(PathBuf::new(), pty_size(1, 1), None, None);
+        let mut manager = AgentManager::new(pty_size(1, 1), None, None);
         manager.next_id = Some(u64::MAX);
 
         assert_eq!(manager.allocate_id().unwrap(), AgentId::new(u64::MAX));
@@ -267,5 +265,23 @@ mod tests {
             manager.allocate_id().unwrap_err().to_string(),
             "agent identifier space exhausted"
         );
+    }
+
+    #[test]
+    fn each_agent_keeps_its_own_launch_directory() {
+        let first = std::env::current_dir().unwrap();
+        let second = first.parent().unwrap().to_owned();
+        let mut manager = AgentManager::new(pty_size(1, 1), None, None);
+        let args = vec!["-c".into(), "exit 0".into()];
+
+        let first_snapshot = manager
+            .spawn_test_command(AgentKind::Codex, &first, "sh", &args)
+            .unwrap();
+        let second_snapshot = manager
+            .spawn_test_command(AgentKind::Claude, &second, "sh", &args)
+            .unwrap();
+
+        assert_eq!(first_snapshot.launch_directory, first);
+        assert_eq!(second_snapshot.launch_directory, second);
     }
 }

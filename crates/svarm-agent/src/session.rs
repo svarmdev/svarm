@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
@@ -14,6 +17,7 @@ pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
 pub struct AgentSession {
     id: AgentId,
     kind: AgentKind,
+    launch_directory: PathBuf,
     terminal: TerminalProcess,
 }
 
@@ -21,6 +25,7 @@ pub struct AgentSession {
 pub struct SessionSnapshot {
     pub id: AgentId,
     pub kind: AgentKind,
+    pub launch_directory: PathBuf,
     pub status: SessionStatus,
     pub output_generation: u64,
     pub read_error: Option<String>,
@@ -52,6 +57,7 @@ impl AgentSession {
         Ok(Self {
             id,
             kind,
+            launch_directory: cwd.to_owned(),
             terminal: TerminalProcess::spawn_command(command, cwd, size, palette, notify)?,
         })
     }
@@ -88,6 +94,7 @@ impl AgentSession {
         SessionSnapshot {
             id: self.id,
             kind: self.kind,
+            launch_directory: self.launch_directory.clone(),
             status: self.terminal.status(),
             output_generation: self.terminal.generation(),
             read_error: self.terminal.read_error(),
