@@ -53,6 +53,7 @@ pub(crate) struct UiModel<'a> {
     pub screen: Option<&'a Screen>,
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
+    pub colors_enabled: bool,
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
@@ -75,7 +76,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     }
 
     if app.sidebar_visible() {
-        render_sidebar(frame, app, sidebar_area(area), theme);
+        render_sidebar(frame, app, sidebar_area(area), theme, model.colors_enabled);
     }
     render_terminal(
         frame,
@@ -316,7 +317,13 @@ fn agent_list_start(app: &App, area: Rect) -> usize {
     app.selected_index().saturating_sub(visible - 1)
 }
 
-fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_sidebar(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    theme: Theme,
+    colors_enabled: bool,
+) {
     let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
     let block = Block::new()
         .title(title)
@@ -335,7 +342,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .enumerate()
         .map(|(index, agent)| {
             let status = agent.display_status();
-            let (circle, status_style) = status_display(status, theme);
+            let (circle, status_style) = status_display(status, colors_enabled);
             let content_width = usize::from(agents_area.width.saturating_sub(2));
             let number = format!("{} · ", index + 1);
             let title = end_truncate(
@@ -443,13 +450,21 @@ fn paired_truncate(left: &str, right: &str, width: usize) -> String {
     )
 }
 
-fn status_display(status: AgentDisplayStatus, theme: Theme) -> (&'static str, Style) {
+fn status_display(status: AgentDisplayStatus, colors_enabled: bool) -> (&'static str, Style) {
     match status {
-        AgentDisplayStatus::Unknown | AgentDisplayStatus::Idle => ("●", theme.muted()),
-        AgentDisplayStatus::Working => ("●", warning(theme)),
-        AgentDisplayStatus::Done => ("●", success(theme)),
-        AgentDisplayStatus::NeedsYou | AgentDisplayStatus::Failed => ("●", error(theme)),
+        AgentDisplayStatus::Unknown | AgentDisplayStatus::Idle => {
+            ("●", Style::default().add_modifier(Modifier::DIM))
+        }
+        AgentDisplayStatus::Working => ("●", status_color(Color::Yellow, colors_enabled)),
+        AgentDisplayStatus::Done => ("●", status_color(Color::Green, colors_enabled)),
+        AgentDisplayStatus::NeedsYou | AgentDisplayStatus::Failed => {
+            ("●", status_color(Color::Red, colors_enabled))
+        }
     }
+}
+
+fn status_color(color: Color, colors_enabled: bool) -> Style {
+    Style::default().fg(if colors_enabled { color } else { Color::Reset })
 }
 
 fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -910,10 +925,6 @@ fn warning(theme: Theme) -> Style {
     Style::default().fg(theme.warn)
 }
 
-fn error(theme: Theme) -> Style {
-    Style::default().fg(theme.error)
-}
-
 fn border(theme: Theme) -> Style {
     Style::default().fg(theme.border)
 }
@@ -995,6 +1006,7 @@ mod tests {
                             screen: None,
                             embedded: None,
                             theme: app.theme().theme(true),
+                            colors_enabled: true,
                         },
                     );
                 })
@@ -1033,6 +1045,7 @@ mod tests {
                             screen: None,
                             embedded: None,
                             theme: app.theme().theme(true),
+                            colors_enabled: true,
                         },
                     );
                 })
@@ -1213,6 +1226,7 @@ mod tests {
                         screen: None,
                         embedded: None,
                         theme,
+                        colors_enabled: true,
                     },
                 )
             })
@@ -1225,7 +1239,7 @@ mod tests {
             .filter(|cell| cell.symbol() == "●")
             .map(|cell| cell.fg)
             .collect::<Vec<_>>();
-        assert_eq!(circle_colors, vec![theme.error, theme.ok]);
+        assert_eq!(circle_colors, vec![Color::Red, Color::Green]);
         for row in 0..24 {
             for column in 0..SIDEBAR_WIDTH {
                 assert_eq!(
@@ -1238,11 +1252,10 @@ mod tests {
     }
 
     #[test]
-    fn status_markers_share_one_glyph_and_use_semantic_colors() {
-        let theme = crate::theme::ThemeName::Dark.theme(true);
+    fn status_markers_share_one_glyph_and_keep_fixed_colors_across_themes() {
         assert_eq!(
-            status_display(AgentDisplayStatus::Unknown, theme),
-            status_display(AgentDisplayStatus::Idle, theme)
+            status_display(AgentDisplayStatus::Unknown, true),
+            status_display(AgentDisplayStatus::Idle, true)
         );
         for status in [
             AgentDisplayStatus::Unknown,
@@ -1252,19 +1265,23 @@ mod tests {
             AgentDisplayStatus::NeedsYou,
             AgentDisplayStatus::Failed,
         ] {
-            assert_eq!(status_display(status, theme).0, "●");
+            assert_eq!(status_display(status, true).0, "●");
         }
         assert_eq!(
-            status_display(AgentDisplayStatus::Working, theme).1.fg,
-            Some(theme.warn)
+            status_display(AgentDisplayStatus::Working, true).1.fg,
+            Some(Color::Yellow)
         );
         assert_eq!(
-            status_display(AgentDisplayStatus::Done, theme).1.fg,
-            Some(theme.ok)
+            status_display(AgentDisplayStatus::Done, true).1.fg,
+            Some(Color::Green)
         );
         assert_eq!(
-            status_display(AgentDisplayStatus::NeedsYou, theme).1.fg,
-            Some(theme.error)
+            status_display(AgentDisplayStatus::NeedsYou, true).1.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            status_display(AgentDisplayStatus::Working, false).1.fg,
+            Some(Color::Reset)
         );
     }
 
@@ -1342,6 +1359,7 @@ mod tests {
                         screen: Some(parser.screen()),
                         embedded: None,
                         theme: app.theme().theme(true),
+                        colors_enabled: true,
                     },
                 )
             })
@@ -1381,6 +1399,7 @@ mod tests {
                         screen: Some(parser.screen()),
                         embedded: None,
                         theme: app.theme().theme(true),
+                        colors_enabled: true,
                     },
                 )
             })
@@ -1423,6 +1442,7 @@ mod tests {
                         screen: None,
                         embedded: Some(&snapshot),
                         theme: app.theme().theme(true),
+                        colors_enabled: true,
                     },
                 )
             })
@@ -1455,6 +1475,7 @@ mod tests {
                         screen: None,
                         embedded: None,
                         theme: app.theme().theme(false),
+                        colors_enabled: false,
                     },
                 )
             })

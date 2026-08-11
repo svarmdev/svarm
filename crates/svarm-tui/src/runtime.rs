@@ -108,6 +108,7 @@ pub fn run(
                 screen: selected.and_then(|id| agents.screen(id)),
                 embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
+                colors_enabled,
             };
             let cursor_style = embedded.as_ref().map_or_else(
                 || {
