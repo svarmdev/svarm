@@ -23,11 +23,15 @@ pub mod server;
 pub mod server_session;
 mod session;
 mod terminal;
+mod terminal_process;
 
 pub use manager::{AgentManager, pty_size};
 pub use portable_pty::PtySize;
-pub use session::{AgentSession, ProcessExit, Result, SessionSnapshot, SessionStatus};
+pub use session::{AgentSession, SessionSnapshot};
 pub use terminal::{CursorStyle, TerminalPalette};
+pub use terminal_process::{
+    ProcessExit, Result, SessionStatus, TerminalNotifier, TerminalProcess, TerminalProcessSnapshot,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
