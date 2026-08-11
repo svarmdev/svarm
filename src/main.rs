@@ -1,7 +1,10 @@
 use clap::Parser;
-use svarm::cli::Cli;
+
+mod cli;
+
+use cli::Cli;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    svarm::runtime::run(cli.agent, cli.path)
+    svarm_tui::run(cli.agent, cli.path)
 }

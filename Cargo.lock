@@ -920,12 +920,27 @@ name = "svarm"
 version = "0.1.0"
 dependencies = [
  "clap",
- "crossterm",
+ "svarm-tui",
+]
+
+[[package]]
+name = "svarm-agent"
+version = "0.1.0"
+dependencies = [
  "portable-pty",
+ "terminal-colorsaurus",
+ "tui-term",
+]
+
+[[package]]
+name = "svarm-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
  "ratatui",
  "serde",
  "serde_json",
- "terminal-colorsaurus",
+ "svarm-agent",
  "tui-term",
 ]
 

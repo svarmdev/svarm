@@ -7,7 +7,8 @@ use ratatui::{
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::{Mode, app::App, session::SessionStatus, theme::Theme};
+use crate::{Mode, app::App, theme::Theme};
+use svarm_agent::SessionStatus;
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;

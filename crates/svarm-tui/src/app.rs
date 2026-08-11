@@ -1,13 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use portable_pty::PtySize;
-
 use crate::{
-    AgentKind, Mode,
-    session::{AgentSession, Result, SessionStatus, TerminalPalette},
+    Mode,
     settings::{Settings, settings_path},
     theme::ThemeName,
 };
+use svarm_agent::{AgentKind, AgentSession, PtySize, Result, SessionStatus, TerminalPalette};
 
 pub struct AgentEntry {
     pub session: AgentSession,
@@ -118,10 +116,6 @@ impl App {
 
     pub fn current(&self) -> Option<&AgentEntry> {
         self.agents.get(self.selected)
-    }
-
-    pub fn current_mut(&mut self) -> Option<&mut AgentEntry> {
-        self.agents.get_mut(self.selected)
     }
 
     pub fn select_next(&mut self) {

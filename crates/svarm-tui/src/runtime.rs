@@ -13,12 +13,12 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
 use crate::{
-    AgentKind, Mode,
+    Mode,
     app::{App, pty_size},
     input::{encode_key, encode_mouse, encode_paste},
-    session::{Result, TerminalPalette},
     ui,
 };
+use svarm_agent::{AgentKind, Result, TerminalPalette};
 
 type SvarmTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);

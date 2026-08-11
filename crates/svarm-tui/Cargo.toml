@@ -1,0 +1,13 @@
+[package]
+name = "svarm-tui"
+version.workspace = true
+edition.workspace = true
+description = "Interactive terminal interface for Svarm"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+svarm-agent = { path = "../svarm-agent" }
+tui-term = "0.3"

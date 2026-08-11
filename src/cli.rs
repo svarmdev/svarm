@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::AgentKind;
+use svarm_tui::AgentKind;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "A small terminal multiplexer for coding agents")]

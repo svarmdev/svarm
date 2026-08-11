@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "A small terminal multiplexer for coding agents"
 
+[workspace]
+members = ["crates/svarm-agent", "crates/svarm-tui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.29"
-portable-pty = "0.9"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-terminal-colorsaurus = "1.0.3"
-tui-term = "0.3"
+svarm-tui = { path = "crates/svarm-tui" }

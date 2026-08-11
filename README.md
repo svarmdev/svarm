@@ -51,6 +51,12 @@ Sessions currently live for the lifetime of the Svarm process; quitting stops th
 
 ## Develop
 
+The workspace is split by responsibility:
+
+- `svarm-agent` launches and manages coding agents in pseudo-terminals.
+- `svarm-tui` owns application state, terminal input, rendering, themes, and settings.
+- the root `svarm` package contains only the executable entry point and CLI arguments.
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings

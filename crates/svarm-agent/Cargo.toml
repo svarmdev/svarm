@@ -1,0 +1,10 @@
+[package]
+name = "svarm-agent"
+version.workspace = true
+edition.workspace = true
+description = "Coding-agent processes backed by pseudo-terminals"
+
+[dependencies]
+portable-pty = "0.9"
+terminal-colorsaurus = "1.0.3"
+tui-term = "0.3"

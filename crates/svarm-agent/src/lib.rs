@@ -1,31 +1,14 @@
 use std::{fmt, str::FromStr};
 
-pub mod app;
-pub mod cli;
-pub mod input;
-pub mod runtime;
-pub mod session;
-pub mod settings;
-pub mod theme;
-pub mod ui;
+mod session;
+
+pub use portable_pty::PtySize;
+pub use session::{AgentSession, Result, SessionStatus, TerminalPalette};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {
     Codex,
     Claude,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Mode {
-    #[default]
-    Terminal,
-    Prefix,
-    ChooseAgent,
-    ConfirmClose,
-    ConfirmQuit,
-    Menu,
-    Keybinds,
-    Settings,
 }
 
 impl AgentKind {
@@ -55,7 +38,7 @@ impl fmt::Display for AgentKind {
 impl FromStr for AgentKind {
     type Err = String;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" => Ok(Self::Claude),

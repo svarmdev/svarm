@@ -133,7 +133,7 @@ impl AgentSession {
         })
     }
 
-    pub(crate) fn parser(&self) -> MutexGuard<'_, Parser> {
+    pub fn parser(&self) -> MutexGuard<'_, Parser> {
         self.parser
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
