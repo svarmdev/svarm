@@ -4,7 +4,7 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentKind, Mode,
-    session::{AgentSession, Result},
+    session::{AgentSession, Result, SessionStatus},
 };
 
 pub struct AgentEntry {
@@ -127,7 +127,9 @@ impl App {
         Ok(())
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let before = self.output_stamp();
+        let notice = self.notice.clone();
         for agent in &mut self.agents {
             if let Err(error) = agent.session.poll_status() {
                 self.notice = Some(error.to_string());
@@ -135,6 +137,14 @@ impl App {
                 self.notice = Some(error);
             }
         }
+        before != self.output_stamp() || notice != self.notice
+    }
+
+    pub fn output_stamp(&self) -> Vec<(u64, SessionStatus)> {
+        self.agents
+            .iter()
+            .map(|agent| (agent.session.generation(), agent.session.status()))
+            .collect()
     }
 
     pub fn workspace_name(&self) -> &str {

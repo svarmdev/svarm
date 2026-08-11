@@ -32,15 +32,23 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
     let area = terminal.terminal.size()?;
     let child_area = ui::terminal_area(area.into(), true);
     let mut app = App::new(kind, cwd, pty_size(child_area.height, child_area.width))?;
+    let mut last_stamp = Vec::new();
+    let mut dirty = true;
 
     while !app.quit {
-        app.poll();
-        app.mark_selected_seen();
-        terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+        dirty |= app.poll();
+        dirty |= last_stamp != app.output_stamp();
+        if dirty {
+            app.mark_selected_seen();
+            terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+            last_stamp = app.output_stamp();
+            dirty = false;
+        }
 
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
+        dirty = true;
         match event::read()? {
             Event::Key(key) => {
                 let resize = handle_key(&mut app, key)?;
@@ -174,8 +182,7 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        terminal.clear()?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
 }
