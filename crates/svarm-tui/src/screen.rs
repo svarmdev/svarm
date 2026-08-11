@@ -1,4 +1,4 @@
-//! Draws an agent's emulated screen into the frame.
+//! Draws an emulated terminal screen into the frame.
 //!
 //! Svarm renders this itself rather than through a widget library because the translation from
 //! terminal cell to buffer cell is where an agent's colors are either preserved or quietly lost.
@@ -21,11 +21,11 @@ use ratatui::{
 };
 use svarm_agent::vt100::{Cell, Color as TerminalColor, Screen};
 
-pub(crate) struct AgentScreen<'a> {
+pub(crate) struct TerminalScreen<'a> {
     screen: &'a Screen,
 }
 
-impl<'a> AgentScreen<'a> {
+impl<'a> TerminalScreen<'a> {
     pub const fn new(screen: &'a Screen) -> Self {
         Self { screen }
     }
@@ -42,7 +42,7 @@ impl<'a> AgentScreen<'a> {
     }
 }
 
-impl Widget for AgentScreen<'_> {
+impl Widget for TerminalScreen<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         for row in 0..area.height {
             for column in 0..area.width {
@@ -126,7 +126,7 @@ mod tests {
         parser.process(output);
         let area = Rect::new(0, 0, 12, 2);
         let mut buffer = Buffer::empty(area);
-        AgentScreen::new(parser.screen()).render(area, &mut buffer);
+        TerminalScreen::new(parser.screen()).render(area, &mut buffer);
         buffer
     }
 
@@ -190,7 +190,7 @@ mod tests {
         buffer[(4, 0)].set_symbol("x");
         let mut parser = Parser::new(2, 12, 0);
         parser.process(b"ab");
-        AgentScreen::new(parser.screen()).render(Rect::new(0, 0, 12, 2), &mut buffer);
+        TerminalScreen::new(parser.screen()).render(Rect::new(0, 0, 12, 2), &mut buffer);
 
         assert_eq!(buffer[(4, 0)].symbol(), " ");
     }
@@ -201,13 +201,13 @@ mod tests {
         parser.process(b"ab");
         let area = Rect::new(3, 1, 12, 2);
         assert_eq!(
-            AgentScreen::new(parser.screen()).cursor_position(area),
+            TerminalScreen::new(parser.screen()).cursor_position(area),
             Some(Position::new(5, 1))
         );
 
         parser.process(b"\x1b[?25l");
         assert_eq!(
-            AgentScreen::new(parser.screen()).cursor_position(area),
+            TerminalScreen::new(parser.screen()).cursor_position(area),
             None
         );
     }

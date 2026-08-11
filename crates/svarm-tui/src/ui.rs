@@ -10,7 +10,7 @@ use svarm_agent::vt100::Screen;
 use crate::{
     app::{App, MenuItem, Mode, SessionChooser},
     input::MANAGEMENT_KEYBINDINGS,
-    screen::AgentScreen,
+    screen::TerminalScreen,
     theme::Theme,
 };
 use svarm_agent::SessionStatus;
@@ -409,7 +409,7 @@ fn render_terminal(
     };
     // The cursor is the host terminal's own, placed below, so that it keeps the shape, color and
     // blink the user configured. Painting one into the buffer can only produce a static block.
-    let pane = AgentScreen::new(screen);
+    let pane = TerminalScreen::new(screen);
     if mode == Mode::Terminal
         && let Some(position) = pane.cursor_position(area)
     {
