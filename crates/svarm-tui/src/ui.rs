@@ -11,7 +11,7 @@ use tui_term::{
 };
 
 use crate::{
-    app::{App, MenuItem, Mode},
+    app::{App, MenuItem, Mode, SessionChooser},
     input::MANAGEMENT_KEYBINDINGS,
     theme::Theme,
 };
@@ -21,6 +21,7 @@ pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
 pub const SIDEBAR_WIDTH: u16 = 25;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
+const MENU_WIDTH: u16 = 46;
 
 #[derive(Clone, Copy)]
 pub(crate) struct UiModel<'a> {
@@ -64,12 +65,159 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?")
         }
-        Mode::ConfirmQuit => {
-            render_confirmation(frame, theme, "Quit Svarm?", "Stop all agents and quit?")
-        }
+        Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme),
         Mode::Keybinds => render_keybinds(frame, theme),
         Mode::Settings => render_settings(frame, app, theme),
         _ => {}
+    }
+}
+
+pub(crate) fn render_session_chooser(
+    frame: &mut Frame<'_>,
+    chooser: &SessionChooser,
+    now_ms: u64,
+    theme: Theme,
+) {
+    let area = frame.area();
+    frame.render_widget(Block::new().style(theme.page()), area);
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Svarm needs at least {MIN_WIDTH}x{MIN_HEIGHT}\ncurrent terminal: {}x{}",
+                area.width, area.height
+            ))
+            .centered()
+            .style(text(theme)),
+            area,
+        );
+        return;
+    }
+
+    let block = Block::bordered()
+        .title(Span::styled(
+            " Open Svarm session ",
+            accent(theme).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(border(theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let footer_height = 2;
+    let list_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(footer_height),
+    );
+    let visible_rows = usize::from(list_area.height);
+    let start = chooser.viewport_start(visible_rows);
+    let end = (start + visible_rows).min(chooser.row_count());
+    let rows = (start..end).map(|index| {
+        let selected = index == chooser.selected();
+        let line = if let Some(session) = chooser.sessions().get(index) {
+            session_row(session, now_ms, list_area.width.saturating_sub(3), theme)
+        } else {
+            Line::from(vec![
+                Span::styled("+ ", success(theme)),
+                Span::styled(
+                    "Start new session",
+                    text(theme).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        };
+        let marker = Span::styled(if selected { "▌ " } else { "  " }, accent(theme));
+        let mut spans = vec![marker];
+        spans.extend(line.spans);
+        ListItem::new(Line::from(spans)).style(if selected {
+            theme.selected()
+        } else {
+            text(theme)
+        })
+    });
+    frame.render_widget(List::new(rows), list_area);
+
+    let mut footer = "[Enter] open  [j/k] select  [Esc] cancel".to_owned();
+    if chooser.allow_new() {
+        footer.push_str("  [n] new");
+    }
+    frame.render_widget(
+        Paragraph::new(footer).style(theme.muted()),
+        Rect::new(
+            inner.x + 1,
+            inner.bottom().saturating_sub(1),
+            inner.width - 1,
+            1,
+        ),
+    );
+}
+
+fn session_row(
+    session: &svarm_agent::protocol::SessionSummary,
+    now_ms: u64,
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
+    let state = if session.attachment.is_some() {
+        "attached"
+    } else {
+        "detached"
+    };
+    let age = format_age(now_ms.saturating_sub(session.last_user_activity_ms));
+    let fixed = format!(
+        "{}  {}  {}/{} running  {}  {}  ",
+        session.id.0,
+        session.display_name,
+        session.running_agents,
+        session.total_agents,
+        state,
+        age
+    );
+    let available = usize::from(width).saturating_sub(fixed.chars().count());
+    let path = middle_truncate(&session.canonical_path.display().to_string(), available);
+    Line::from(vec![
+        Span::styled(format!("{}  ", session.id.0), accent(theme)),
+        Span::styled(format!("{}  ", session.display_name), text(theme)),
+        Span::styled(path, theme.muted()),
+        Span::styled(
+            format!(
+                "  {}/{} running  {}  {}",
+                session.running_agents, session.total_agents, state, age
+            ),
+            if session.attachment.is_some() {
+                warning(theme)
+            } else {
+                theme.muted()
+            },
+        ),
+    ])
+}
+
+fn middle_truncate(value: &str, width: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let left = (width - 1) / 2;
+    let right = width - 1 - left;
+    characters[..left]
+        .iter()
+        .chain(['…'].iter())
+        .chain(characters[characters.len() - right..].iter())
+        .collect()
+}
+
+fn format_age(age_ms: u64) -> String {
+    let seconds = age_ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
     }
 }
 
@@ -123,7 +271,7 @@ fn menu_popup_area(button: Rect) -> Rect {
     Rect::new(
         button.x,
         button.y.saturating_sub(MENU_HEIGHT),
-        button.width,
+        MENU_WIDTH.max(button.width),
         MENU_HEIGHT,
     )
 }
@@ -293,6 +441,41 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
     );
 }
 
+fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let session = app
+        .session_id()
+        .map_or_else(|| "local".into(), |id| id.0.to_string());
+    let path = app.workspace_path().map_or_else(
+        || app.workspace_name().into(),
+        |path| path.display().to_string(),
+    );
+    let path = middle_truncate(&path, 58);
+    let running = app
+        .agents()
+        .iter()
+        .filter(|agent| agent.status() == SessionStatus::Running)
+        .count();
+    render_dialog(
+        frame,
+        theme,
+        " Stop Svarm session? ",
+        64,
+        9,
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  Session {session} · {running} running agents"),
+                warning(theme),
+            )),
+            Line::from(format!("  {path}")),
+            Line::from(""),
+            Line::from("  This terminates every agent in the session."),
+            Line::from(""),
+            Line::from("  [y] Stop session    [Esc] Cancel"),
+        ],
+    );
+}
+
 fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
     let mut lines = vec![Line::from("")];
     lines.extend(
@@ -314,7 +497,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
         frame,
         theme,
         " Keybinds ",
-        58,
+        76,
         MANAGEMENT_KEYBINDINGS.len() as u16 + 8,
         lines,
     );
@@ -408,7 +591,13 @@ fn border(theme: Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use ratatui::{Terminal, backend::TestBackend};
+    use svarm_agent::protocol::{
+        AgentSnapshot, AttachmentSummary, ConnectionId, SessionId, SessionRevision, SessionSummary,
+        SvarmSessionSnapshot, TerminalSequence,
+    };
 
     use super::*;
 
@@ -430,7 +619,7 @@ mod tests {
         assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 24, 1)));
         assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
-        assert_eq!(menu_item_at(area, 30, 36), None);
+        assert_eq!(menu_item_at(area, 50, 36), None);
     }
 
     #[test]
@@ -466,5 +655,138 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn session_chooser_preserves_id_state_and_footer_at_80x24() {
+        let chooser = SessionChooser::new(
+            vec![SessionSummary {
+                id: SessionId(42),
+                canonical_path: PathBuf::from(
+                    "/a/very/long/workspace/path/that/must/be/middle/truncated/project",
+                ),
+                display_name: "project".into(),
+                running_agents: 1,
+                total_agents: 2,
+                attachment: Some(AttachmentSummary {
+                    connection_id: ConnectionId(1),
+                    process_id: Some(7),
+                    attached_at_ms: 1,
+                    last_activity_ms: 1,
+                }),
+                last_user_activity_ms: 1,
+                revision: SessionRevision(1),
+            }],
+            true,
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_chooser(
+                    frame,
+                    &chooser,
+                    2_001,
+                    crate::theme::ThemeName::Monochrome.theme(false),
+                )
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Open Svarm session"));
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains("attached"));
+        assert!(rendered.contains("[Enter] open  [j/k] select  [Esc] cancel  [n] new"));
+    }
+
+    #[test]
+    fn keybinds_and_menu_use_canonical_detach_and_stop_copy() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        app.set_mode(Mode::Keybinds);
+        let keybinds = render_app_text(&app);
+        assert!(keybinds.contains("detach — agents keep running"));
+        assert!(keybinds.contains("stop session — terminates all agents"));
+
+        app.set_mode(Mode::Menu);
+        let menu = render_app_text(&app);
+        assert!(menu.contains("Detach — agents keep running"));
+        assert!(menu.contains("Stop session — terminates all agents"));
+    }
+
+    #[test]
+    fn stop_confirmation_names_target_and_running_agents_at_80x24() {
+        let summary = SessionSummary {
+            id: SessionId(7),
+            canonical_path: PathBuf::from("/tmp/project-seven"),
+            display_name: "project-seven".into(),
+            running_agents: 1,
+            total_agents: 1,
+            attachment: None,
+            last_user_activity_ms: 1,
+            revision: SessionRevision(1),
+        };
+        let agent = AgentSnapshot {
+            id: svarm_agent::AgentId::new(1),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: summary.canonical_path.clone(),
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 0,
+            seen_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            recognition: None,
+        };
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary,
+                selected_agent_id: Some(agent.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![agent],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+        app.set_mode(Mode::ConfirmQuit);
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("Session 7 · 1 running agents"));
+        assert!(rendered.contains("/tmp/project-seven"));
+        assert!(rendered.contains("terminates every agent"));
+    }
+
+    fn render_app_text(app: &App) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app,
+                        screen: None,
+                        theme: app.theme().theme(false),
+                    },
+                )
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 }

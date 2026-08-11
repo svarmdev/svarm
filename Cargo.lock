@@ -920,6 +920,8 @@ name = "svarm"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
+ "svarm-agent",
  "svarm-tui",
 ]
 

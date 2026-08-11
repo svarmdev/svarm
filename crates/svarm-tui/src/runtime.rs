@@ -1,17 +1,16 @@
 use std::{path::PathBuf, time::Duration};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::Rect;
-use svarm_agent::{AgentKind, AgentManager, Result, TerminalPalette, pty_size};
+use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerEvent};
 
 use crate::{
-    app::{App, MenuItem, Mode},
-    input::{
-        ManagementCommand, encode_key, encode_mouse, encode_paste, is_management_prefix,
-        management_command,
-    },
+    agents::{InitialSession, RemoteAgents, RemoteUpdate},
+    app::{App, ExitIntent, MenuItem, Mode},
+    input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     settings::SettingsStore,
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
@@ -19,55 +18,46 @@ use crate::{
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
-    let cwd = cwd.canonicalize().map_err(|error| {
-        format!(
-            "could not open workspace {}: {error}",
-            cwd.to_string_lossy()
-        )
-    })?;
-    let workspace_name = cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| cwd.to_str().unwrap_or("workspace"))
-        .to_owned();
+pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession) -> Result<()> {
+    let target = canonicalize_target(target)?;
     let palette = TerminalPalette::detect();
     let colors_enabled = colors_enabled();
     let settings = SettingsStore::discover();
     let (theme, settings_notice) = settings.load();
-
-    let mut terminal = TerminalSession::open()?;
-    let area = terminal.terminal().size()?;
-    let child_area = ui::terminal_area(area.into(), true);
-    let mut agents = AgentManager::new(cwd, pty_size(child_area.height, child_area.width), palette);
-    let mut app = App::new(workspace_name, theme, kind.is_none(), settings_notice);
+    let (width, height) = crossterm::terminal::size()?;
+    let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
+    let (mut agents, snapshot) = RemoteAgents::connect(
+        &socket_path,
+        target,
+        child_area.height.max(1),
+        child_area.width.max(1),
+        palette,
+    )?;
+    let mut app = App::hydrate(snapshot, theme, settings_notice);
     if let Some(kind) = kind {
-        app.add_agent(agents.spawn(kind)?);
+        agents.spawn(kind)?;
     }
 
+    let mut terminal = TerminalSession::open()?;
     let mut dirty = true;
-    while !app.quit_requested() {
-        for snapshot in agents.poll() {
-            match snapshot {
-                Ok(snapshot) => dirty |= app.update_agent(snapshot),
-                Err(error) => {
-                    app.set_notice(error.to_string());
-                    dirty = true;
-                }
-            }
+    let mut connection_failure = None;
+    while app.exit_intent() == ExitIntent::None {
+        dirty |= apply_remote_updates(&mut app, &mut agents, &mut connection_failure);
+        if connection_failure.is_some() {
+            break;
         }
 
         if dirty {
-            app.mark_selected_seen();
-            let terminal_snapshot = app
-                .selected_agent_id()
-                .and_then(|id| agents.terminal_snapshot(id));
+            let screen = app.selected_agent_id().and_then(|id| agents.screen(id));
             let model = UiModel {
                 app: &app,
-                screen: terminal_snapshot.as_ref().map(|terminal| terminal.screen()),
+                screen,
                 theme: app.theme().theme(colors_enabled),
             };
             terminal.terminal().draw(|frame| ui::render(frame, model))?;
+            if let Some((id, generation)) = app.mark_selected_seen() {
+                agents.mark_seen(id, generation)?;
+            }
             dirty = false;
         }
 
@@ -75,38 +65,116 @@ pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
             continue;
         }
         match event::read()? {
-            Event::Key(key) => {
+            HostEvent::Key(key) => {
                 let (resize, redraw) = handle_key(&mut app, &mut agents, &settings, key)?;
                 dirty |= redraw;
                 if resize {
                     resize_agents(&mut agents, &app, terminal.terminal().size()?.into())?;
                 }
             }
-            Event::Paste(text) if app.mode() == Mode::Terminal => {
+            HostEvent::Paste(text) if app.mode() == Mode::Terminal => {
                 if let Some(id) = app.selected_agent_id() {
-                    let bracketed = agents
-                        .terminal_snapshot(id)
-                        .is_some_and(|terminal| terminal.screen().bracketed_paste());
-                    agents.send(id, &encode_paste(&text, bracketed))?;
+                    agents.paste(id, text)?;
                 }
             }
-            Event::Resize(width, height) => {
+            HostEvent::Resize(width, height) => {
                 dirty = true;
                 resize_agents(&mut agents, &app, Rect::new(0, 0, width, height))?;
             }
-            Event::Mouse(mouse) => {
-                dirty |=
-                    handle_mouse(&mut app, &agents, mouse, terminal.terminal().size()?.into())?;
+            HostEvent::Mouse(mouse) => {
+                dirty |= handle_mouse(
+                    &mut app,
+                    &mut agents,
+                    mouse,
+                    terminal.terminal().size()?.into(),
+                )?;
             }
             _ => {}
         }
     }
+
+    drop(terminal);
+    if let Some(error) = connection_failure {
+        return Err(format!(
+            "{error}\nAgents may still be running.\nReattach: svarm --attach --workspace {}",
+            agents.session_id().0
+        )
+        .into());
+    }
+    match app.exit_intent() {
+        ExitIntent::Detach => agents.detach()?,
+        ExitIntent::StopSession => agents.stop()?,
+        ExitIntent::None => {}
+    }
     Ok(())
+}
+
+fn canonicalize_target(target: InitialSession) -> Result<InitialSession> {
+    match target {
+        InitialSession::Create(path) => {
+            let canonical = path.canonicalize().map_err(|error| {
+                format!(
+                    "could not open workspace {}: {error}",
+                    path.to_string_lossy()
+                )
+            })?;
+            Ok(InitialSession::Create(canonical))
+        }
+        target => Ok(target),
+    }
+}
+
+fn apply_remote_updates(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    connection_failure: &mut Option<String>,
+) -> bool {
+    let mut dirty = false;
+    for update in agents.drain() {
+        match update {
+            RemoteUpdate::Event(ServerEvent::AgentAdded { agent, .. }) => {
+                app.add_remote_agent(agent);
+                dirty = true;
+            }
+            RemoteUpdate::Event(ServerEvent::AgentChanged { agent, .. }) => {
+                dirty |= app.update_remote_agent(agent);
+            }
+            RemoteUpdate::Event(ServerEvent::AgentRemoved { agent_id, .. }) => {
+                app.remove_agent(agent_id);
+                dirty = true;
+            }
+            RemoteUpdate::Event(ServerEvent::SessionNotice(notice)) => {
+                app.set_notice(notice.message);
+                dirty = true;
+            }
+            RemoteUpdate::Event(ServerEvent::LeaseRevoked { reason }) => {
+                *connection_failure = Some(reason);
+            }
+            RemoteUpdate::Event(ServerEvent::ServerStopping) => {
+                *connection_failure = Some("Svarm server is stopping".into());
+            }
+            RemoteUpdate::Event(
+                ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_),
+            ) => {
+                dirty = true;
+            }
+            RemoteUpdate::Event(ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_)) => {
+                unreachable!("terminal frames are applied by adapter")
+            }
+            RemoteUpdate::TerminalChanged => dirty = true,
+            RemoteUpdate::Error(error) => {
+                app.set_notice(error);
+                dirty = true;
+            }
+            RemoteUpdate::Disconnected(error) => *connection_failure = Some(error),
+        }
+    }
+    dirty
 }
 
 fn handle_key(
     app: &mut App,
-    agents: &mut AgentManager,
+    agents: &mut RemoteAgents,
     settings: &SettingsStore,
     key: KeyEvent,
 ) -> Result<(bool, bool)> {
@@ -119,19 +187,18 @@ fn handle_key(
         Mode::Terminal if is_management_prefix(key) => app.set_mode(Mode::Prefix),
         Mode::Terminal => {
             redraw = false;
-            if let Some(bytes) = encode_key(key)
+            if let Some(event) = key_input(key)
                 && let Some(id) = app.selected_agent_id()
-                && let Err(error) = agents.send(id, &bytes)
             {
-                app.set_notice(error.to_string());
-                redraw = true;
+                agents.key(id, event)?;
             }
         }
         Mode::Prefix => return handle_management_command(app, agents, management_command(key)),
         Mode::ChooseAgent => match key.code {
-            KeyCode::Char('c') => spawn(app, agents, AgentKind::Codex),
-            KeyCode::Char('a') => spawn(app, agents, AgentKind::Claude),
-            KeyCode::Esc => app.set_mode(Mode::Terminal),
+            KeyCode::Char('c') => spawn(app, agents, AgentKind::Codex)?,
+            KeyCode::Char('a') => spawn(app, agents, AgentKind::Claude)?,
+            KeyCode::Esc if app.selected_agent_id().is_some() => app.set_mode(Mode::Terminal),
+            KeyCode::Esc => app.request_detach(),
             _ => {}
         },
         Mode::ConfirmClose => match key.code {
@@ -140,7 +207,7 @@ fn handle_key(
             _ => {}
         },
         Mode::ConfirmQuit => match key.code {
-            KeyCode::Char('y') => app.request_quit(),
+            KeyCode::Char('y') => app.request_stop(),
             KeyCode::Char('n') | KeyCode::Esc => app.set_mode(Mode::Terminal),
             _ => {}
         },
@@ -177,23 +244,25 @@ fn handle_key(
 
 fn handle_management_command(
     app: &mut App,
-    agents: &AgentManager,
+    agents: &mut RemoteAgents,
     command: ManagementCommand,
 ) -> Result<(bool, bool)> {
     let mut resize = false;
     match command {
         ManagementCommand::LiteralPrefix => {
             if let Some(id) = app.selected_agent_id() {
-                agents.send(id, &[0x02])?;
+                agents.literal(id, vec![0x02])?;
             }
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::NextAgent => {
             app.select_next();
+            sync_selection(app, agents)?;
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::PreviousAgent => {
             app.select_previous();
+            sync_selection(app, agents)?;
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::ChooseAgent => app.set_mode(Mode::ChooseAgent),
@@ -201,6 +270,7 @@ fn handle_management_command(
             app.set_mode(Mode::ConfirmClose);
         }
         ManagementCommand::ConfirmQuit => app.set_mode(Mode::ConfirmQuit),
+        ManagementCommand::Detach => app.request_detach(),
         ManagementCommand::ToggleSidebar => {
             app.toggle_sidebar();
             app.set_mode(Mode::Terminal);
@@ -216,6 +286,7 @@ fn handle_management_command(
         ManagementCommand::OpenKeybinds => app.set_mode(Mode::Keybinds),
         ManagementCommand::SelectAgent(index) => {
             app.select(index);
+            sync_selection(app, agents)?;
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::Cancel => app.set_mode(Mode::Terminal),
@@ -229,7 +300,7 @@ fn handle_management_command(
 
 fn handle_mouse(
     app: &mut App,
-    agents: &AgentManager,
+    agents: &mut RemoteAgents,
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<bool> {
@@ -268,44 +339,37 @@ fn handle_mouse(
     let Some(id) = app.selected_agent_id() else {
         return Ok(false);
     };
-    let Some(terminal) = agents.terminal_snapshot(id) else {
-        return Ok(false);
-    };
-    let mode = terminal.screen().mouse_protocol_mode();
-    let encoding = terminal.screen().mouse_protocol_encoding();
-
     let translated = MouseEvent {
         column: mouse.column - child_area.x,
         row: mouse.row - child_area.y,
         ..mouse
     };
-    if let Some(bytes) = encode_mouse(translated, mode, encoding) {
-        agents.send(id, &bytes)?;
-    }
+    agents.mouse(id, mouse_input(translated))?;
     Ok(false)
 }
 
-fn close_selected(app: &mut App, agents: &mut AgentManager) -> Result<()> {
+fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
     let Some(id) = app.selected_agent_id() else {
         app.set_mode(Mode::Terminal);
         return Ok(());
     };
     agents.close(id)?;
-    app.remove_agent(id);
+    app.set_mode(Mode::Terminal);
     Ok(())
 }
 
-fn spawn(app: &mut App, agents: &mut AgentManager, kind: AgentKind) {
-    match agents.spawn(kind) {
-        Ok(snapshot) => {
-            app.add_agent(snapshot);
-            app.clear_notice();
-        }
-        Err(error) => {
-            app.set_notice(error.to_string());
-            app.set_mode(Mode::Terminal);
-        }
+fn spawn(app: &mut App, agents: &mut RemoteAgents, kind: AgentKind) -> Result<()> {
+    agents.spawn(kind)?;
+    app.clear_notice();
+    app.set_mode(Mode::Terminal);
+    Ok(())
+}
+
+fn sync_selection(app: &App, agents: &mut RemoteAgents) -> Result<()> {
+    if let Some(id) = app.selected_agent_id() {
+        agents.select(id)?;
     }
+    Ok(())
 }
 
 fn save_theme(app: &mut App, settings: &SettingsStore, delta: isize) {
@@ -316,9 +380,9 @@ fn save_theme(app: &mut App, settings: &SettingsStore, delta: isize) {
     }
 }
 
-fn resize_agents(agents: &mut AgentManager, app: &App, area: Rect) -> Result<()> {
+fn resize_agents(agents: &mut RemoteAgents, app: &App, area: Rect) -> Result<()> {
     let child = ui::terminal_area(area, app.sidebar_visible());
-    agents.resize(child.height, child.width)
+    agents.resize(child.height.max(1), child.width.max(1))
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
