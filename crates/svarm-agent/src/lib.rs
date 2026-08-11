@@ -26,9 +26,7 @@ mod terminal;
 
 pub use manager::{AgentManager, pty_size};
 pub use portable_pty::PtySize;
-pub use session::{
-    AgentSession, ProcessExit, Result, SessionSnapshot, SessionStatus, TerminalSnapshot,
-};
+pub use session::{AgentSession, ProcessExit, Result, SessionSnapshot, SessionStatus};
 pub use terminal::{CursorStyle, TerminalPalette};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

@@ -56,17 +56,6 @@ impl From<portable_pty::ExitStatus> for ProcessExit {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct TerminalSnapshot {
-    screen: vt100::Screen,
-}
-
-impl TerminalSnapshot {
-    pub const fn screen(&self) -> &vt100::Screen {
-        &self.screen
-    }
-}
-
 pub struct AgentSession {
     id: AgentId,
     kind: AgentKind,
@@ -192,15 +181,9 @@ impl AgentSession {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    pub fn terminal_snapshot(&self) -> TerminalSnapshot {
-        TerminalSnapshot {
-            screen: self.parser().screen().clone(),
-        }
-    }
-
-    /// Reads the live screen in place. Callers that only need to measure or serialize it should
-    /// use this rather than [`Self::terminal_snapshot`]: copying the screen is the most expensive
-    /// thing on the output path, and doing it under the lock stalls the agent's reader thread.
+    /// Reads the live screen in place. Copying it is the most expensive thing on the output path,
+    /// and doing that under the lock stalls the agent's reader thread, so callers that only need
+    /// to measure or serialize the screen work through this instead.
     pub fn with_screen<T>(&self, read: impl FnOnce(&vt100::Screen) -> T) -> T {
         read(self.parser().screen())
     }

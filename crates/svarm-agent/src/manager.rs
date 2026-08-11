@@ -11,7 +11,7 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentId, AgentKind, AgentSession, Result, SessionSnapshot, SessionStatus, TerminalPalette,
-    TerminalSnapshot, session::OutputNotifier,
+    session::OutputNotifier,
 };
 
 pub struct AgentManager {
@@ -93,10 +93,6 @@ impl AgentManager {
             session.send(bytes)?;
         }
         Ok(())
-    }
-
-    pub fn terminal_snapshot(&self, id: AgentId) -> Option<TerminalSnapshot> {
-        self.sessions.get(&id).map(AgentSession::terminal_snapshot)
     }
 
     pub fn with_screen<T>(&self, id: AgentId, read: impl FnOnce(&vt100::Screen) -> T) -> Option<T> {
