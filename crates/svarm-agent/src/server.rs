@@ -1,10 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     net::Shutdown,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,13 +17,14 @@ use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
     framing::{read_frame, write_frame},
+    input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
     protocol::{
         AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event, LeaseToken,
         Message, MouseEncoding, MouseProtocol, ProtocolError, ProtocolRange, Request, RequestId,
         Response, ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId,
-        SessionSummary, SessionTarget, StopSummary, SvarmSessionSnapshot, TerminalFull,
-        TerminalModes, Welcome,
+        SessionSummary, SessionTarget, StopSummary, SvarmSessionSnapshot, TerminalDiff,
+        TerminalFull, TerminalModes, TerminalSequence, Welcome,
     },
     pty_size,
     server_session::{ServerSessionState, sort_session_summaries},
@@ -62,12 +66,103 @@ pub fn run_foreground(config: ServerConfig) -> AgentResult<()> {
 }
 
 struct Connection {
-    sender: SyncSender<Box<Envelope>>,
+    outgoing: Arc<OutgoingQueue>,
     stream: UnixStream,
     role: Option<ConnectionRole>,
     protocol_version: Option<u16>,
     process_id: Option<u32>,
     attached_session: Option<SessionId>,
+}
+
+struct OutgoingQueue {
+    state: Mutex<OutgoingState>,
+    ready: Condvar,
+}
+
+struct OutgoingState {
+    frames: VecDeque<Box<Envelope>>,
+    closed: bool,
+}
+
+enum QueueResult {
+    Queued,
+    NeedsFull(AgentId),
+    Full,
+}
+
+impl OutgoingQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OutgoingState {
+                frames: VecDeque::with_capacity(CONNECTION_QUEUE),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn push(&self, envelope: Box<Envelope>) -> QueueResult {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.closed {
+            return QueueResult::Full;
+        }
+        if state.frames.len() == CONNECTION_QUEUE {
+            let Some((agent_id, full)) = terminal_frame(envelope.as_ref()) else {
+                return QueueResult::Full;
+            };
+            state.frames.retain(|queued| {
+                terminal_frame(queued.as_ref()).is_none_or(|(queued_id, _)| queued_id != agent_id)
+            });
+            if state.frames.len() == CONNECTION_QUEUE {
+                return QueueResult::Full;
+            }
+            if !full {
+                return QueueResult::NeedsFull(agent_id);
+            }
+        }
+        state.frames.push_back(envelope);
+        self.ready.notify_one();
+        QueueResult::Queued
+    }
+
+    fn pop(&self) -> Option<Box<Envelope>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if let Some(envelope) = state.frames.pop_front() {
+                return Some(envelope);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .closed = true;
+        self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .frames
+            .len()
+    }
 }
 
 enum ServerInput {
@@ -79,6 +174,13 @@ struct SessionRuntime {
     state: ServerSessionState,
     agents: AgentManager,
     previous: HashMap<AgentId, SessionSnapshot>,
+    frame_bases: HashMap<AgentId, FrameBasis>,
+}
+
+struct FrameBasis {
+    sequence: TerminalSequence,
+    acknowledged: Option<TerminalSequence>,
+    screen: Screen,
 }
 
 impl SessionRuntime {
@@ -93,6 +195,7 @@ impl SessionRuntime {
             state,
             agents,
             previous: HashMap::new(),
+            frame_bases: HashMap::new(),
         }
     }
 
@@ -120,7 +223,23 @@ impl SessionRuntime {
     fn close(&mut self, id: AgentId, now_ms: u64) -> AgentResult<()> {
         self.agents.close(id)?;
         self.previous.remove(&id);
+        self.frame_bases.remove(&id);
         self.state.remove_agent(id, self.agents.agent_ids(), now_ms);
+        Ok(())
+    }
+
+    fn send_input(&mut self, id: AgentId, bytes: &[u8], now_ms: u64) -> Result<(), ProtocolError> {
+        let snapshot = self.agents.snapshot(id).ok_or_else(agent_not_found)?;
+        if snapshot.status == SessionStatus::Exited {
+            return Err(ProtocolError::new(
+                ErrorCode::AgentExited,
+                "agent has exited",
+            ));
+        }
+        if !bytes.is_empty() {
+            self.agents.send(id, bytes).map_err(internal_error)?;
+        }
+        self.state.record_activity(now_ms);
         Ok(())
     }
 
@@ -164,28 +283,87 @@ impl SessionRuntime {
         }
     }
 
-    fn full_terminal(&mut self, id: AgentId) -> Option<Event> {
+    fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
         let snapshot = self.agents.snapshot(id)?;
         let terminal = self.agents.terminal_snapshot(id)?;
-        let sequence = self.state.next_terminal_sequence(id).ok()?;
         let screen = terminal.screen();
         let (rows, cols) = screen.size();
-        Some(Event::TerminalFull(TerminalFull {
-            agent_id: id,
-            rows,
-            cols,
-            output_generation: snapshot.output_generation,
-            sequence,
-            formatted_screen: screen.contents_formatted(),
-            modes: terminal_modes(screen),
-        }))
+        let basis = self.frame_bases.get(&id);
+        let full = force_full
+            || basis.is_none()
+            || basis.is_some_and(|basis| basis.screen.size() != screen.size());
+        let sequence = self.state.next_terminal_sequence(id).ok()?;
+        let event = if full {
+            Event::TerminalFull(TerminalFull {
+                agent_id: id,
+                rows,
+                cols,
+                output_generation: snapshot.output_generation,
+                sequence,
+                formatted_screen: screen.state_formatted(),
+                modes: terminal_modes(screen),
+            })
+        } else {
+            let basis = basis.expect("non-full terminal frame has a basis");
+            Event::TerminalDiff(TerminalDiff {
+                agent_id: id,
+                rows,
+                cols,
+                output_generation: snapshot.output_generation,
+                base_sequence: basis.sequence,
+                sequence,
+                formatted_changes: screen.state_diff(&basis.screen),
+                modes: terminal_modes(screen),
+            })
+        };
+        let acknowledged = self
+            .frame_bases
+            .get(&id)
+            .and_then(|basis| basis.acknowledged);
+        self.frame_bases.insert(
+            id,
+            FrameBasis {
+                sequence,
+                acknowledged,
+                screen: screen.clone(),
+            },
+        );
+        Some(event)
+    }
+
+    fn full_terminal(&mut self, id: AgentId) -> Option<Event> {
+        self.terminal_event(id, true)
+    }
+
+    fn acknowledge(
+        &mut self,
+        id: AgentId,
+        sequence: TerminalSequence,
+    ) -> Result<(), ProtocolError> {
+        let Some(basis) = self.frame_bases.get_mut(&id) else {
+            return Err(agent_not_found());
+        };
+        if sequence > basis.sequence {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "terminal acknowledgement is newer than the last server frame",
+            ));
+        }
+        if basis
+            .acknowledged
+            .is_none_or(|acknowledged| sequence > acknowledged)
+        {
+            basis.acknowledged = Some(sequence);
+        }
+        Ok(())
     }
 
     fn synchronization_events(&mut self) -> Vec<Event> {
+        self.frame_bases.clear();
         let ids = self.agents.agent_ids().to_vec();
         let mut terminals = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(event) = self.full_terminal(id) {
+            if let Some(event) = self.terminal_event(id, false) {
                 terminals.push(event);
             }
         }
@@ -228,7 +406,7 @@ impl SessionRuntime {
             })
             .collect::<Vec<_>>();
         for id in terminal_ids {
-            if let Some(event) = self.full_terminal(id) {
+            if let Some(event) = self.terminal_event(id, false) {
                 events.push(event);
             }
         }
@@ -416,7 +594,7 @@ impl Server {
                     instance_id: self.instance_id.clone(),
                     capabilities: ServerCapabilities {
                         takeover: true,
-                        terminal_diffs: false,
+                        terminal_diffs: true,
                     },
                     connection_id: id,
                 }),
@@ -452,6 +630,11 @@ impl Server {
                     .expect("attached session exists")
                     .state
                     .detach(&lease_token, now)?;
+                self.sessions
+                    .get_mut(&session_id)
+                    .expect("attached session exists")
+                    .frame_bases
+                    .clear();
                 self.connections.get_mut(&id).unwrap().attached_session = None;
                 Ok(Outcome::new(Response::Ok))
             }
@@ -508,23 +691,7 @@ impl Server {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
-                let snapshot = runtime
-                    .agents
-                    .snapshot(agent_id)
-                    .ok_or_else(agent_not_found)?;
-                if snapshot.status == SessionStatus::Exited {
-                    return Err(ProtocolError::new(
-                        ErrorCode::AgentExited,
-                        "agent has exited",
-                    ));
-                }
-                if !bytes.is_empty() {
-                    runtime
-                        .agents
-                        .send(agent_id, &bytes)
-                        .map_err(internal_error)?;
-                }
-                runtime.state.record_activity(now);
+                runtime.send_input(agent_id, &bytes, now)?;
                 Ok(Outcome::new(Response::Ok))
             }
             Request::ResizeSession {
@@ -537,6 +704,7 @@ impl Server {
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
                 runtime.state.resize(rows, cols, now)?;
                 runtime.agents.resize(rows, cols).map_err(internal_error)?;
+                runtime.frame_bases.clear();
                 let events = runtime
                     .agents
                     .agent_ids()
@@ -601,16 +769,13 @@ impl Server {
             Request::AcknowledgeFrame {
                 lease_token,
                 agent_id,
-                ..
+                sequence,
             } => {
                 let session_id = self.attached_session(id, &lease_token)?;
-                if self.sessions[&session_id]
-                    .agents
-                    .snapshot(agent_id)
-                    .is_none()
-                {
-                    return Err(agent_not_found());
-                }
+                self.sessions
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .acknowledge(agent_id, sequence)?;
                 Ok(Outcome::new(Response::Ok))
             }
             Request::ServerStatus => Ok(Outcome::new(Response::ServerStatus(self.status()))),
@@ -655,11 +820,55 @@ impl Server {
                 self.stopping = true;
                 Ok(outcome)
             }
-            Request::Key { .. } | Request::Paste { .. } | Request::Mouse { .. } => {
-                Err(ProtocolError::new(
-                    ErrorCode::InvalidRequest,
-                    "semantic terminal input is not available in this server build",
-                ))
+            Request::Key {
+                lease_token,
+                agent_id,
+                event,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let terminal = runtime
+                    .agents
+                    .terminal_snapshot(agent_id)
+                    .ok_or_else(agent_not_found)?;
+                let bytes =
+                    encode_key(&event, terminal_modes(terminal.screen())).unwrap_or_default();
+                runtime.send_input(agent_id, &bytes, now)?;
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::Paste {
+                lease_token,
+                agent_id,
+                text,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let terminal = runtime
+                    .agents
+                    .terminal_snapshot(agent_id)
+                    .ok_or_else(agent_not_found)?;
+                let bytes = encode_paste(&text, terminal_modes(terminal.screen()));
+                runtime.send_input(agent_id, &bytes, now)?;
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::Mouse {
+                lease_token,
+                agent_id,
+                event,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let terminal = runtime
+                    .agents
+                    .terminal_snapshot(agent_id)
+                    .ok_or_else(agent_not_found)?;
+                let bytes =
+                    encode_mouse(&event, terminal_modes(terminal.screen())).unwrap_or_default();
+                runtime.send_input(agent_id, &bytes, now)?;
+                Ok(Outcome::new(Response::Ok))
             }
         }
     }
@@ -911,9 +1120,11 @@ impl Server {
         };
         if let Some(session_id) = connection.attached_session
             && let Some(runtime) = self.sessions.get_mut(&session_id)
+            && runtime.state.disconnect(id, now)
         {
-            runtime.state.disconnect(id, now);
+            runtime.frame_bases.clear();
         }
+        connection.outgoing.close();
         let _ = connection.stream.shutdown(Shutdown::Both);
     }
 
@@ -954,12 +1165,37 @@ impl Server {
         let result = self
             .connections
             .get(&id)
-            .map(|connection| connection.sender.try_send(Box::new(envelope)));
-        if matches!(
-            result,
-            Some(Err(TrySendError::Full(_) | TrySendError::Disconnected(_)))
-        ) {
-            self.disconnect(id);
+            .map(|connection| connection.outgoing.push(Box::new(envelope)));
+        match result {
+            Some(QueueResult::NeedsFull(agent_id)) => {
+                let full = self.connections.get(&id).and_then(|connection| {
+                    connection.attached_session.and_then(|session_id| {
+                        self.sessions
+                            .get_mut(&session_id)
+                            .and_then(|runtime| runtime.full_terminal(agent_id))
+                    })
+                });
+                let Some(event) = full else {
+                    self.disconnect(id);
+                    return;
+                };
+                let version = self.connections[&id]
+                    .protocol_version
+                    .unwrap_or(crate::protocol::PROTOCOL_VERSION);
+                let envelope = Envelope {
+                    protocol_version: version,
+                    request_id: None,
+                    message: Message::Event(event),
+                };
+                if !matches!(
+                    self.connections[&id].outgoing.push(Box::new(envelope)),
+                    QueueResult::Queued
+                ) {
+                    self.disconnect(id);
+                }
+            }
+            Some(QueueResult::Full) => self.disconnect(id),
+            Some(QueueResult::Queued) | None => {}
         }
     }
 
@@ -996,6 +1232,9 @@ impl Server {
             let _ = runtime.agents.stop_all();
         }
         self.sessions.clear();
+        for connection in self.connections.values() {
+            connection.outgoing.close();
+        }
         self.connections.clear();
     }
 }
@@ -1007,7 +1246,7 @@ fn start_connection(
 ) -> io::Result<Connection> {
     let reader = stream.try_clone()?;
     let writer = stream.try_clone()?;
-    let (sender, outgoing) = mpsc::sync_channel::<Box<Envelope>>(CONNECTION_QUEUE);
+    let outgoing = Arc::new(OutgoingQueue::new());
     let reader_input = input.clone();
     thread::spawn(move || {
         let mut reader = reader;
@@ -1021,9 +1260,10 @@ fn start_connection(
         }
         let _ = reader_input.send(ServerInput::Disconnected(id));
     });
+    let writer_outgoing = outgoing.clone();
     thread::spawn(move || {
         let mut writer = writer;
-        while let Ok(envelope) = outgoing.recv() {
+        while let Some(envelope) = writer_outgoing.pop() {
             if write_frame(&mut writer, envelope.as_ref()).is_err() {
                 break;
             }
@@ -1031,7 +1271,7 @@ fn start_connection(
         let _ = input.send(ServerInput::Disconnected(id));
     });
     Ok(Connection {
-        sender,
+        outgoing,
         stream,
         role: None,
         protocol_version: None,
@@ -1057,6 +1297,14 @@ fn terminal_modes(screen: &Screen) -> TerminalModes {
             MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
             MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
         },
+    }
+}
+
+fn terminal_frame(envelope: &Envelope) -> Option<(AgentId, bool)> {
+    match &envelope.message {
+        Message::Event(Event::TerminalFull(frame)) => Some((frame.agent_id, true)),
+        Message::Event(Event::TerminalDiff(frame)) => Some((frame.agent_id, false)),
+        _ => None,
     }
 }
 
@@ -1103,7 +1351,10 @@ mod tests {
     use std::{fs, io::Write, time::SystemTime};
 
     use super::*;
-    use crate::protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION};
+    use crate::protocol::{
+        Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull,
+    };
+    use tui_term::vt100::Parser;
 
     struct Client {
         stream: UnixStream,
@@ -1171,12 +1422,18 @@ mod tests {
         }
 
         fn event_until(&mut self, predicate: impl Fn(&Event) -> bool) -> Event {
+            let mut last_event = None;
             loop {
-                let envelope: Envelope = read_frame(&mut self.stream).unwrap().unwrap();
-                if let Message::Event(event) = envelope.message
-                    && predicate(&event)
-                {
-                    return event;
+                let envelope: Envelope = read_frame(&mut self.stream)
+                    .unwrap_or_else(|error| {
+                        panic!("timed out waiting for server event after {last_event:?}: {error}")
+                    })
+                    .unwrap_or_else(|| panic!("server disconnected after {last_event:?}"));
+                if let Message::Event(event) = envelope.message {
+                    if predicate(&event) {
+                        return event;
+                    }
+                    last_event = Some(event);
                 }
             }
         }
@@ -1229,8 +1486,12 @@ mod tests {
         });
         let first = client.event_until(|event| {
             matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"before"))
+                || matches!(event, Event::TerminalDiff(frame) if contains(&frame.formatted_changes, b"before"))
         });
-        assert!(matches!(first, Event::TerminalFull(_)));
+        assert!(matches!(
+            first,
+            Event::TerminalFull(_) | Event::TerminalDiff(_)
+        ));
         let _ = client.request(Request::DetachSession { lease_token });
         drop(client);
         thread::sleep(Duration::from_millis(200));
@@ -1249,6 +1510,7 @@ mod tests {
         };
         let _ = reattached.event_until(|event| {
             matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"after"))
+                || matches!(event, Event::TerminalDiff(frame) if contains(&frame.formatted_changes, b"after"))
         });
         let _ = reattached.request(Request::StopAttachedSession { lease_token });
         drop(reattached);
@@ -1291,6 +1553,98 @@ mod tests {
         drop(control);
         server.join().unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn full_and_diff_frames_reconstruct_screen_cursor_and_input_modes() {
+        let mut authoritative = Parser::new(5, 30, 100);
+        authoritative.process(b"\x1b[?2004h\x1b[?1000h\x1b[31mfirst");
+        let full = authoritative.screen().state_formatted();
+        let mut client = Parser::new(5, 30, 100);
+        for byte in full {
+            client.process(&[byte]);
+        }
+        assert_screens_match(authoritative.screen(), client.screen());
+
+        let previous = authoritative.screen().clone();
+        authoritative.process(b"\x1b[2;3H\x1b[32msecond\x1b[?1000l\x1b[?1003h");
+        let diff = authoritative.screen().state_diff(&previous);
+        for byte in diff {
+            client.process(&[byte]);
+        }
+        assert_screens_match(authoritative.screen(), client.screen());
+    }
+
+    #[test]
+    fn terminal_queue_pressure_discards_obsolete_diffs_and_requires_a_full_frame() {
+        let queue = OutgoingQueue::new();
+        for sequence in 1..=CONNECTION_QUEUE as u64 {
+            assert!(matches!(
+                queue.push(Box::new(terminal_envelope(false, sequence))),
+                QueueResult::Queued
+            ));
+        }
+        match queue.push(Box::new(terminal_envelope(
+            false,
+            CONNECTION_QUEUE as u64 + 1,
+        ))) {
+            QueueResult::NeedsFull(agent_id) => assert_eq!(agent_id, AgentId::new(1)),
+            _ => panic!("queue pressure should require a full terminal frame"),
+        }
+        assert_eq!(queue.len(), 0);
+        assert!(matches!(
+            queue.push(Box::new(terminal_envelope(
+                true,
+                CONNECTION_QUEUE as u64 + 2
+            ))),
+            QueueResult::Queued
+        ));
+        assert_eq!(queue.len(), 1);
+    }
+
+    fn assert_screens_match(expected: &Screen, actual: &Screen) {
+        assert_eq!(actual.size(), expected.size());
+        assert_eq!(actual.contents(), expected.contents());
+        assert_eq!(actual.cursor_position(), expected.cursor_position());
+        assert_eq!(actual.application_cursor(), expected.application_cursor());
+        assert_eq!(actual.application_keypad(), expected.application_keypad());
+        assert_eq!(actual.bracketed_paste(), expected.bracketed_paste());
+        assert_eq!(actual.mouse_protocol_mode(), expected.mouse_protocol_mode());
+        assert_eq!(
+            actual.mouse_protocol_encoding(),
+            expected.mouse_protocol_encoding()
+        );
+    }
+
+    fn terminal_envelope(full: bool, sequence: u64) -> Envelope {
+        let sequence = TerminalSequence(sequence);
+        let message = if full {
+            Message::Event(Event::TerminalFull(TerminalFull {
+                agent_id: AgentId::new(1),
+                rows: 1,
+                cols: 1,
+                output_generation: sequence.0,
+                sequence,
+                formatted_screen: vec![b'x'],
+                modes: TerminalModes::default(),
+            }))
+        } else {
+            Message::Event(Event::TerminalDiff(TerminalDiff {
+                agent_id: AgentId::new(1),
+                rows: 1,
+                cols: 1,
+                output_generation: sequence.0,
+                base_sequence: TerminalSequence(sequence.0.saturating_sub(1)),
+                sequence,
+                formatted_changes: vec![b'x'],
+                modes: TerminalModes::default(),
+            }))
+        };
+        Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            message,
+        }
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

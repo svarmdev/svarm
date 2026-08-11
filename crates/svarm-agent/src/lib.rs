@@ -3,6 +3,7 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 pub mod framing;
+pub mod input;
 #[cfg(unix)]
 pub mod ipc;
 mod manager;

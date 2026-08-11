@@ -417,6 +417,54 @@ pub struct TerminalDiff {
     pub modes: TerminalModes,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameDisposition {
+    Apply,
+    Duplicate,
+    Gap,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalFrameTracker {
+    sequence: Option<TerminalSequence>,
+}
+
+impl TerminalFrameTracker {
+    pub fn accept_full(&mut self, sequence: TerminalSequence) -> FrameDisposition {
+        if self.sequence.is_some_and(|current| sequence <= current) {
+            return FrameDisposition::Duplicate;
+        }
+        self.sequence = Some(sequence);
+        FrameDisposition::Apply
+    }
+
+    pub fn accept_diff(
+        &mut self,
+        base: TerminalSequence,
+        sequence: TerminalSequence,
+    ) -> FrameDisposition {
+        let Some(current) = self.sequence else {
+            return FrameDisposition::Gap;
+        };
+        if sequence <= current {
+            return FrameDisposition::Duplicate;
+        }
+        if base != current {
+            return FrameDisposition::Gap;
+        }
+        self.sequence = Some(sequence);
+        FrameDisposition::Apply
+    }
+
+    pub const fn sequence(self) -> Option<TerminalSequence> {
+        self.sequence
+    }
+
+    pub fn reset(&mut self) {
+        self.sequence = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeLevel {
@@ -526,5 +574,31 @@ mod tests {
         assert_eq!(error.code, ErrorCode::IncompatibleProtocol);
         assert_eq!(error.context["client_max"], "2");
         assert_eq!(error.context["server_min"], "4");
+    }
+
+    #[test]
+    fn terminal_sequences_reject_duplicates_and_detect_gaps() {
+        let mut tracker = TerminalFrameTracker::default();
+        assert_eq!(
+            tracker.accept_diff(TerminalSequence(0), TerminalSequence(1)),
+            FrameDisposition::Gap
+        );
+        assert_eq!(
+            tracker.accept_full(TerminalSequence(2)),
+            FrameDisposition::Apply
+        );
+        assert_eq!(
+            tracker.accept_full(TerminalSequence(2)),
+            FrameDisposition::Duplicate
+        );
+        assert_eq!(
+            tracker.accept_diff(TerminalSequence(1), TerminalSequence(3)),
+            FrameDisposition::Gap
+        );
+        assert_eq!(
+            tracker.accept_diff(TerminalSequence(2), TerminalSequence(3)),
+            FrameDisposition::Apply
+        );
+        assert_eq!(tracker.sequence(), Some(TerminalSequence(3)));
     }
 }
