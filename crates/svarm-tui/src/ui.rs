@@ -62,6 +62,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme),
         Mode::NewAgent(NewAgentPage::Workspaces) => render_workspace_choices(frame, app, theme),
         Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme),
+        Mode::NewAgent(NewAgentPage::NativeBrowser) => render_native_browser(frame, app, theme),
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?")
         }
@@ -550,6 +551,63 @@ fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     render_dialog(frame, theme, " Choose agent ", 44, 8, lines);
 }
 
+fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let Some(browser) = app.native_browser() else {
+        return;
+    };
+    let visible = 8;
+    let start = browser.selected.saturating_sub(visible - 1);
+    let rows = std::iter::once((0, "Use this directory".into()))
+        .chain(
+            browser
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| (index + 1, format!("{}/", choice.label))),
+        )
+        .skip(start)
+        .take(visible)
+        .map(|(index, label)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == browser.selected {
+                        " > "
+                    } else {
+                        "   "
+                    },
+                    accent(theme),
+                ),
+                Span::styled(end_truncate(&label, 66), text(theme)),
+            ])
+        });
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "  {}",
+                end_truncate(&browser.current_path.display().to_string(), 68)
+            ),
+            theme.muted(),
+        )),
+        Line::from(""),
+    ];
+    lines.extend(rows);
+    if browser.loading {
+        lines.push(Line::from(Span::styled("  Loading…", theme.muted())));
+    } else if let Some(error) = &browser.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", end_truncate(error, 68)),
+            warning(theme),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
+        theme.muted(),
+    )));
+    render_dialog(frame, theme, " Select workspace ", 76, 16, lines);
+}
+
 fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt: &str) {
     render_dialog(
         frame,
@@ -773,6 +831,44 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn native_browser_renders_loading_listing_and_error_states_at_supported_sizes() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        app.open_new_agent(None, None, Vec::new());
+        app.open_native_browser(PathBuf::from("/tmp/a very long workspace path"), 1);
+        app.apply_directory_load(
+            1,
+            PathBuf::from("/tmp/a very long workspace path"),
+            Ok(vec![crate::app::DirectoryChoice {
+                path: PathBuf::from("/tmp/a very long workspace path/child"),
+                label: "child".into(),
+            }]),
+        );
+
+        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        UiModel {
+                            app: &app,
+                            screen: None,
+                            theme: app.theme().theme(true),
+                        },
+                    );
+                })
+                .unwrap();
+        }
+        assert!(render_app_text(&app).contains("Use this directory"));
     }
 
     #[test]

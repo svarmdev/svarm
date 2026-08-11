@@ -89,7 +89,13 @@ fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {
         };
         target
     };
-    svarm_tui::run(initial_agent, paths.socket.clone(), target)
+    svarm_tui::run(
+        initial_agent,
+        std::env::current_dir().ok(),
+        paths.directory.clone(),
+        paths.socket.clone(),
+        target,
+    )
 }
 
 fn select_launch_target(

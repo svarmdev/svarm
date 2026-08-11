@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::mpsc};
+use std::{env, path::PathBuf, sync::mpsc};
 
 use crossterm::event::{
     Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -8,17 +8,23 @@ use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerE
 
 use crate::{
     agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
-    app::{App, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage, WorkspaceChoice},
+    app::{
+        App, BrowserAction, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage,
+        WorkspaceChoice,
+    },
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
+    workspace::DirectoryLoader,
 };
 
 const EVENT_QUEUE: usize = 1_024;
 
 pub fn run(
     initial_agent: InitialAgentRequest,
+    invocation_directory: Option<PathBuf>,
+    _runtime_directory: PathBuf,
     socket_path: PathBuf,
     target: InitialSession,
 ) -> Result<()> {
@@ -29,6 +35,11 @@ pub fn run(
     let (width, height) = crossterm::terminal::size()?;
     let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
+    let mut browser = BrowserRuntime {
+        loader: DirectoryLoader::new(events_tx.clone()),
+        generation: 0,
+        invocation_directory,
+    };
     let (mut agents, snapshot) = RemoteAgents::connect(
         &socket_path,
         target,
@@ -98,15 +109,18 @@ pub fn run(
                     }
                 }
                 ClientEvent::Host(host) => {
-                    dirty |= handle_host_event(
-                        &mut app,
-                        &mut agents,
-                        &settings,
-                        &mut settings_value,
-                        &events,
-                        &mut terminal,
-                        host,
-                    )?;
+                    let resources = InteractionResources {
+                        settings_store: &settings,
+                        settings: &mut settings_value,
+                        events: &events,
+                        browser: &mut browser,
+                    };
+                    dirty |=
+                        handle_host_event(&mut app, &mut agents, resources, &mut terminal, host)?;
+                }
+                ClientEvent::DirectoryLoaded(result) => {
+                    dirty |=
+                        app.apply_directory_load(result.generation, result.path, result.result);
                 }
             }
         }
@@ -136,16 +150,14 @@ pub fn run(
 fn handle_host_event(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings_store: &SettingsStore,
-    settings: &mut Settings,
-    events: &mpsc::Receiver<ClientEvent>,
+    mut resources: InteractionResources<'_>,
     terminal: &mut TerminalSession,
     event: HostEvent,
 ) -> Result<bool> {
     let mut dirty = false;
     match event {
         HostEvent::Key(key) => {
-            let (resize, redraw) = handle_key(app, agents, settings_store, settings, events, key)?;
+            let (resize, redraw) = handle_key(app, agents, &mut resources, key)?;
             dirty |= redraw;
             if resize {
                 resize_agents(agents, app, terminal.terminal().size()?.into())?;
@@ -217,9 +229,7 @@ fn apply_remote_update(
 fn handle_key(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings_store: &SettingsStore,
-    settings: &mut Settings,
-    events: &mpsc::Receiver<ClientEvent>,
+    resources: &mut InteractionResources<'_>,
     key: KeyEvent,
 ) -> Result<(bool, bool)> {
     if key.kind == KeyEventKind::Release {
@@ -238,10 +248,15 @@ fn handle_key(
             }
         }
         Mode::Prefix => {
-            return handle_management_command(app, agents, settings, management_command(key));
+            return handle_management_command(
+                app,
+                agents,
+                resources.settings,
+                management_command(key),
+            );
         }
         Mode::NewAgent(page) => {
-            handle_new_agent_key(app, agents, settings_store, settings, events, page, key);
+            handle_new_agent_key(app, agents, resources, page, key);
         }
         Mode::ConfirmClose => match key.code {
             KeyCode::Char('y') => close_selected(app, agents)?,
@@ -275,8 +290,12 @@ fn handle_key(
             }
         }
         Mode::Settings => match key.code {
-            KeyCode::Char('h') | KeyCode::Left => save_theme(app, settings_store, settings, -1),
-            KeyCode::Char('l') | KeyCode::Right => save_theme(app, settings_store, settings, 1),
+            KeyCode::Char('h') | KeyCode::Left => {
+                save_theme(app, resources.settings_store, resources.settings, -1)
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                save_theme(app, resources.settings_store, resources.settings, 1)
+            }
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
             _ => {}
         },
@@ -412,17 +431,17 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
 fn submit_new_agent(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings_store: &SettingsStore,
-    settings: &mut Settings,
-    events: &mpsc::Receiver<ClientEvent>,
+    resources: &mut InteractionResources<'_>,
 ) {
     let Some((kind, launch_directory)) = app.new_agent_submission() else {
         return;
     };
-    match agents.spawn(kind, launch_directory.clone(), events) {
+    match agents.spawn(kind, launch_directory.clone(), resources.events) {
         Ok(()) => {
-            settings.record_successful_launch(launch_directory, kind);
-            match settings_store.save(settings) {
+            resources
+                .settings
+                .record_successful_launch(launch_directory, kind);
+            match resources.settings_store.save(resources.settings) {
                 Ok(()) => app.clear_notice(),
                 Err(error) => app.set_notice(error),
             }
@@ -435,9 +454,7 @@ fn submit_new_agent(
 fn handle_new_agent_key(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings_store: &SettingsStore,
-    settings: &mut Settings,
-    events: &mpsc::Receiver<ClientEvent>,
+    resources: &mut InteractionResources<'_>,
     page: NewAgentPage,
     key: KeyEvent,
 ) {
@@ -450,9 +467,7 @@ fn handle_new_agent_key(
             KeyCode::Enter => match app.new_agent().map(|state| state.draft.selected_field) {
                 Some(NewAgentField::Workspace) => app.open_workspace_choices(),
                 Some(NewAgentField::Agent) => app.open_agent_choices(),
-                Some(NewAgentField::Start) => {
-                    submit_new_agent(app, agents, settings_store, settings, events)
-                }
+                Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
                 None => {}
             },
             KeyCode::Esc => app.cancel_new_agent(),
@@ -462,6 +477,7 @@ fn handle_new_agent_key(
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
             KeyCode::Enter => app.confirm_workspace(),
+            KeyCode::Char('b') => resources.browser.open(app, resources.settings),
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}
         },
@@ -474,6 +490,94 @@ fn handle_new_agent_key(
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}
         },
+        NewAgentPage::NativeBrowser => handle_native_browser_key(app, resources.browser, key),
+    }
+}
+
+struct InteractionResources<'a> {
+    settings_store: &'a SettingsStore,
+    settings: &'a mut Settings,
+    events: &'a mpsc::Receiver<ClientEvent>,
+    browser: &'a mut BrowserRuntime,
+}
+
+fn handle_native_browser_key(app: &mut App, browser: &mut BrowserRuntime, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
+        KeyCode::Home => app.set_native_browser_position(0),
+        KeyCode::End => {
+            let end = app.native_browser().map_or(0, |state| state.entries.len());
+            app.set_native_browser_position(end);
+        }
+        KeyCode::PageUp => app.move_new_agent_selection(-8),
+        KeyCode::PageDown => app.move_new_agent_selection(8),
+        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            if let Some(parent) = app
+                .native_browser()
+                .and_then(|state| state.current_path.parent())
+                .map(PathBuf::from)
+            {
+                browser.load(app, parent);
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('l') => match app.native_browser_action() {
+            Some(BrowserAction::Select(path)) => match path.canonicalize() {
+                Ok(path) if path.is_dir() => app.choose_browsed_workspace(path),
+                Ok(_) => app.set_notice("selected workspace is not a directory"),
+                Err(error) => app.set_notice(format!("could not select workspace: {error}")),
+            },
+            Some(BrowserAction::Load(path)) => browser.load(app, path),
+            None => {}
+        },
+        KeyCode::Esc => app.close_native_browser(),
+        _ => {}
+    }
+}
+
+struct BrowserRuntime {
+    loader: DirectoryLoader,
+    generation: u64,
+    invocation_directory: Option<PathBuf>,
+}
+
+impl BrowserRuntime {
+    fn open(&mut self, app: &mut App, settings: &Settings) {
+        let start = app
+            .new_agent()
+            .and_then(|state| state.draft.workspace.clone())
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                settings
+                    .workspaces
+                    .iter()
+                    .find(|path| path.is_dir())
+                    .cloned()
+            })
+            .or_else(|| {
+                self.invocation_directory
+                    .clone()
+                    .filter(|path| path.is_dir())
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir())
+            })
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.generation = self.generation.saturating_add(1);
+        app.open_native_browser(start.clone(), self.generation);
+        if let Err(error) = self.loader.load(self.generation, start) {
+            app.set_notice(error);
+        }
+    }
+
+    fn load(&mut self, app: &mut App, path: PathBuf) {
+        self.generation = self.generation.saturating_add(1);
+        app.begin_directory_load(path.clone(), self.generation);
+        if let Err(error) = self.loader.load(self.generation, path) {
+            app.set_notice(error);
+        }
     }
 }
 

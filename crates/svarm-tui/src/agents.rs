@@ -57,6 +57,7 @@ pub(crate) enum Incoming {
 pub(crate) enum ClientEvent {
     Host(crossterm::event::Event),
     Remote(Incoming),
+    DirectoryLoaded(crate::workspace::DirectoryLoadResult),
 }
 
 struct CachedTerminal {
@@ -493,7 +494,11 @@ impl RemoteAgents {
                 }
                 // Host keystrokes and unrelated frames keep arriving while the session is being
                 // torn down; they no longer matter, so drop them and keep waiting.
-                Ok(ClientEvent::Remote(Incoming::Envelope(_)) | ClientEvent::Host(_)) => {}
+                Ok(
+                    ClientEvent::Remote(Incoming::Envelope(_))
+                    | ClientEvent::Host(_)
+                    | ClientEvent::DirectoryLoaded(_),
+                ) => {}
                 Ok(ClientEvent::Remote(Incoming::Disconnected(error))) => return Err(error.into()),
                 Err(error) => return Err(format!("Svarm server did not respond: {error}").into()),
             }

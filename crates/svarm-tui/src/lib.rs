@@ -8,6 +8,7 @@ mod startup;
 mod terminal;
 mod theme;
 mod ui;
+mod workspace;
 
 pub use agents::{InitialAgentRequest, InitialSession};
 pub use app::StartupChoice;

@@ -29,6 +29,7 @@ pub(crate) enum NewAgentPage {
     Form,
     Workspaces,
     Agents,
+    NativeBrowser,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,6 +62,29 @@ pub(crate) struct WorkspaceChoice {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryChoice {
+    pub path: PathBuf,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBrowserState {
+    pub generation: u64,
+    pub requested_path: PathBuf,
+    pub current_path: PathBuf,
+    pub entries: Vec<DirectoryChoice>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BrowserAction {
+    Select(PathBuf),
+    Load(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewAgentDraft {
     pub workspace: Option<PathBuf>,
     pub agent: Option<AgentKind>,
@@ -73,6 +97,7 @@ pub(crate) struct NewAgentState {
     pub workspaces: Vec<WorkspaceChoice>,
     pub selected_workspace: usize,
     pub selected_agent: usize,
+    pub native_browser: Option<NativeBrowserState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -570,6 +595,7 @@ impl App {
             workspaces,
             selected_workspace,
             selected_agent,
+            native_browser: None,
         });
         self.mode = Mode::NewAgent(NewAgentPage::Form);
     }
@@ -595,6 +621,14 @@ impl App {
                 state.selected_agent = (state.selected_agent as isize + delta)
                     .rem_euclid(AgentKind::ALL.len() as isize)
                     as usize;
+            }
+            Mode::NewAgent(NewAgentPage::NativeBrowser) => {
+                if let Some(browser) = &mut state.native_browser {
+                    let rows = browser.entries.len() + 1;
+                    browser.selected = (browser.selected as isize + delta)
+                        .clamp(0, rows.saturating_sub(1) as isize)
+                        as usize;
+                }
             }
             _ => {}
         }
@@ -665,6 +699,117 @@ impl App {
     pub fn finish_new_agent(&mut self) {
         self.new_agent = None;
         self.mode = Mode::Terminal;
+    }
+
+    pub fn open_native_browser(&mut self, path: PathBuf, generation: u64) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        state.native_browser = Some(NativeBrowserState {
+            generation,
+            requested_path: path.clone(),
+            current_path: path,
+            entries: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+        });
+        self.mode = Mode::NewAgent(NewAgentPage::NativeBrowser);
+    }
+
+    pub fn begin_directory_load(&mut self, path: PathBuf, generation: u64) {
+        let Some(browser) = self
+            .new_agent
+            .as_mut()
+            .and_then(|state| state.native_browser.as_mut())
+        else {
+            return;
+        };
+        browser.generation = generation;
+        browser.requested_path = path;
+        browser.loading = true;
+        browser.error = None;
+    }
+
+    pub fn apply_directory_load(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        result: Result<Vec<DirectoryChoice>, String>,
+    ) -> bool {
+        let Some(browser) = self
+            .new_agent
+            .as_mut()
+            .and_then(|state| state.native_browser.as_mut())
+        else {
+            return false;
+        };
+        if browser.generation != generation || browser.requested_path != path {
+            return false;
+        }
+        browser.loading = false;
+        match result {
+            Ok(entries) => {
+                browser.current_path = path;
+                browser.entries = entries;
+                browser.selected = 0;
+                browser.error = None;
+            }
+            Err(error) => browser.error = Some(error),
+        }
+        true
+    }
+
+    pub fn native_browser(&self) -> Option<&NativeBrowserState> {
+        self.new_agent.as_ref()?.native_browser.as_ref()
+    }
+
+    pub fn set_native_browser_position(&mut self, position: usize) {
+        if let Some(browser) = self
+            .new_agent
+            .as_mut()
+            .and_then(|state| state.native_browser.as_mut())
+        {
+            browser.selected = position.min(browser.entries.len());
+        }
+    }
+
+    pub fn native_browser_action(&self) -> Option<BrowserAction> {
+        let browser = self.native_browser()?;
+        if browser.selected == 0 {
+            Some(BrowserAction::Select(browser.current_path.clone()))
+        } else {
+            browser
+                .entries
+                .get(browser.selected - 1)
+                .map(|choice| BrowserAction::Load(choice.path.clone()))
+        }
+    }
+
+    pub fn choose_browsed_workspace(&mut self, path: PathBuf) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        state.draft.workspace = Some(path.clone());
+        if !state.workspaces.iter().any(|choice| choice.path == path) {
+            state.workspaces.insert(
+                0,
+                WorkspaceChoice {
+                    path,
+                    available: true,
+                },
+            );
+            state.selected_workspace = 0;
+        }
+        state.native_browser = None;
+        self.mode = Mode::NewAgent(NewAgentPage::Form);
+    }
+
+    pub fn close_native_browser(&mut self) {
+        if let Some(state) = &mut self.new_agent {
+            state.native_browser = None;
+            self.mode = Mode::NewAgent(NewAgentPage::Workspaces);
+        }
     }
 
     #[cfg(test)]
@@ -857,6 +1002,58 @@ mod tests {
         app.confirm_workspace();
         assert_eq!(app.mode(), Mode::NewAgent(NewAgentPage::Workspaces));
         assert_eq!(app.new_agent().unwrap().draft.workspace, None);
+    }
+
+    #[test]
+    fn native_browser_discards_stale_results_and_keeps_the_last_good_listing_on_error() {
+        let mut app = app();
+        app.open_new_agent(None, Some(AgentKind::Codex), Vec::new());
+        app.open_native_browser(PathBuf::from("/tmp"), 1);
+        let entries = vec![DirectoryChoice {
+            path: PathBuf::from("/tmp/one"),
+            label: "one".into(),
+        }];
+        assert!(app.apply_directory_load(1, PathBuf::from("/tmp"), Ok(entries.clone())));
+
+        app.begin_directory_load(PathBuf::from("/var"), 2);
+        assert!(!app.apply_directory_load(1, PathBuf::from("/tmp"), Ok(Vec::new())));
+        assert!(app.apply_directory_load(
+            2,
+            PathBuf::from("/var"),
+            Err("permission denied".into())
+        ));
+
+        let browser = app.native_browser().unwrap();
+        assert_eq!(browser.current_path, PathBuf::from("/tmp"));
+        assert_eq!(browser.entries, entries);
+        assert_eq!(browser.error.as_deref(), Some("permission denied"));
+    }
+
+    #[test]
+    fn native_browser_rows_select_current_or_descend_and_stay_in_bounds() {
+        let mut app = app();
+        app.open_new_agent(None, Some(AgentKind::Codex), Vec::new());
+        app.open_native_browser(PathBuf::from("/tmp"), 1);
+        app.apply_directory_load(
+            1,
+            PathBuf::from("/tmp"),
+            Ok(vec![DirectoryChoice {
+                path: PathBuf::from("/tmp/child"),
+                label: "child".into(),
+            }]),
+        );
+
+        assert_eq!(
+            app.native_browser_action(),
+            Some(BrowserAction::Select(PathBuf::from("/tmp")))
+        );
+        app.move_new_agent_selection(99);
+        assert_eq!(
+            app.native_browser_action(),
+            Some(BrowserAction::Load(PathBuf::from("/tmp/child")))
+        );
+        app.move_new_agent_selection(-99);
+        assert_eq!(app.native_browser().unwrap().selected, 0);
     }
 
     #[test]
