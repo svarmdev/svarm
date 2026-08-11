@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, AgentKind, CursorStyle, ProcessExit, SessionStatus, TerminalPalette};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -137,6 +137,7 @@ pub enum Request {
     SpawnAgent {
         lease_token: LeaseToken,
         kind: AgentKind,
+        launch_directory: PathBuf,
     },
     CloseAgent {
         lease_token: LeaseToken,
@@ -594,6 +595,25 @@ impl ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_three_spawn_request_has_a_stable_launch_directory() {
+        let request = Request::SpawnAgent {
+            lease_token: LeaseToken("lease".into()),
+            kind: AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/workspace"),
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "request": "spawn_agent",
+                "lease_token": "lease",
+                "kind": "codex",
+                "launch_directory": "/tmp/workspace"
+            })
+        );
+    }
 
     #[test]
     fn negotiation_selects_the_highest_shared_version() {

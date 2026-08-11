@@ -263,10 +263,11 @@ impl RemoteAgents {
             .map(|terminal| terminal.parser.screen())
     }
 
-    pub fn spawn(&mut self, kind: AgentKind) -> Result<()> {
+    pub fn spawn(&mut self, kind: AgentKind, launch_directory: PathBuf) -> Result<()> {
         self.send(Request::SpawnAgent {
             lease_token: self.lease_token.clone(),
             kind,
+            launch_directory,
         })
     }
 

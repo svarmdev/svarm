@@ -324,18 +324,19 @@ impl SessionRuntime {
     fn spawn(
         &mut self,
         kind: AgentKind,
+        launch_directory: &Path,
         now_ms: u64,
         _config: &ServerConfig,
     ) -> AgentResult<SessionSnapshot> {
         #[cfg(test)]
         let snapshot = if let Some((program, args)) = &_config.test_agent_command {
             self.agents
-                .spawn_test_command(kind, self.state.canonical_path(), program, args)?
+                .spawn_test_command(kind, launch_directory, program, args)?
         } else {
-            self.agents.spawn(kind, self.state.canonical_path())?
+            self.agents.spawn(kind, launch_directory)?
         };
         #[cfg(not(test))]
-        let snapshot = self.agents.spawn(kind, self.state.canonical_path())?;
+        let snapshot = self.agents.spawn(kind, launch_directory)?;
 
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
@@ -816,12 +817,17 @@ impl Server {
                 self.connections.get_mut(&id).unwrap().attached_session = None;
                 Ok(Outcome::new(Response::Ok))
             }
-            Request::SpawnAgent { lease_token, kind } => {
+            Request::SpawnAgent {
+                lease_token,
+                kind,
+                launch_directory,
+            } => {
                 let session_id = self.attached_session(id, &lease_token)?;
+                let launch_directory = canonicalize_agent_directory(&launch_directory)?;
                 let now = self.now_ms();
                 let runtime = self.sessions.get_mut(&session_id).unwrap();
                 let snapshot = runtime
-                    .spawn(kind, now, &self.config)
+                    .spawn(kind, &launch_directory, now, &self.config)
                     .map_err(internal_error)?;
                 let mut outcome = Outcome::new(Response::Ok);
                 outcome.events.push((
@@ -1555,6 +1561,25 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProtocolError> {
     })
 }
 
+fn canonicalize_agent_directory(path: &Path) -> Result<PathBuf, ProtocolError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "could not resolve agent workspace {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("agent workspace is not a directory: {}", path.display()),
+        ));
+    }
+    Ok(canonical)
+}
+
 fn agent_not_found() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::AgentNotFound,
@@ -1704,6 +1729,85 @@ mod tests {
     }
 
     #[test]
+    fn one_session_launches_agents_in_distinct_validated_directories() {
+        let directory = temp_dir();
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let regular_file = directory.join("not-a-directory");
+        fs::write(&regular_file, b"file").unwrap();
+        let socket = directory.join("server.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            run_foreground(
+                ServerConfig::new(server_socket, "test")
+                    .with_test_agent_command("sh", &["-c", "exec sleep 60"]),
+            )
+            .unwrap()
+        });
+
+        let mut client = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, created) = client.request(Request::CreateSession {
+            canonical_path: directory.clone(),
+            rows: 10,
+            cols: 40,
+            palette: None,
+        });
+        let (session_id, lease_token) = match created {
+            Response::Created {
+                session_id,
+                lease_token,
+            } => (session_id, lease_token),
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let _ = client.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+
+        for expected in [&first, &second] {
+            let _ = client.request(Request::SpawnAgent {
+                lease_token: lease_token.clone(),
+                kind: AgentKind::Codex,
+                launch_directory: expected.clone(),
+            });
+            let added = client.event_until(|event| matches!(event, Event::AgentAdded { .. }));
+            assert!(
+                matches!(added, Event::AgentAdded { agent, .. } if agent.launch_directory == *expected)
+            );
+            let _ = client.event_until(|event| matches!(event, Event::TerminalFull(_)));
+        }
+
+        for invalid in [directory.join("missing"), regular_file] {
+            let error = client.request_error(Request::SpawnAgent {
+                lease_token: lease_token.clone(),
+                kind: AgentKind::Claude,
+                launch_directory: invalid.clone(),
+            });
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(error.message.contains(&invalid.display().to_string()));
+        }
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let (_, response) = control.request(Request::GetSession {
+            target: SessionTarget::Id(session_id),
+        });
+        let Response::Session {
+            session: Some(snapshot),
+        } = response
+        else {
+            panic!("unexpected session response: {response:?}");
+        };
+        assert_eq!(snapshot.agents.len(), 2);
+        assert_eq!(snapshot.selected_agent_id, Some(snapshot.agents[1].id));
+
+        let _ = client.request(Request::StopAttachedSession { lease_token });
+        drop(client);
+        let _ = control.request(Request::StopServer { confirmed: true });
+        drop(control);
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn agent_keeps_running_and_producing_output_while_detached() {
         let directory = temp_dir();
         let socket = directory.join("server.sock");
@@ -1734,6 +1838,7 @@ mod tests {
         let _ = client.request(Request::SpawnAgent {
             lease_token: lease_token.clone(),
             kind: AgentKind::Codex,
+            launch_directory: directory.clone(),
         });
         let first = client.event_until(|event| {
             matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"before"))
@@ -1895,6 +2000,7 @@ mod tests {
         let _ = old.request(Request::SpawnAgent {
             lease_token: old_lease.clone(),
             kind: AgentKind::Codex,
+            launch_directory: directory.clone(),
         });
         let added = old.event_until(|event| matches!(event, Event::AgentAdded { .. }));
         let agent_id = match added {
@@ -1998,6 +2104,7 @@ mod tests {
         let _ = client.request(Request::SpawnAgent {
             lease_token: lease_token.clone(),
             kind: AgentKind::Codex,
+            launch_directory: directory.clone(),
         });
         let _ = client.request(Request::DetachSession { lease_token });
         drop(client);

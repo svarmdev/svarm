@@ -36,7 +36,11 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
     )?;
     let mut app = App::hydrate(snapshot, theme, settings_notice);
     if let Some(kind) = kind {
-        agents.spawn(kind)?;
+        let launch_directory = app
+            .workspace_path()
+            .cloned()
+            .ok_or("new session did not provide an agent workspace")?;
+        agents.spawn(kind, launch_directory)?;
     }
 
     let mut terminal = TerminalSession::open()?;
@@ -381,7 +385,11 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
 }
 
 fn spawn(app: &mut App, agents: &mut RemoteAgents, kind: AgentKind) -> Result<()> {
-    agents.spawn(kind)?;
+    let launch_directory = app
+        .workspace_path()
+        .cloned()
+        .ok_or("choose a workspace before starting an agent")?;
+    agents.spawn(kind, launch_directory)?;
     app.clear_notice();
     app.set_mode(Mode::Terminal);
     Ok(())
