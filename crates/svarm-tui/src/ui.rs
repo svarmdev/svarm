@@ -259,6 +259,11 @@ pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
     ))
 }
 
+pub fn new_agent_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
+    let menu = menu_button_area(area, sidebar_visible)?;
+    (menu.y > area.y).then_some(Rect::new(menu.x, menu.y - 1, menu.width, 1))
+}
+
 pub fn menu_item_at(area: Rect, column: u16, row: u16) -> Option<MenuItem> {
     let button = menu_button_area(area, true)?;
     let popup = menu_popup_area(button);
@@ -303,7 +308,7 @@ fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
     } else {
         0
     };
-    let reserved = 1 + popup_height + u16::from(app.notice().is_some());
+    let reserved = 2 + popup_height + u16::from(app.notice().is_some());
     Rect::new(
         inner.x,
         inner.y,
@@ -333,6 +338,8 @@ fn render_sidebar(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let new_button =
+        new_agent_button_area(area, true).expect("visible sidebar has a new-agent button");
     let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
     let agents_area = agent_list_area(app, area);
 
@@ -404,6 +411,19 @@ fn render_sidebar(
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
+
+    let new_button_style = text(theme);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " + New agent",
+                new_button_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ^B n", new_button_style),
+        ]))
+        .style(new_button_style),
+        new_button,
+    );
 
     if app.mode() == Mode::Menu {
         render_menu(frame, app, menu_popup_area(button), theme);
@@ -960,6 +980,41 @@ mod tests {
         assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
         assert_eq!(menu_item_at(area, 50, 36), None);
+    }
+
+    #[test]
+    fn sidebar_renders_new_agent_button_above_menu() {
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: None,
+                        embedded: None,
+                        theme: app.theme().theme(false),
+                        colors_enabled: false,
+                    },
+                );
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("+ New agent"));
+        assert!(rendered.contains("≡ Menu"));
     }
 
     #[test]

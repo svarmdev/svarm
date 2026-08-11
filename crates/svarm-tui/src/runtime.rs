@@ -221,7 +221,7 @@ fn handle_host_event(
                     app.set_notice(format!("could not send mouse input to Yazi: {error}"));
                 }
             } else {
-                dirty |= handle_mouse(app, agents, mouse, area)?;
+                dirty |= handle_mouse(app, agents, resources.settings, mouse, area)?;
             }
         }
         _ => {}
@@ -436,6 +436,7 @@ fn handle_management_command(
 fn handle_mouse(
     app: &mut App,
     agents: &mut RemoteAgents,
+    settings: &Settings,
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<bool> {
@@ -444,6 +445,14 @@ fn handle_mouse(
         Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
     ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
     {
+        if app.mode() != Mode::Menu
+            && ui::new_agent_button_area(area, app.sidebar_visible())
+                .is_some_and(|button| contains(button, mouse.column, mouse.row))
+        {
+            handle_management_command(app, agents, settings, ManagementCommand::ChooseAgent)?;
+            return Ok(true);
+        }
+
         if ui::menu_button_area(area, app.sidebar_visible())
             .is_some_and(|button| contains(button, mouse.column, mouse.row))
         {
