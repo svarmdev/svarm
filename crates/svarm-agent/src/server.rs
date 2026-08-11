@@ -1058,19 +1058,30 @@ impl Server {
                 "connection is already attached to a Svarm session",
             ));
         }
-        let token = self.lease_token();
         let now = self.now_ms();
         let process_id = self.connections[&id].process_id;
-        let runtime = self.sessions.get_mut(&session_id).ok_or_else(|| {
-            ProtocolError::new(ErrorCode::SessionNotFound, "Svarm session was not found")
-        })?;
-        runtime.state.resize(rows, cols, now)?;
-        runtime.state.set_terminal_palette(palette, now);
-        runtime.agents.resize(rows, cols).map_err(internal_error)?;
-        runtime.agents.set_terminal_palette(palette);
+        {
+            let runtime = self.sessions.get_mut(&session_id).ok_or_else(|| {
+                ProtocolError::new(ErrorCode::SessionNotFound, "Svarm session was not found")
+            })?;
+            runtime.state.validate_attach(takeover, now)?;
+            ServerSessionState::validate_resize(rows, cols)?;
+            runtime.agents.resize(rows, cols).map_err(internal_error)?;
+            runtime.agents.set_terminal_palette(palette);
+        }
+        let token = self.lease_token();
+        let runtime = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("session validated before attachment commit");
         let attach = runtime
             .state
             .attach(id, process_id, token.clone(), takeover, now)?;
+        runtime
+            .state
+            .resize(rows, cols, now)
+            .expect("dimensions validated before attachment commit");
+        runtime.state.set_terminal_palette(palette, now);
         let events = runtime
             .synchronization_events()
             .into_iter()
@@ -1791,7 +1802,11 @@ mod tests {
         let socket = directory.join("server.sock");
         let server_socket = socket.clone();
         let server = thread::spawn(move || {
-            run_foreground(ServerConfig::new(server_socket, "test")).unwrap()
+            run_foreground(
+                ServerConfig::new(server_socket, "test")
+                    .with_test_agent_command("sh", &["-c", "exec sleep 60"]),
+            )
+            .unwrap()
         });
 
         let mut old = Client::connect(&socket, ConnectionRole::Interactive);
@@ -1801,23 +1816,67 @@ mod tests {
             cols: 40,
             palette: None,
         });
-        let session_id = match created {
-            Response::Created { session_id, .. } => session_id,
+        let (session_id, old_lease) = match created {
+            Response::Created {
+                session_id,
+                lease_token,
+            } => (session_id, lease_token),
             other => panic!("unexpected create response: {other:?}"),
         };
         let _ = old.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+        let _ = old.request(Request::SpawnAgent {
+            lease_token: old_lease.clone(),
+            kind: AgentKind::Codex,
+        });
+        let added = old.event_until(|event| matches!(event, Event::AgentAdded { .. }));
+        let agent_id = match added {
+            Event::AgentAdded { agent, .. } => agent.id,
+            _ => unreachable!(),
+        };
+        let _ = old.event_until(|event| matches!(event, Event::TerminalFull(_)));
 
         let mut conflict = Client::connect(&socket, ConnectionRole::Interactive);
         let error = conflict.request_error(Request::AttachSession {
             session_id,
-            rows: 10,
-            cols: 40,
+            rows: 20,
+            cols: 60,
             palette: None,
             takeover: false,
         });
         assert_eq!(error.code, ErrorCode::SessionAlreadyAttached);
         assert!(error.context.contains_key("connection_id"));
         assert!(error.context.contains_key("attachment_age_ms"));
+        let mut inspector = Client::connect(&socket, ConnectionRole::Control);
+        let (_, session) = inspector.request(Request::GetSession {
+            target: SessionTarget::Id(session_id),
+        });
+        let snapshot = match session {
+            Response::Session {
+                session: Some(snapshot),
+            } => snapshot,
+            other => panic!("unexpected session response: {other:?}"),
+        };
+        assert_eq!((snapshot.rows, snapshot.cols), (10, 40));
+        assert_eq!(
+            snapshot
+                .summary
+                .attachment
+                .unwrap()
+                .connection_id
+                .0
+                .to_string(),
+            error.context["connection_id"]
+        );
+        let _ = old.request(Request::ResyncTerminal {
+            lease_token: old_lease,
+            agent_id,
+            last_sequence: None,
+        });
+        let full = old.event_until(
+            |event| matches!(event, Event::TerminalFull(frame) if frame.agent_id == agent_id),
+        );
+        assert!(matches!(full, Event::TerminalFull(frame) if (frame.rows, frame.cols) == (10, 40)));
+        drop(inspector);
         drop(conflict);
 
         let mut replacement = Client::connect(&socket, ConnectionRole::Interactive);

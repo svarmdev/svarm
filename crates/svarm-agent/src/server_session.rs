@@ -83,6 +83,23 @@ impl ServerSessionState {
         takeover: bool,
         now_ms: u64,
     ) -> Result<AttachResult, ProtocolError> {
+        let result = self.validate_attach(takeover, now_ms)?;
+        self.attachment = Some(AttachmentLease {
+            connection_id,
+            process_id,
+            token,
+            attached_at_ms: now_ms,
+            last_activity_ms: now_ms,
+        });
+        self.touch(now_ms);
+        Ok(result)
+    }
+
+    pub fn validate_attach(
+        &self,
+        takeover: bool,
+        now_ms: u64,
+    ) -> Result<AttachResult, ProtocolError> {
         self.ensure_running()?;
         let revoked_connection = match &self.attachment {
             Some(lease) if !takeover => {
@@ -107,15 +124,11 @@ impl ServerSessionState {
             Some(lease) => Some(lease.connection_id),
             None => None,
         };
-        self.attachment = Some(AttachmentLease {
-            connection_id,
-            process_id,
-            token,
-            attached_at_ms: now_ms,
-            last_activity_ms: now_ms,
-        });
-        self.touch(now_ms);
         Ok(AttachResult { revoked_connection })
+    }
+
+    pub fn validate_resize(rows: u16, cols: u16) -> Result<(), ProtocolError> {
+        validate_dimensions(rows, cols)
     }
 
     pub fn detach(&mut self, token: &LeaseToken, now_ms: u64) -> Result<(), ProtocolError> {

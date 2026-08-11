@@ -174,9 +174,19 @@ impl AgentManager {
         if size == self.pty_size {
             return Ok(());
         }
+        let previous = self.pty_size;
+        let mut resized = Vec::new();
         for id in &self.order {
             if let Some(session) = self.sessions.get(id) {
-                session.resize(size.rows, size.cols)?;
+                if let Err(error) = session.resize(size.rows, size.cols) {
+                    for resized_id in resized {
+                        if let Some(session) = self.sessions.get(&resized_id) {
+                            let _ = session.resize(previous.rows, previous.cols);
+                        }
+                    }
+                    return Err(error);
+                }
+                resized.push(*id);
             }
         }
         self.pty_size = size;
