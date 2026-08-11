@@ -10,7 +10,8 @@ Codex and/or Claude Code must already be installed and available on `PATH`.
 
 ```sh
 cargo install --path .
-svarm                         # Codex in the current directory
+svarm                         # Choose an agent in the current directory
+svarm --agent codex           # Codex in the current directory
 svarm --agent claude ../repo  # Claude Code in ../repo
 ```
 

@@ -40,7 +40,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        kind: AgentKind,
+        kind: Option<AgentKind>,
         cwd: PathBuf,
         pty_size: PtySize,
         terminal_palette: Option<TerminalPalette>,
@@ -48,7 +48,11 @@ impl App {
         let mut app = Self {
             agents: Vec::new(),
             selected: 0,
-            mode: Mode::Terminal,
+            mode: if kind.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::ChooseAgent
+            },
             sidebar_visible: true,
             menu_selected: 0,
             theme: ThemeName::default(),
@@ -59,7 +63,9 @@ impl App {
             pty_size,
             terminal_palette,
         };
-        app.spawn(kind)?;
+        if let Some(kind) = kind {
+            app.spawn(kind)?;
+        }
         Ok(app)
     }
 

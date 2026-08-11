@@ -23,7 +23,7 @@ use crate::{
 type SvarmTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
+pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
     let cwd = cwd.canonicalize().map_err(|error| {
         format!(
             "could not open workspace {}: {error}",
