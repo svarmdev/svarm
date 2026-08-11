@@ -1154,6 +1154,7 @@ mod tests {
             read_error: None,
             generation: 1,
             modes: svarm_agent::protocol::TerminalModes::default(),
+            output_closed: false,
         };
         let mut app = App::new(
             "workspace".into(),

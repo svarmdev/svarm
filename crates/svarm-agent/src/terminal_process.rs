@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -63,6 +63,7 @@ pub struct TerminalProcessSnapshot {
     pub read_error: Option<String>,
     pub generation: u64,
     pub modes: TerminalModes,
+    pub output_closed: bool,
 }
 
 pub struct TerminalProcess {
@@ -77,6 +78,7 @@ pub struct TerminalProcess {
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
     keyboard: Arc<Mutex<KeyboardState>>,
+    output_closed: Arc<AtomicBool>,
 }
 
 impl TerminalProcess {
@@ -147,6 +149,7 @@ impl TerminalProcess {
         let terminal_palette = Arc::new(Mutex::new(palette));
         let cursor_style = Arc::new(Mutex::new(CursorStyle::default()));
         let keyboard = Arc::new(Mutex::new(KeyboardState::default()));
+        let output_closed = Arc::new(AtomicBool::new(false));
         spawn_reader(
             reader,
             ReaderState {
@@ -157,6 +160,7 @@ impl TerminalProcess {
                 read_error: read_error.clone(),
                 cursor_style: cursor_style.clone(),
                 keyboard: keyboard.clone(),
+                output_closed: output_closed.clone(),
                 notify,
             },
         );
@@ -173,6 +177,7 @@ impl TerminalProcess {
             read_error,
             cursor_style,
             keyboard,
+            output_closed,
         })
     }
 
@@ -215,6 +220,7 @@ impl TerminalProcess {
             exit: self.exit.clone(),
             read_error: self.read_error(),
             generation: self.generation(),
+            output_closed: self.output_closed.load(Ordering::Acquire),
         }
     }
 
@@ -329,6 +335,7 @@ struct ReaderState {
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
     keyboard: Arc<Mutex<KeyboardState>>,
+    output_closed: Arc<AtomicBool>,
     notify: Option<TerminalNotifier>,
 }
 
@@ -409,6 +416,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                 }
             }
         }
+        state.output_closed.store(true, Ordering::Release);
         if let Some(notify) = &state.notify {
             notify();
         }
@@ -506,7 +514,7 @@ mod tests {
         let notify = Arc::new(move || {
             let _ = tx.try_send(());
         });
-        let _process = TerminalProcess::spawn_command(
+        let process = TerminalProcess::spawn_command(
             command("exit 0", &cwd),
             &cwd,
             size(),
@@ -517,6 +525,7 @@ mod tests {
 
         rx.recv_timeout(Duration::from_secs(1))
             .expect("EOF did not wake the owner");
+        assert!(process.snapshot().output_closed);
     }
 
     #[test]

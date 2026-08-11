@@ -756,7 +756,16 @@ impl BrowserRuntime {
             true
         } else {
             match yazi.poll() {
-                Ok(SessionStatus::Running) => false,
+                Ok(SessionStatus::Running) => {
+                    if snapshot.output_closed {
+                        let notify = self.embedded_notify.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            notify();
+                        });
+                    }
+                    false
+                }
                 Ok(SessionStatus::Exited) => true,
                 Err(error) => {
                     app.set_notice(format!("could not poll Yazi: {error}"));
