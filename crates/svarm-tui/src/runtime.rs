@@ -4,10 +4,9 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use svarm_agent::{AgentKind, Result, TerminalPalette};
+use svarm_agent::{AgentKind, AgentManager, Result, TerminalPalette, pty_size};
 
 use crate::{
-    agents::{AgentRuntime, pty_size},
     app::{App, MenuItem, Mode},
     input::{
         ManagementCommand, encode_key, encode_mouse, encode_paste, is_management_prefix,
@@ -40,7 +39,7 @@ pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
     let mut terminal = TerminalSession::open()?;
     let area = terminal.terminal().size()?;
     let child_area = ui::terminal_area(area.into(), true);
-    let mut agents = AgentRuntime::new(cwd, pty_size(child_area.height, child_area.width), palette);
+    let mut agents = AgentManager::new(cwd, pty_size(child_area.height, child_area.width), palette);
     let mut app = App::new(workspace_name, theme, kind.is_none(), settings_notice);
     if let Some(kind) = kind {
         app.add_agent(agents.spawn(kind)?);
@@ -60,11 +59,12 @@ pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
 
         if dirty {
             app.mark_selected_seen();
-            let parser = app.selected_agent_id().and_then(|id| agents.parser(id));
-            let screen = parser.as_ref().map(|parser| parser.screen());
+            let terminal_snapshot = app
+                .selected_agent_id()
+                .and_then(|id| agents.terminal_snapshot(id));
             let model = UiModel {
                 app: &app,
-                screen,
+                screen: terminal_snapshot.as_ref().map(|terminal| terminal.screen()),
                 theme: app.theme().theme(colors_enabled),
             };
             terminal.terminal().draw(|frame| ui::render(frame, model))?;
@@ -85,8 +85,8 @@ pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
             Event::Paste(text) if app.mode() == Mode::Terminal => {
                 if let Some(id) = app.selected_agent_id() {
                     let bracketed = agents
-                        .parser(id)
-                        .is_some_and(|parser| parser.screen().bracketed_paste());
+                        .terminal_snapshot(id)
+                        .is_some_and(|terminal| terminal.screen().bracketed_paste());
                     agents.send(id, &encode_paste(&text, bracketed))?;
                 }
             }
@@ -106,7 +106,7 @@ pub fn run(kind: Option<AgentKind>, cwd: PathBuf) -> Result<()> {
 
 fn handle_key(
     app: &mut App,
-    agents: &mut AgentRuntime,
+    agents: &mut AgentManager,
     settings: &SettingsStore,
     key: KeyEvent,
 ) -> Result<(bool, bool)> {
@@ -177,7 +177,7 @@ fn handle_key(
 
 fn handle_management_command(
     app: &mut App,
-    agents: &AgentRuntime,
+    agents: &AgentManager,
     command: ManagementCommand,
 ) -> Result<(bool, bool)> {
     let mut resize = false;
@@ -229,7 +229,7 @@ fn handle_management_command(
 
 fn handle_mouse(
     app: &mut App,
-    agents: &AgentRuntime,
+    agents: &AgentManager,
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<bool> {
@@ -268,12 +268,11 @@ fn handle_mouse(
     let Some(id) = app.selected_agent_id() else {
         return Ok(false);
     };
-    let Some(parser) = agents.parser(id) else {
+    let Some(terminal) = agents.terminal_snapshot(id) else {
         return Ok(false);
     };
-    let mode = parser.screen().mouse_protocol_mode();
-    let encoding = parser.screen().mouse_protocol_encoding();
-    drop(parser);
+    let mode = terminal.screen().mouse_protocol_mode();
+    let encoding = terminal.screen().mouse_protocol_encoding();
 
     let translated = MouseEvent {
         column: mouse.column - child_area.x,
@@ -286,7 +285,7 @@ fn handle_mouse(
     Ok(false)
 }
 
-fn close_selected(app: &mut App, agents: &mut AgentRuntime) -> Result<()> {
+fn close_selected(app: &mut App, agents: &mut AgentManager) -> Result<()> {
     let Some(id) = app.selected_agent_id() else {
         app.set_mode(Mode::Terminal);
         return Ok(());
@@ -296,7 +295,7 @@ fn close_selected(app: &mut App, agents: &mut AgentRuntime) -> Result<()> {
     Ok(())
 }
 
-fn spawn(app: &mut App, agents: &mut AgentRuntime, kind: AgentKind) {
+fn spawn(app: &mut App, agents: &mut AgentManager, kind: AgentKind) {
     match agents.spawn(kind) {
         Ok(snapshot) => {
             app.add_agent(snapshot);
@@ -317,7 +316,7 @@ fn save_theme(app: &mut App, settings: &SettingsStore, delta: isize) {
     }
 }
 
-fn resize_agents(agents: &mut AgentRuntime, app: &App, area: Rect) -> Result<()> {
+fn resize_agents(agents: &mut AgentManager, app: &App, area: Rect) -> Result<()> {
     let child = ui::terminal_area(area, app.sidebar_visible());
     agents.resize(child.height, child.width)
 }

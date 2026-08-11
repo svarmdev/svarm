@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -24,6 +25,34 @@ pub enum SessionStatus {
     Exited,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessExit {
+    pub code: u32,
+    pub signal: Option<String>,
+    pub success: bool,
+}
+
+impl From<portable_pty::ExitStatus> for ProcessExit {
+    fn from(status: portable_pty::ExitStatus) -> Self {
+        Self {
+            code: status.exit_code(),
+            signal: status.signal().map(str::to_owned),
+            success: status.success(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalSnapshot {
+    screen: tui_term::vt100::Screen,
+}
+
+impl TerminalSnapshot {
+    pub const fn screen(&self) -> &tui_term::vt100::Screen {
+        &self.screen
+    }
+}
+
 pub struct AgentSession {
     id: AgentId,
     kind: AgentKind,
@@ -32,6 +61,7 @@ pub struct AgentSession {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     status: SessionStatus,
+    exit: Option<ProcessExit>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
 }
@@ -43,6 +73,7 @@ pub struct SessionSnapshot {
     pub status: SessionStatus,
     pub output_generation: u64,
     pub read_error: Option<String>,
+    pub exit: Option<ProcessExit>,
 }
 
 impl AgentSession {
@@ -103,15 +134,22 @@ impl AgentSession {
             master: pair.master,
             child,
             status: SessionStatus::Running,
+            exit: None,
             generation,
             read_error,
         })
     }
 
-    pub fn parser(&self) -> MutexGuard<'_, Parser> {
+    fn parser(&self) -> MutexGuard<'_, Parser> {
         self.parser
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub fn terminal_snapshot(&self) -> TerminalSnapshot {
+        TerminalSnapshot {
+            screen: self.parser().screen().clone(),
+        }
     }
 
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
@@ -137,8 +175,10 @@ impl AgentSession {
     }
 
     fn poll_status(&mut self) -> Result<SessionStatus> {
-        if self.status == SessionStatus::Running && self.child.try_wait()?.is_some() {
-            self.status = SessionStatus::Exited;
+        if self.status == SessionStatus::Running
+            && let Some(status) = self.child.try_wait()?
+        {
+            self.record_exit(status);
         }
         Ok(self.status)
     }
@@ -146,10 +186,24 @@ impl AgentSession {
     pub fn stop(&mut self) -> Result<()> {
         if self.poll_status()? == SessionStatus::Running {
             self.child.kill()?;
-            self.child.wait()?;
-            self.status = SessionStatus::Exited;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    self.record_exit(status);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("agent did not exit after forced termination".into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
         Ok(())
+    }
+
+    fn record_exit(&mut self, status: portable_pty::ExitStatus) {
+        self.status = SessionStatus::Exited;
+        self.exit = Some(status.into());
     }
 
     fn generation(&self) -> u64 {
@@ -170,6 +224,7 @@ impl AgentSession {
             status: self.status,
             output_generation: self.generation(),
             read_error: self.read_error(),
+            exit: self.exit.clone(),
         }
     }
 

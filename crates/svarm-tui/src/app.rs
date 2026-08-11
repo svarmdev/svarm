@@ -291,6 +291,7 @@ mod tests {
             status: SessionStatus::Running,
             output_generation: generation,
             read_error: None,
+            exit: None,
         }
     }
 

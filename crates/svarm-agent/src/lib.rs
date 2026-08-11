@@ -1,10 +1,14 @@
 use std::{fmt, str::FromStr};
 
+mod manager;
 mod session;
 mod terminal;
 
+pub use manager::{AgentManager, pty_size};
 pub use portable_pty::PtySize;
-pub use session::{AgentSession, Result, SessionSnapshot, SessionStatus};
+pub use session::{
+    AgentSession, ProcessExit, Result, SessionSnapshot, SessionStatus, TerminalSnapshot,
+};
 pub use terminal::TerminalPalette;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
