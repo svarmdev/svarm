@@ -268,12 +268,23 @@ impl RemoteAgents {
             .map(|terminal| terminal.parser.screen())
     }
 
-    pub fn spawn(&mut self, kind: AgentKind, launch_directory: PathBuf) -> Result<()> {
-        self.send(Request::SpawnAgent {
-            lease_token: self.lease_token.clone(),
-            kind,
-            launch_directory,
-        })
+    pub fn spawn(
+        &mut self,
+        kind: AgentKind,
+        launch_directory: PathBuf,
+        events: &Receiver<ClientEvent>,
+    ) -> Result<()> {
+        match self.send_and_wait(
+            Request::SpawnAgent {
+                lease_token: self.lease_token.clone(),
+                kind,
+                launch_directory,
+            },
+            events,
+        )? {
+            Response::Ok => Ok(()),
+            _ => Err("Svarm server returned an invalid spawn response".into()),
+        }
     }
 
     pub fn close(&mut self, agent_id: AgentId) -> Result<()> {

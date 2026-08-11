@@ -10,7 +10,7 @@ use crate::{
     agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
     app::{App, ExitIntent, MenuItem, Mode},
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
-    settings::SettingsStore,
+    settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
 };
@@ -25,7 +25,7 @@ pub fn run(
     let palette = TerminalPalette::detect();
     let colors_enabled = colors_enabled();
     let settings = SettingsStore::discover();
-    let (theme, settings_notice) = settings.load();
+    let (mut settings_value, settings_notice) = settings.load();
     let (width, height) = crossterm::terminal::size()?;
     let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
@@ -37,12 +37,16 @@ pub fn run(
         palette,
         events_tx.clone(),
     )?;
-    let mut app = App::hydrate(snapshot, theme, settings_notice);
+    let mut app = App::hydrate(snapshot, settings_value.theme, settings_notice);
     if let Some(workspace) = initial_agent.workspace.clone() {
         app.set_workspace_hint(workspace);
     }
     if let (Some(kind), Some(launch_directory)) = (initial_agent.kind, initial_agent.workspace) {
-        agents.spawn(kind, launch_directory)?;
+        agents.spawn(kind, launch_directory.clone(), &events)?;
+        settings_value.record_successful_launch(launch_directory, kind);
+        if let Err(error) = settings.save(&settings_value) {
+            app.set_notice(error);
+        }
     }
 
     let mut terminal = TerminalSession::open()?;
@@ -79,8 +83,15 @@ pub fn run(
                     }
                 }
                 ClientEvent::Host(host) => {
-                    dirty |=
-                        handle_host_event(&mut app, &mut agents, &settings, &mut terminal, host)?;
+                    dirty |= handle_host_event(
+                        &mut app,
+                        &mut agents,
+                        &settings,
+                        &mut settings_value,
+                        &events,
+                        &mut terminal,
+                        host,
+                    )?;
                 }
             }
         }
@@ -110,14 +121,16 @@ pub fn run(
 fn handle_host_event(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings: &SettingsStore,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    events: &mpsc::Receiver<ClientEvent>,
     terminal: &mut TerminalSession,
     event: HostEvent,
 ) -> Result<bool> {
     let mut dirty = false;
     match event {
         HostEvent::Key(key) => {
-            let (resize, redraw) = handle_key(app, agents, settings, key)?;
+            let (resize, redraw) = handle_key(app, agents, settings_store, settings, events, key)?;
             dirty |= redraw;
             if resize {
                 resize_agents(agents, app, terminal.terminal().size()?.into())?;
@@ -189,7 +202,9 @@ fn apply_remote_update(
 fn handle_key(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings: &SettingsStore,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    events: &mpsc::Receiver<ClientEvent>,
     key: KeyEvent,
 ) -> Result<(bool, bool)> {
     if key.kind == KeyEventKind::Release {
@@ -209,8 +224,22 @@ fn handle_key(
         }
         Mode::Prefix => return handle_management_command(app, agents, management_command(key)),
         Mode::ChooseAgent => match key.code {
-            KeyCode::Char('c') => spawn(app, agents, AgentKind::Codex)?,
-            KeyCode::Char('a') => spawn(app, agents, AgentKind::Claude)?,
+            KeyCode::Char('c') => spawn(
+                app,
+                agents,
+                settings_store,
+                settings,
+                events,
+                AgentKind::Codex,
+            )?,
+            KeyCode::Char('a') => spawn(
+                app,
+                agents,
+                settings_store,
+                settings,
+                events,
+                AgentKind::Claude,
+            )?,
             KeyCode::Esc => app.set_mode(Mode::Terminal),
             _ => {}
         },
@@ -246,8 +275,8 @@ fn handle_key(
             }
         }
         Mode::Settings => match key.code {
-            KeyCode::Char('h') | KeyCode::Left => save_theme(app, settings, -1),
-            KeyCode::Char('l') | KeyCode::Right => save_theme(app, settings, 1),
+            KeyCode::Char('h') | KeyCode::Left => save_theme(app, settings_store, settings, -1),
+            KeyCode::Char('l') | KeyCode::Right => save_theme(app, settings_store, settings, 1),
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
             _ => {}
         },
@@ -371,13 +400,24 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
     Ok(())
 }
 
-fn spawn(app: &mut App, agents: &mut RemoteAgents, kind: AgentKind) -> Result<()> {
+fn spawn(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    events: &mpsc::Receiver<ClientEvent>,
+    kind: AgentKind,
+) -> Result<()> {
     let launch_directory = app
         .workspace_path()
         .cloned()
         .ok_or("choose a workspace before starting an agent")?;
-    agents.spawn(kind, launch_directory)?;
-    app.clear_notice();
+    agents.spawn(kind, launch_directory.clone(), events)?;
+    settings.record_successful_launch(launch_directory, kind);
+    match settings_store.save(settings) {
+        Ok(()) => app.clear_notice(),
+        Err(error) => app.set_notice(error),
+    }
     app.set_mode(Mode::Terminal);
     Ok(())
 }
@@ -389,9 +429,15 @@ fn sync_selection(app: &App, agents: &mut RemoteAgents) -> Result<()> {
     Ok(())
 }
 
-fn save_theme(app: &mut App, settings: &SettingsStore, delta: isize) {
+fn save_theme(
+    app: &mut App,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    delta: isize,
+) {
     let theme = app.cycle_theme(delta);
-    match settings.save_theme(theme) {
+    settings.theme = theme;
+    match settings_store.save(settings) {
         Ok(()) => app.clear_notice(),
         Err(error) => app.set_notice(error),
     }
