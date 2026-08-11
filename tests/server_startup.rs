@@ -186,6 +186,9 @@ fn wait_for_children(children: &mut [Child]) {
             .iter_mut()
             .all(|child| child.try_wait().unwrap().is_some())
         {
+            for child in children {
+                assert!(child.wait().unwrap().success(), "server candidate failed");
+            }
             return;
         }
         if Instant::now() >= deadline {

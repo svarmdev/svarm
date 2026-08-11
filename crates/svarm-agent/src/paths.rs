@@ -122,7 +122,11 @@ fn ensure_private_directory(path: &Path, uid: u32) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::DirBuilder::new().mode(0o700).create(path)?;
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -147,7 +151,11 @@ fn private_owned_directory(path: &Path, uid: u32) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
@@ -203,5 +211,29 @@ mod tests {
         assert!(ensure_private_directory(&link, uid).is_err());
         fs::remove_file(link).unwrap();
         fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn concurrent_creators_revalidate_the_winning_directory() {
+        let directory = temp_path();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let barrier = Arc::new(Barrier::new(32));
+        let creators = (0..32)
+            .map(|_| {
+                let directory = directory.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    ensure_private_directory(&directory, uid).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for creator in creators {
+            assert!(creator.join().unwrap());
+        }
+        assert!(private_owned_directory(&directory, uid).unwrap());
+        fs::remove_dir(directory).unwrap();
     }
 }
