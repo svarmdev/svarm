@@ -355,24 +355,27 @@ mod tests {
     #[test]
     fn yazi_not_found_is_the_only_launch_error_that_requests_fallback() {
         let root = test_root();
-        let result = YaziPicker::spawn_program(
-            root.join("not-installed").as_os_str(),
-            &root,
-            &root,
-            PtySize {
-                rows: 10,
-                cols: 40,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            None,
-            None,
-        );
-
-        match result {
-            Err(YaziLaunchError::NotFound) => {}
-            Err(YaziLaunchError::Failed(error)) => panic!("wrong launch error: {error}"),
-            Ok(_) => panic!("missing executable unexpectedly launched"),
+        for program in [
+            root.join("not-installed").into_os_string(),
+            OsString::from("svarm-yazi-test-definitely-not-installed"),
+        ] {
+            match YaziPicker::spawn_program(
+                &program,
+                &root,
+                &root,
+                PtySize {
+                    rows: 10,
+                    cols: 40,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                None,
+                None,
+            ) {
+                Err(YaziLaunchError::NotFound) => {}
+                Err(YaziLaunchError::Failed(error)) => panic!("wrong launch error: {error}"),
+                Ok(_) => panic!("missing executable unexpectedly launched"),
+            }
         }
         let not_executable = root.join("not-executable");
         fs::write(&not_executable, b"not executable").unwrap();
