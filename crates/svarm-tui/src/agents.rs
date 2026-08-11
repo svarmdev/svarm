@@ -9,7 +9,7 @@ use std::{
 };
 
 use svarm_agent::{
-    AgentId, AgentKind, Result, TerminalPalette,
+    AgentId, AgentKind, CursorStyle, Result, TerminalPalette,
     framing::{read_frame, write_frame},
     protocol::{
         ConnectionRole, Envelope, Event, FrameDisposition, Hello, HostTerminalCapabilities,
@@ -56,6 +56,7 @@ pub(crate) enum ClientEvent {
 struct CachedTerminal {
     parser: Parser,
     tracker: TerminalFrameTracker,
+    cursor_style: CursorStyle,
 }
 
 pub(crate) struct RemoteAgents {
@@ -250,6 +251,12 @@ impl RemoteAgents {
         updates
     }
 
+    pub fn cursor_style(&self, id: AgentId) -> Option<CursorStyle> {
+        self.terminals
+            .get(&id)
+            .map(|terminal| terminal.cursor_style)
+    }
+
     pub fn screen(&self, id: AgentId) -> Option<&Screen> {
         self.terminals
             .get(&id)
@@ -360,11 +367,13 @@ impl RemoteAgents {
             .or_insert_with(|| CachedTerminal {
                 parser: Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS),
                 tracker: TerminalFrameTracker::default(),
+                cursor_style: CursorStyle::default(),
             });
         let disposition = terminal.tracker.accept_full(frame.sequence);
         if disposition == FrameDisposition::Apply {
             terminal.parser = Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS);
             terminal.parser.process(&frame.formatted_screen);
+            terminal.cursor_style = frame.cursor_style;
             self.pending_resync.remove(&frame.agent_id);
         }
         disposition
@@ -382,6 +391,7 @@ impl RemoteAgents {
             .accept_diff(frame.base_sequence, frame.sequence);
         if disposition == FrameDisposition::Apply {
             terminal.parser.process(&frame.formatted_changes);
+            terminal.cursor_style = frame.cursor_style;
         }
         disposition
     }

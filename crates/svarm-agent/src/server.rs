@@ -429,6 +429,7 @@ impl SessionRuntime {
 
         let (rows, cols) = screen.size();
         let modes = terminal_modes(&screen);
+        let cursor_style = self.agents.cursor_style(id).unwrap_or_default();
         let sequence = self.state.next_terminal_sequence(id).ok()?;
         let event = match payload {
             FramePayload::Full(formatted_screen) => Event::TerminalFull(TerminalFull {
@@ -439,6 +440,7 @@ impl SessionRuntime {
                 sequence,
                 formatted_screen,
                 modes,
+                cursor_style,
             }),
             FramePayload::Diff {
                 base_sequence,
@@ -452,6 +454,7 @@ impl SessionRuntime {
                 sequence,
                 formatted_changes: bytes,
                 modes,
+                cursor_style,
             }),
         };
         let acknowledged = self
@@ -1579,8 +1582,9 @@ mod tests {
     use std::{fs, io::Write, time::SystemTime};
 
     use super::*;
-    use crate::protocol::{
-        Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull,
+    use crate::{
+        CursorStyle,
+        protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull},
     };
     use tui_term::vt100::Parser;
 
@@ -2108,6 +2112,7 @@ mod tests {
                 sequence,
                 formatted_screen: vec![b'x'],
                 modes: TerminalModes::default(),
+                cursor_style: CursorStyle::default(),
             }))
         } else {
             Message::Event(Event::TerminalDiff(TerminalDiff {
@@ -2119,6 +2124,7 @@ mod tests {
                 sequence,
                 formatted_changes: vec![b'x'],
                 modes: TerminalModes::default(),
+                cursor_style: CursorStyle::default(),
             }))
         };
         Envelope {

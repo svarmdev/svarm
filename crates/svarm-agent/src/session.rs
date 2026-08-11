@@ -15,7 +15,10 @@ use tui_term::vt100::Parser;
 
 use crate::{
     AgentId, AgentKind,
-    terminal::{ColorQueryDetector, TerminalPalette, color_query_responses},
+    terminal::{
+        ColorQueryDetector, CursorStyle, CursorStyleDetector, TerminalPalette,
+        color_query_responses,
+    },
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -76,6 +79,7 @@ pub struct AgentSession {
     terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
+    cursor_style: Arc<Mutex<CursorStyle>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,14 +135,19 @@ impl AgentSession {
         let generation = Arc::new(AtomicU64::new(0));
         let read_error = Arc::new(Mutex::new(None));
         let terminal_palette = Arc::new(Mutex::new(palette));
+        let cursor_style = Arc::new(Mutex::new(CursorStyle::default()));
         spawn_reader(
             reader,
-            parser.clone(),
-            writer.clone(),
-            terminal_palette.clone(),
-            generation.clone(),
-            read_error.clone(),
-            (id, notify),
+            ReaderState {
+                id,
+                parser: parser.clone(),
+                writer: writer.clone(),
+                terminal_palette: terminal_palette.clone(),
+                generation: generation.clone(),
+                read_error: read_error.clone(),
+                cursor_style: cursor_style.clone(),
+                notify,
+            },
         );
 
         Ok(Self {
@@ -153,7 +162,16 @@ impl AgentSession {
             terminal_palette,
             generation,
             read_error,
+            cursor_style,
         })
+    }
+
+    /// The cursor the agent last asked for. Frames carry it because the emulated screen cannot.
+    pub fn cursor_style(&self) -> CursorStyle {
+        *self
+            .cursor_style
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn parser(&self) -> MutexGuard<'_, Parser> {
@@ -283,18 +301,34 @@ impl Drop for AgentSession {
     }
 }
 
-fn spawn_reader(
-    mut reader: Box<dyn Read + Send>,
+/// The state an agent's reader thread shares with its session: everything the output stream can
+/// change, plus the channels it answers and reports on.
+struct ReaderState {
+    id: AgentId,
     parser: Arc<Mutex<Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
-    notify: (AgentId, Option<OutputNotifier>),
-) {
+    cursor_style: Arc<Mutex<CursorStyle>>,
+    notify: Option<OutputNotifier>,
+}
+
+fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
+    let ReaderState {
+        id,
+        parser,
+        writer,
+        terminal_palette,
+        generation,
+        read_error,
+        cursor_style,
+        notify,
+    } = state;
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
         let mut color_queries = ColorQueryDetector::default();
+        let mut cursor_styles = CursorStyleDetector::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -310,13 +344,18 @@ fn spawn_reader(
                         let _ = writer.write_all(response.as_bytes());
                         let _ = writer.flush();
                     }
+                    if let Some(style) = cursor_styles.process(&buffer[..count]) {
+                        *cursor_style
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner()) = style;
+                    }
                     parser
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .process(&buffer[..count]);
                     generation.fetch_add(1, Ordering::Release);
-                    if let Some(callback) = &notify.1 {
-                        callback(notify.0);
+                    if let Some(callback) = &notify {
+                        callback(id);
                     }
                 }
                 Err(error) => {

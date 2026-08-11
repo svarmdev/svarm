@@ -2,9 +2,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, AgentKind, ProcessExit, SessionStatus, TerminalPalette};
+use crate::{AgentId, AgentKind, CursorStyle, ProcessExit, SessionStatus, TerminalPalette};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -404,6 +404,7 @@ pub struct TerminalFull {
     #[serde(with = "crate::base64")]
     pub formatted_screen: Vec<u8>,
     pub modes: TerminalModes,
+    pub cursor_style: CursorStyle,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -417,6 +418,7 @@ pub struct TerminalDiff {
     #[serde(with = "crate::base64")]
     pub formatted_changes: Vec<u8>,
     pub modes: TerminalModes,
+    pub cursor_style: CursorStyle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

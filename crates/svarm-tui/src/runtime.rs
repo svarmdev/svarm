@@ -46,12 +46,16 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
     let mut connection_failure = None;
     while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
-            let screen = app.selected_agent_id().and_then(|id| agents.screen(id));
+            let selected = app.selected_agent_id();
             let model = UiModel {
                 app: &app,
-                screen,
+                screen: selected.and_then(|id| agents.screen(id)),
                 theme: app.theme().theme(colors_enabled),
             };
+            let cursor_style = selected
+                .and_then(|id| agents.cursor_style(id))
+                .unwrap_or_default();
+            terminal.set_cursor_style(cursor_style)?;
             terminal.terminal().draw(|frame| ui::render(frame, model))?;
             if let Some((id, generation)) = app.mark_selected_seen() {
                 agents.mark_seen(id, generation)?;

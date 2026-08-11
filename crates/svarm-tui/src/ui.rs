@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -409,9 +409,25 @@ fn render_terminal(
         );
         return;
     };
-    let terminal =
-        PseudoTerminal::new(screen).cursor(Cursor::default().visibility(mode == Mode::Terminal));
-    frame.render_widget(terminal, area);
+    // The cursor is the host terminal's own, placed below, so that it keeps the shape, color and
+    // blink the user configured. Painting one into the buffer can only produce a static block.
+    frame.render_widget(
+        PseudoTerminal::new(screen).cursor(Cursor::default().visibility(false)),
+        area,
+    );
+    if mode == Mode::Terminal
+        && !screen.hide_cursor()
+        && let Some(position) = cursor_position(screen, area)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+/// The cursor's place in the frame, or `None` when the agent has it somewhere the pane cannot show
+/// — off the bottom of a screen taller than its area, for instance.
+fn cursor_position(screen: &Screen, area: Rect) -> Option<Position> {
+    let (row, column) = screen.cursor_position();
+    (row < area.height && column < area.width).then(|| Position::new(area.x + column, area.y + row))
 }
 
 fn render_choose_agent(frame: &mut Frame<'_>, theme: Theme) {
@@ -813,6 +829,73 @@ mod tests {
         let rendered = render_app_text(&app);
         assert!(rendered.contains('×'));
         assert!(rendered.contains('!'));
+    }
+
+    #[test]
+    fn the_agent_cursor_is_the_host_terminal_cursor_not_a_painted_cell() {
+        let mut parser = tui_term::vt100::Parser::new(24, 55, 0);
+        parser.process(b"prompt> ");
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            true,
+            None,
+        );
+        app.set_mode(Mode::Terminal);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: Some(parser.screen()),
+                        theme: app.theme().theme(true),
+                    },
+                )
+            })
+            .unwrap();
+
+        // Column 8 of the pane, which starts after the sidebar.
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(SIDEBAR_WIDTH + 8, 0)
+        );
+        let cursor_cell = &terminal.backend().buffer()[(SIDEBAR_WIDTH + 8, 0)];
+        assert!(
+            !cursor_cell.modifier.contains(Modifier::REVERSED) && cursor_cell.symbol() != "█",
+            "the pane must not paint a cursor over the terminal's own"
+        );
+    }
+
+    #[test]
+    fn a_hidden_agent_cursor_leaves_the_host_cursor_hidden() {
+        let mut parser = tui_term::vt100::Parser::new(24, 55, 0);
+        parser.process(b"working\x1b[?25l");
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            true,
+            None,
+        );
+        app.set_mode(Mode::Terminal);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: Some(parser.screen()),
+                        theme: app.theme().theme(true),
+                    },
+                )
+            })
+            .unwrap();
+
+        assert!(!terminal.backend().cursor_visible());
     }
 
     fn render_app_text(app: &App) -> String {

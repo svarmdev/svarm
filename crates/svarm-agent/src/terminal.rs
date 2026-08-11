@@ -40,6 +40,78 @@ impl From<ColorPalette> for TerminalPalette {
     }
 }
 
+/// The cursor an agent asked the terminal to draw, via `CSI Ps SP q` (DECSCUSR).
+///
+/// The emulator does not model this, and Svarm cannot infer it from the screen, so the sequence is
+/// recognized as it passes through and carried alongside the frame instead. [`Self::Default`] is
+/// the agent deferring to the terminal, which is what makes the user's own shape and blink setting
+/// apply when no agent has expressed a preference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorStyle {
+    #[default]
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
+impl CursorStyle {
+    fn from_parameter(parameter: u16) -> Self {
+        match parameter {
+            1 => Self::BlinkingBlock,
+            2 => Self::SteadyBlock,
+            3 => Self::BlinkingUnderline,
+            4 => Self::SteadyUnderline,
+            5 => Self::BlinkingBar,
+            6 => Self::SteadyBar,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// Recognizes `CSI Ps SP q` in an agent's output. Reads arrive in arbitrary chunks, so this keeps
+/// only the position within a candidate sequence rather than buffering bytes.
+#[derive(Default)]
+pub(crate) struct CursorStyleDetector {
+    scan: Scan,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Scan {
+    #[default]
+    Idle,
+    Escape,
+    Parameter(u16),
+    Intermediate(u16),
+}
+
+impl CursorStyleDetector {
+    /// Returns the last style requested in `bytes`, if any.
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> Option<CursorStyle> {
+        let mut style = None;
+        for byte in bytes {
+            self.scan = match (self.scan, byte) {
+                (_, 0x1b) => Scan::Escape,
+                (Scan::Escape, b'[') => Scan::Parameter(0),
+                (Scan::Parameter(value), b'0'..=b'9') => {
+                    Scan::Parameter(value.saturating_mul(10) + u16::from(byte - b'0'))
+                }
+                (Scan::Parameter(value), b' ') => Scan::Intermediate(value),
+                (Scan::Intermediate(value), b'q') => {
+                    style = Some(CursorStyle::from_parameter(value));
+                    Scan::Idle
+                }
+                _ => Scan::Idle,
+            };
+        }
+        style
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ColorQuery {
     Foreground,
@@ -131,6 +203,41 @@ mod tests {
             detector.process(b"\\middle\x1b]11;?\x07after"),
             [ColorQuery::Foreground, ColorQuery::Background]
         );
+    }
+
+    #[test]
+    fn cursor_styles_are_recognized_across_reads_and_default_when_unset() {
+        let mut detector = CursorStyleDetector::default();
+
+        assert_eq!(detector.process(b"text without a request"), None);
+        assert_eq!(
+            detector.process(b"\x1b[5 q"),
+            Some(CursorStyle::BlinkingBar)
+        );
+        assert_eq!(detector.process(b"\x1b[2"), None, "sequence is incomplete");
+        assert_eq!(detector.process(b" q"), Some(CursorStyle::SteadyBlock));
+        assert_eq!(
+            detector.process(b"\x1b[0 q"),
+            Some(CursorStyle::Default),
+            "zero returns the cursor to the terminal's own preference"
+        );
+    }
+
+    #[test]
+    fn cursor_detection_reports_the_last_request_and_ignores_lookalikes() {
+        let mut detector = CursorStyleDetector::default();
+
+        assert_eq!(
+            detector.process(b"\x1b[1 q\x1b[38;5;9mred\x1b[4 q"),
+            Some(CursorStyle::SteadyUnderline),
+            "later requests supersede earlier ones within a single read"
+        );
+        assert_eq!(
+            detector.process(b"\x1b[?25h\x1b[6n\x1b[q\x1b[ q"),
+            Some(CursorStyle::Default),
+            "an empty parameter is DECSCUSR 0, while other sequences are not cursor requests"
+        );
+        assert_eq!(detector.process(b"\x1b[2J\x1b[Hq"), None);
     }
 
     #[test]

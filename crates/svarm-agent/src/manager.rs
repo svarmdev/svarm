@@ -109,6 +109,10 @@ impl AgentManager {
             .map(|session| session.with_screen(read))
     }
 
+    pub fn cursor_style(&self, id: AgentId) -> Option<crate::CursorStyle> {
+        self.sessions.get(&id).map(AgentSession::cursor_style)
+    }
+
     pub fn snapshot(&self, id: AgentId) -> Option<SessionSnapshot> {
         self.sessions.get(&id).map(AgentSession::snapshot)
     }
