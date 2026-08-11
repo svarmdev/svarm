@@ -22,6 +22,7 @@ const COMPACT_MODAL_HEIGHT: u16 = 12;
 const STANDARD_MODAL_WIDTH: u16 = 72;
 const STANDARD_MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = 34;
+const AGENT_CARD_HEIGHT: u16 = 3;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
 
@@ -267,6 +268,22 @@ pub fn menu_item_at(area: Rect, column: u16, row: u16) -> Option<MenuItem> {
     MenuItem::ALL.get(index).copied()
 }
 
+pub fn agent_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
+    if !app.sidebar_visible() {
+        return None;
+    }
+    let agents = agent_list_area(app, sidebar_area(area));
+    if column < agents.x || column >= agents.right() || row < agents.y || row >= agents.bottom() {
+        return None;
+    }
+    let slot = usize::from((row - agents.y) / AGENT_CARD_HEIGHT);
+    if slot >= usize::from(agents.height / AGENT_CARD_HEIGHT) {
+        return None;
+    }
+    let index = agent_list_start(app, agents) + slot;
+    (index < app.agents().len()).then_some(index)
+}
+
 fn menu_popup_area(button: Rect) -> Rect {
     Rect::new(
         button.x,
@@ -276,26 +293,41 @@ fn menu_popup_area(button: Rect) -> Rect {
     )
 }
 
-fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
-    let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
-    let block = Block::new()
-        .title(title)
+fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
+    let inner = Block::new()
         .borders(Borders::TOP | Borders::RIGHT)
-        .border_style(border(theme));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
+        .inner(sidebar);
     let popup_height = if app.mode() == Mode::Menu {
         MENU_HEIGHT
     } else {
         0
     };
-    let notice_height = u16::from(app.notice().is_some());
-    let agents_height = inner
-        .height
-        .saturating_sub(1 + popup_height + notice_height);
-    let agents_area = Rect::new(inner.x, inner.y, inner.width, agents_height);
+    let reserved = 1 + popup_height + u16::from(app.notice().is_some());
+    Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(reserved),
+    )
+}
+
+fn agent_list_start(app: &App, area: Rect) -> usize {
+    let visible = usize::from((area.height / AGENT_CARD_HEIGHT).max(1));
+    app.selected_index().saturating_sub(visible - 1)
+}
+
+fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+    let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
+    let block = Block::new()
+        .title(title)
+        .borders(Borders::TOP | Borders::RIGHT)
+        .border_style(border(theme))
+        .style(Style::default().bg(Color::Reset));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
+    let agents_area = agent_list_area(app, area);
 
     let cards = app
         .agents()
@@ -305,16 +337,25 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
             let status = agent.display_status();
             let (circle, status_style) = status_display(status, theme);
             let content_width = usize::from(agents_area.width.saturating_sub(2));
+            let number = format!("{} · ", index + 1);
             let title = end_truncate(
                 agent
                     .conversation_title()
                     .unwrap_or("Untitled conversation"),
-                content_width.saturating_sub(2),
+                usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
             );
             let mut lines = vec![
                 Line::from(vec![
+                    Span::styled(
+                        if index == app.selected_index() {
+                            "▌"
+                        } else {
+                            " "
+                        },
+                        accent(theme),
+                    ),
                     Span::styled(format!("{circle} "), status_style),
-                    Span::styled(format!("{} · ", index + 1), theme.muted()),
+                    Span::styled(number, theme.muted()),
                     Span::styled(title, text(theme).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
@@ -334,18 +375,20 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                     Span::raw("  "),
                     Span::styled(value, accent(theme)),
                 ]));
+            } else {
+                lines.push(Line::default());
             }
-            ListItem::new(lines)
+            ListItem::new(lines).style(if index == app.selected_index() {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(app.selected_index()));
-    frame.render_stateful_widget(
-        List::new(cards)
-            .highlight_symbol("▌")
-            .highlight_style(sidebar_selection(theme)),
-        agents_area,
-        &mut state,
-    );
+    let mut state = ListState::default()
+        .with_offset(agent_list_start(app, agents_area))
+        .with_selected(Some(app.selected_index()));
+    frame.render_stateful_widget(List::new(cards), agents_area, &mut state);
 
     if let Some(notice) = app.notice() {
         let y = agents_area.bottom();
@@ -362,7 +405,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let button_style = if app.mode() == Mode::Menu {
         theme.selected()
     } else {
-        theme.surface()
+        text(theme)
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -406,16 +449,6 @@ fn status_display(status: AgentDisplayStatus, theme: Theme) -> (&'static str, St
         AgentDisplayStatus::Working => ("●", warning(theme)),
         AgentDisplayStatus::Done => ("●", success(theme)),
         AgentDisplayStatus::NeedsYou | AgentDisplayStatus::Failed => ("●", error(theme)),
-    }
-}
-
-fn sidebar_selection(theme: Theme) -> Style {
-    if theme.selection == Color::Reset {
-        theme.selected()
-    } else {
-        Style::default()
-            .bg(theme.selection)
-            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -1169,7 +1202,7 @@ mod tests {
         assert!(!rendered.contains("/tmp/project-eight"));
         assert!(rendered.contains("project-eight · feature/side…"));
 
-        let theme = crate::theme::ThemeName::Dark.theme(true);
+        let theme = crate::theme::ThemeName::CatppuccinMocha.theme(true);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| {
@@ -1193,6 +1226,15 @@ mod tests {
             .map(|cell| cell.fg)
             .collect::<Vec<_>>();
         assert_eq!(circle_colors, vec![theme.error, theme.ok]);
+        for row in 0..24 {
+            for column in 0..SIDEBAR_WIDTH {
+                assert_eq!(
+                    terminal.backend().buffer()[(column, row)].bg,
+                    Color::Reset,
+                    "sidebar background changed at ({column}, {row})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1270,6 +1312,12 @@ mod tests {
         assert!(rendered.contains("Claude Code"));
         assert!(!rendered.contains("8 · Claude Code"));
         assert!(!rendered.contains("idle"));
+
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(agent_item_at(&app, area, 2, 1), Some(1));
+        assert_eq!(agent_item_at(&app, area, 2, 19), Some(7));
+        assert_eq!(agent_item_at(&app, area, 2, 22), None);
+        assert_eq!(agent_item_at(&app, area, 40, 19), None);
     }
 
     #[test]

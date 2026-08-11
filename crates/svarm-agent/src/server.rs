@@ -458,15 +458,13 @@ impl SessionRuntime {
         } else {
             Some(title)
         };
-        let recognition = title_recognition
-            .map(|recognized| recognized.evidence)
-            .or_else(|| match screen_recognition {
-                ScreenRecognition::Recognized(evidence) => Some(evidence),
-                ScreenRecognition::Preserve => previous
-                    .as_ref()
-                    .and_then(|agent| agent.recognition.clone()),
-                ScreenRecognition::Unknown => None,
-            });
+        let recognition = match screen_recognition {
+            ScreenRecognition::Recognized(evidence) => Some(evidence),
+            ScreenRecognition::Preserve => previous
+                .as_ref()
+                .and_then(|agent| agent.recognition.clone()),
+            ScreenRecognition::Unknown => title_recognition.map(|recognized| recognized.evidence),
+        };
         let activity = recognition
             .as_ref()
             .map_or(AgentActivity::Unknown, |evidence| evidence.claim);
@@ -1821,7 +1819,7 @@ mod tests {
             "sh",
             &[
                 "-c",
-                r"printf '\033]2;⠋ Working | Initial conversation\a'; sleep 0.3; printf '\033]2;⠙ Working | Refactor sidebar\a'; sleep 0.2; printf '\033]2;Ready | Refactor sidebar\a'; sleep 2",
+                r"printf '\033]2;[ ! ] Action Required | Initial conversation\a\033[20;1HWorking  esc to interrupt'; sleep 0.3; printf '\033]2;⠙ Working | Refactor sidebar\a'; sleep 0.2; printf '\033]2;Ready | Refactor sidebar\a\033[20;1H\033[2KReady\033[21;1H\033[2K? for shortcuts'; sleep 2",
             ],
         );
         runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
@@ -1839,7 +1837,7 @@ mod tests {
                         .recognition
                         .as_ref()
                         .map(|evidence| evidence.rule.as_str()),
-                    Some("codex.title-active")
+                    Some("codex.active-turn")
                 );
                 let git = agent.git.as_ref().unwrap();
                 assert!(!git.branch.is_empty());

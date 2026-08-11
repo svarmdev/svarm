@@ -98,6 +98,9 @@ pub fn run(
     let mut connection_failure = None;
     while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
+            if let Some((id, generation)) = app.mark_selected_seen() {
+                agents.mark_seen(id, generation)?;
+            }
             let selected = app.selected_agent_id();
             let embedded = browser.snapshot();
             let model = UiModel {
@@ -116,9 +119,6 @@ pub fn run(
             );
             terminal.set_cursor_style(cursor_style)?;
             terminal.terminal().draw(|frame| ui::render(frame, model))?;
-            if let Some((id, generation)) = app.mark_selected_seen() {
-                agents.mark_seen(id, generation)?;
-            }
             dirty = false;
         }
 
@@ -459,6 +459,14 @@ fn handle_mouse(
         {
             app.select_menu_item(item);
             app.open_selected_menu_item();
+            return Ok(true);
+        }
+
+        if app.mode() == Mode::Terminal
+            && let Some(index) = ui::agent_item_at(app, area, mouse.column, mouse.row)
+        {
+            app.select(index);
+            sync_selection(app, agents)?;
             return Ok(true);
         }
     }

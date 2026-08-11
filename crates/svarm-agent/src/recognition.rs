@@ -125,7 +125,9 @@ pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecog
 
     Some(TitleRecognition {
         conversation_title: (!conversation_title.trim().is_empty())
-            .then(|| conversation_title.trim().to_owned()),
+            .then(|| conversation_title.trim())
+            .filter(|title| !looks_like_uuid(title))
+            .map(str::to_owned),
         evidence: RecognitionEvidence {
             provider: kind,
             claim,
@@ -133,6 +135,17 @@ pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecog
             evidence: evidence.into(),
         },
     })
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.char_indices().all(|(index, character)| {
+            if [8, 13, 18, 23].contains(&index) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
 }
 
 pub(crate) fn recognize(kind: AgentKind, screen: &Screen) -> ScreenRecognition {
@@ -280,6 +293,15 @@ mod tests {
         }
         assert!(recognize_title(AgentKind::Claude, "Ready | Conversation").is_none());
         assert!(recognize_title(AgentKind::Codex, "Conversation only").is_none());
+        assert_eq!(
+            recognize_title(
+                AgentKind::Codex,
+                "Ready | 019ff1d3-375e-7a72-a176-c47497827e49"
+            )
+            .unwrap()
+            .conversation_title,
+            None
+        );
     }
 
     #[test]
