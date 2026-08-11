@@ -130,6 +130,10 @@ impl AgentSession {
         Ok(self.status)
     }
 
+    pub const fn status(&self) -> SessionStatus {
+        self.status
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         if self.poll_status()? == SessionStatus::Running {
             self.child.kill()?;

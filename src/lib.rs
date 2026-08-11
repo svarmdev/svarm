@@ -1,5 +1,6 @@
 use std::{fmt, str::FromStr};
 
+pub mod app;
 pub mod cli;
 pub mod input;
 pub mod session;
@@ -8,6 +9,17 @@ pub mod session;
 pub enum AgentKind {
     Codex,
     Claude,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Mode {
+    #[default]
+    Terminal,
+    Prefix,
+    ChooseAgent,
+    ConfirmClose,
+    ConfirmQuit,
+    Help,
 }
 
 impl AgentKind {
