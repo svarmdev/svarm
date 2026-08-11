@@ -3,12 +3,12 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use svarm_agent::vt100::Screen;
 
 use crate::{
-    app::{App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
+    app::{AgentDisplayStatus, App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
     input::MANAGEMENT_KEYBINDINGS,
     screen::TerminalScreen,
     theme::Theme,
@@ -21,7 +21,7 @@ const COMPACT_MODAL_WIDTH: u16 = 64;
 const COMPACT_MODAL_HEIGHT: u16 = 12;
 const STANDARD_MODAL_WIDTH: u16 = 72;
 const STANDARD_MODAL_HEIGHT: u16 = 18;
-pub const SIDEBAR_WIDTH: u16 = 25;
+pub const SIDEBAR_WIDTH: u16 = 34;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
 
@@ -297,50 +297,65 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .saturating_sub(1 + popup_height + notice_height);
     let agents_area = Rect::new(inner.x, inner.y, inner.width, agents_height);
 
-    let rows = app
+    let cards = app
         .agents()
         .iter()
         .enumerate()
         .map(|(index, agent)| {
-            let selected = index == app.selected_index();
-            let status = agent.status();
-            let marker = match (status, agent.has_unseen_output()) {
-                (SessionStatus::Exited, _) => "×",
-                (_, true) => "!",
-                _ => "●",
-            };
-            let status_style = match (status, agent.has_unseen_output()) {
-                (SessionStatus::Exited, _) => theme.muted(),
-                (_, true) => warning(theme),
-                _ => success(theme),
-            };
-            let fixed_width = 3
-                + (index + 1).to_string().chars().count()
-                + 1
-                + agent.kind().label().chars().count()
-                + 3
-                + 1
-                + marker.chars().count();
-            let workspace = end_truncate(
-                &agent.workspace_name(),
-                usize::from(agents_area.width).saturating_sub(fixed_width),
+            let status = agent.display_status();
+            let (circle, label, status_style) = status_display(status, theme);
+            let content_width = usize::from(agents_area.width.saturating_sub(2));
+            let title = end_truncate(
+                agent
+                    .conversation_title()
+                    .unwrap_or("Untitled conversation"),
+                content_width.saturating_sub(2),
             );
-            let mut line = Line::from(vec![
-                Span::styled(if selected { " ▌ " } else { "   " }, accent(theme)),
-                Span::styled(format!("{} ", index + 1), theme.muted()),
-                Span::styled(agent.kind().label(), text(theme)),
-                Span::styled(" · ", theme.muted()),
-                Span::styled(workspace, theme.muted()),
-                Span::raw(" "),
-                Span::styled(marker, status_style),
-            ]);
-            if selected {
-                line = line.style(theme.selected());
+            let directory = start_truncate(
+                &agent.launch_directory().display().to_string(),
+                content_width.saturating_sub(2),
+            );
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{circle} "), status_style),
+                    Span::styled(title, text(theme).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{} · ", index + 1), theme.muted()),
+                    Span::styled(agent.kind().label(), text(theme)),
+                    Span::styled(" · ", theme.muted()),
+                    Span::styled(label, status_style),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(directory, theme.muted()),
+                ]),
+            ];
+            if let Some(git) = agent.git() {
+                let worktree = git
+                    .worktree
+                    .file_name()
+                    .unwrap_or(git.worktree.as_os_str())
+                    .to_string_lossy();
+                let value =
+                    paired_truncate(&git.branch, &worktree, content_width.saturating_sub(2));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(value, accent(theme)),
+                ]));
             }
-            ListItem::new(line)
+            ListItem::new(lines)
         })
         .collect::<Vec<_>>();
-    frame.render_widget(List::new(rows), agents_area);
+    let mut state = ListState::default().with_selected(Some(app.selected_index()));
+    frame.render_stateful_widget(
+        List::new(cards)
+            .highlight_symbol("▌")
+            .highlight_style(theme.selected()),
+        agents_area,
+        &mut state,
+    );
 
     if let Some(notice) = app.notice() {
         let y = agents_area.bottom();
@@ -377,6 +392,47 @@ fn end_truncate(value: &str, width: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+fn start_truncate(value: &str, width: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let length = characters.len();
+    if length <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    std::iter::once('…')
+        .chain(characters.into_iter().skip(length - (width - 1)))
+        .collect()
+}
+
+fn paired_truncate(left: &str, right: &str, width: usize) -> String {
+    const SEPARATOR: &str = " · ";
+    if width <= SEPARATOR.chars().count() {
+        return end_truncate(left, width);
+    }
+    let available = width - SEPARATOR.chars().count();
+    let left_width = available / 2;
+    let right_width = available - left_width;
+    format!(
+        "{}{}{}",
+        end_truncate(left, left_width),
+        SEPARATOR,
+        end_truncate(right, right_width)
+    )
+}
+
+fn status_display(status: AgentDisplayStatus, theme: Theme) -> (&'static str, &'static str, Style) {
+    match status {
+        AgentDisplayStatus::Unknown => ("○", "unknown", theme.muted()),
+        AgentDisplayStatus::Idle => ("○", "idle", theme.muted()),
+        AgentDisplayStatus::Working => ("●", "working", warning(theme)),
+        AgentDisplayStatus::Done => ("●", "done", success(theme)),
+        AgentDisplayStatus::NeedsYou => ("●", "needs you", error(theme)),
+        AgentDisplayStatus::Failed => ("●", "failed", error(theme)),
+    }
 }
 
 fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
@@ -837,6 +893,10 @@ fn warning(theme: Theme) -> Style {
     Style::default().fg(theme.warn)
 }
 
+fn error(theme: Theme) -> Style {
+    Style::default().fg(theme.error)
+}
+
 fn border(theme: Theme) -> Style {
     Style::default().fg(theme.border)
 }
@@ -847,8 +907,8 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
     use svarm_agent::protocol::{
-        AgentSnapshot, AttachmentSummary, ConnectionId, SessionId, SessionRevision, SessionSummary,
-        SvarmSessionSnapshot, TerminalSequence,
+        AgentActivity, AgentSnapshot, AttachmentSummary, ConnectionId, GitContext, SessionId,
+        SessionRevision, SessionSummary, SvarmSessionSnapshot, TerminalSequence,
     };
 
     use super::*;
@@ -868,7 +928,7 @@ mod tests {
     #[test]
     fn menu_hit_areas_stay_at_the_bottom_of_the_sidebar() {
         let area = Rect::new(0, 0, 120, 40);
-        assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 24, 1)));
+        assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 33, 1)));
         assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
         assert_eq!(menu_item_at(area, 50, 36), None);
@@ -1045,9 +1105,13 @@ mod tests {
             exit: None,
             output_generation: 0,
             seen_generation: 0,
+            completed_generation: 0,
             terminal_sequence: TerminalSequence(0),
             read_error: None,
+            conversation_title: None,
+            activity: AgentActivity::Unknown,
             recognition: None,
+            git: None,
         };
         let mut app = App::hydrate(
             SvarmSessionSnapshot {
@@ -1068,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn reattached_exit_and_unseen_states_have_monochrome_symbols() {
+    fn agent_cards_show_titles_accessible_status_and_optional_git_context() {
         let summary = SessionSummary {
             id: SessionId(8),
             running_agents: 1,
@@ -1082,12 +1146,23 @@ mod tests {
             kind: svarm_agent::AgentKind::Codex,
             launch_directory: PathBuf::from("/tmp/project-eight"),
             status,
-            exit: None,
+            exit: (status == SessionStatus::Exited).then_some(svarm_agent::ProcessExit {
+                code: 1,
+                signal: None,
+                success: false,
+            }),
             output_generation,
             seen_generation,
+            completed_generation: if id == 2 { output_generation } else { 0 },
             terminal_sequence: TerminalSequence(0),
             read_error: None,
+            conversation_title: Some(format!("Conversation {id}")),
+            activity: AgentActivity::Idle,
             recognition: None,
+            git: (id == 2).then_some(GitContext {
+                branch: "feature/sidebar".into(),
+                worktree: "/tmp/project-eight".into(),
+            }),
         };
         let exited = agent(1, SessionStatus::Exited, 1, 1);
         let unseen = agent(2, SessionStatus::Running, 2, 1);
@@ -1103,9 +1178,56 @@ mod tests {
             None,
         );
         let rendered = render_app_text(&app);
-        assert!(rendered.contains('×'));
-        assert!(rendered.contains('!'));
-        assert!(rendered.contains("project"));
+        assert!(rendered.contains("Conversation 1"));
+        assert!(rendered.contains("failed"));
+        assert!(rendered.contains("Conversation 2"));
+        assert!(rendered.contains("done"));
+        assert!(rendered.contains("/tmp/project-eight"));
+        assert!(rendered.contains("feature/side… · project-eight"));
+    }
+
+    #[test]
+    fn multiline_agent_list_scrolls_to_keep_the_selected_card_visible_at_80x24() {
+        let agents = (1..=8)
+            .map(|id| AgentSnapshot {
+                id: svarm_agent::AgentId::new(id),
+                kind: svarm_agent::AgentKind::Claude,
+                launch_directory: PathBuf::from(format!("/tmp/project-{id}")),
+                status: SessionStatus::Running,
+                exit: None,
+                output_generation: 1,
+                seen_generation: 1,
+                completed_generation: 0,
+                terminal_sequence: TerminalSequence(0),
+                read_error: None,
+                conversation_title: Some(format!("Conversation {id}")),
+                activity: AgentActivity::Idle,
+                recognition: None,
+                git: None,
+            })
+            .collect::<Vec<_>>();
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: SessionSummary {
+                    id: SessionId(9),
+                    running_agents: agents.len(),
+                    total_agents: agents.len(),
+                    attachment: None,
+                    last_user_activity_ms: 1,
+                    revision: SessionRevision(1),
+                },
+                selected_agent_id: Some(svarm_agent::AgentId::new(8)),
+                rows: 24,
+                cols: 80,
+                agents,
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("Conversation 8"));
+        assert!(rendered.contains("Claude Code · idle"));
     }
 
     #[test]

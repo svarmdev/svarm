@@ -18,20 +18,23 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
     framing::{read_frame, write_frame},
+    git,
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
     protocol::{
-        AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event, LeaseToken,
-        Message, MouseEncoding, MouseProtocol, ProtocolError, ProtocolRange, Request, RequestId,
-        Response, ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId,
-        SessionSummary, StopSummary, SvarmSessionSnapshot, TerminalDiff, TerminalFull,
-        TerminalModes, TerminalSequence, Welcome,
+        AgentActivity, AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event,
+        GitContext, LeaseToken, Message, MouseEncoding, MouseProtocol, ProtocolError,
+        ProtocolRange, RecognitionEvidence, Request, RequestId, Response, ServerCapabilities,
+        ServerInstanceId, ServerStatusSnapshot, SessionId, SessionSummary, StopSummary,
+        SvarmSessionSnapshot, TerminalDiff, TerminalFull, TerminalModes, TerminalSequence, Welcome,
     },
     pty_size,
+    recognition::{self, ScreenRecognition},
     server_session::{ServerSessionState, sort_session_summaries},
 };
 
 const EVENT_TICK: Duration = Duration::from_millis(16);
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EMPTY_SERVER_GRACE: Duration = Duration::from_secs(2);
 const CONNECTION_QUEUE: usize = 64;
 const INPUT_QUEUE: usize = 1_024;
@@ -291,8 +294,20 @@ impl OutputWake {
 struct SessionRuntime {
     state: ServerSessionState,
     agents: AgentManager,
-    previous: HashMap<AgentId, SessionSnapshot>,
+    previous: HashMap<AgentId, ObservedAgent>,
+    git_checked: HashMap<AgentId, Instant>,
     frame_bases: HashMap<AgentId, FrameBasis>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedAgent {
+    session: SessionSnapshot,
+    conversation_title: Option<String>,
+    activity: AgentActivity,
+    last_affirmative_activity: Option<AgentActivity>,
+    completed_generation: u64,
+    recognition: Option<RecognitionEvidence>,
+    git: Option<GitContext>,
 }
 
 struct FrameBasis {
@@ -317,6 +332,7 @@ impl SessionRuntime {
             state,
             agents,
             previous: HashMap::new(),
+            git_checked: HashMap::new(),
             frame_bases: HashMap::new(),
         }
     }
@@ -340,13 +356,15 @@ impl SessionRuntime {
 
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
-        self.previous.insert(snapshot.id, snapshot.clone());
+        let observed = self.observe(snapshot.clone(), Instant::now(), true);
+        self.previous.insert(snapshot.id, observed);
         Ok(snapshot)
     }
 
     fn close(&mut self, id: AgentId, now_ms: u64) -> AgentResult<()> {
         self.agents.close(id)?;
         self.previous.remove(&id);
+        self.git_checked.remove(&id);
         self.frame_bases.remove(&id);
         self.state.remove_agent(id, self.agents.agent_ids(), now_ms);
         Ok(())
@@ -390,6 +408,7 @@ impl SessionRuntime {
     }
 
     fn agent_snapshot(&self, snapshot: SessionSnapshot) -> AgentSnapshot {
+        let observed = self.previous.get(&snapshot.id);
         AgentSnapshot {
             id: snapshot.id,
             kind: snapshot.kind,
@@ -398,12 +417,89 @@ impl SessionRuntime {
             exit: snapshot.exit,
             output_generation: snapshot.output_generation,
             seen_generation: self.state.seen_generation(snapshot.id).unwrap_or(0),
+            completed_generation: observed.map_or(0, |agent| agent.completed_generation),
             terminal_sequence: self
                 .state
                 .terminal_sequence(snapshot.id)
                 .unwrap_or(crate::protocol::TerminalSequence(0)),
             read_error: snapshot.read_error,
-            recognition: None,
+            conversation_title: observed.and_then(|agent| agent.conversation_title.clone()),
+            activity: observed.map_or(AgentActivity::Unknown, |agent| agent.activity),
+            recognition: observed.and_then(|agent| agent.recognition.clone()),
+            git: observed.and_then(|agent| agent.git.clone()),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        session: SessionSnapshot,
+        now: Instant,
+        force_git: bool,
+    ) -> ObservedAgent {
+        let previous = self.previous.get(&session.id).cloned();
+        let screen = self.agents.with_screen(session.id, |screen| {
+            (
+                screen.title().trim().to_owned(),
+                recognition::recognize(session.kind, screen),
+            )
+        });
+        let (title, screen_recognition) =
+            screen.unwrap_or((String::new(), ScreenRecognition::Unknown));
+        let conversation_title = if title.is_empty() {
+            previous
+                .as_ref()
+                .and_then(|agent| agent.conversation_title.clone())
+        } else {
+            Some(title)
+        };
+        let recognition = match screen_recognition {
+            ScreenRecognition::Recognized(evidence) => Some(evidence),
+            ScreenRecognition::Preserve => previous
+                .as_ref()
+                .and_then(|agent| agent.recognition.clone()),
+            ScreenRecognition::Unknown => None,
+        };
+        let activity = recognition
+            .as_ref()
+            .map_or(AgentActivity::Unknown, |evidence| evidence.claim);
+        let previous_affirmative = previous
+            .as_ref()
+            .and_then(|agent| agent.last_affirmative_activity);
+        let completed_generation = if activity == AgentActivity::Idle
+            && previous_affirmative == Some(AgentActivity::Working)
+        {
+            session.output_generation
+        } else {
+            previous
+                .as_ref()
+                .map_or(0, |agent| agent.completed_generation)
+        };
+        let last_affirmative_activity = if activity == AgentActivity::Unknown {
+            previous_affirmative
+        } else {
+            Some(activity)
+        };
+
+        let refresh_git = force_git
+            || self
+                .git_checked
+                .get(&session.id)
+                .is_none_or(|checked| now.duration_since(*checked) >= GIT_REFRESH_INTERVAL);
+        let git = if refresh_git {
+            self.git_checked.insert(session.id, now);
+            git::context(&session.launch_directory)
+        } else {
+            previous.as_ref().and_then(|agent| agent.git.clone())
+        };
+
+        ObservedAgent {
+            session,
+            conversation_title,
+            activity,
+            last_affirmative_activity,
+            completed_generation,
+            recognition,
+            git,
         }
     }
 
@@ -523,21 +619,24 @@ impl SessionRuntime {
     fn poll_events(&mut self) -> Vec<Event> {
         let dirty = self.agents.drain_dirty();
         let attached = self.state.attachment().is_some();
+        let now = Instant::now();
         let mut changed = Vec::new();
         let mut terminal_ids = Vec::new();
         for result in self.agents.poll() {
             let Ok(snapshot) = result else {
                 continue;
             };
-            let previous = self.previous.insert(snapshot.id, snapshot.clone());
-            if previous.as_ref() != Some(&snapshot) {
+            let previous = self.previous.get(&snapshot.id).cloned();
+            let observed = self.observe(snapshot.clone(), now, false);
+            if previous.as_ref() != Some(&observed) {
                 changed.push(snapshot.clone());
             }
+            self.previous.insert(snapshot.id, observed);
             if attached
                 && (dirty.contains(&snapshot.id)
-                    || previous
-                        .as_ref()
-                        .is_some_and(|old| old.output_generation != snapshot.output_generation))
+                    || previous.as_ref().is_some_and(|old| {
+                        old.session.output_generation != snapshot.output_generation
+                    }))
             {
                 terminal_ids.push(snapshot.id);
             }
@@ -1558,7 +1657,7 @@ fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write, time::SystemTime};
+    use std::{fs, io::Write, process::Command, time::SystemTime};
 
     use super::*;
     use crate::{
@@ -1686,12 +1785,130 @@ mod tests {
         path
     }
 
+    fn run_git(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
     #[test]
     fn relative_agent_directories_are_canonicalized_at_the_server_edge() {
         assert_eq!(
             canonicalize_agent_directory(Path::new(".")).unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn runtime_snapshots_carry_terminal_title_recognition_and_git_context() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected_git = git::context(&cwd).unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test").with_test_agent_command(
+            "sh",
+            &[
+                "-c",
+                r"printf '\033]2;Refactor sidebar\a\033[20;1HWorking  esc to interrupt'; sleep 0.2; printf '\033[20;1H\033[2KReady\033[21;1H\033[2K? for shortcuts'; sleep 2",
+            ],
+        );
+        runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            runtime.poll_events();
+            let snapshot = runtime.snapshot();
+            let agent = &snapshot.agents[0];
+            if agent.activity == AgentActivity::Working {
+                assert_eq!(
+                    agent.conversation_title.as_deref(),
+                    Some("Refactor sidebar")
+                );
+                assert_eq!(
+                    agent
+                        .recognition
+                        .as_ref()
+                        .map(|evidence| evidence.rule.as_str()),
+                    Some("codex.active-turn")
+                );
+                let git = agent.git.as_ref().unwrap();
+                assert!(!git.branch.is_empty());
+                assert_eq!(git.worktree, expected_git.worktree);
+                break;
+            }
+            assert!(Instant::now() < deadline, "agent metadata was not observed");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            runtime.poll_events();
+            let snapshot = runtime.snapshot();
+            let agent = &snapshot.agents[0];
+            if agent.activity == AgentActivity::Idle {
+                assert!(agent.completed_generation > 0);
+                assert_eq!(agent.completed_generation, agent.output_generation);
+                break;
+            }
+            assert!(Instant::now() < deadline, "completion was not observed");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn runtime_emits_agent_change_when_the_git_branch_changes() {
+        let directory = temp_dir();
+        run_git(&directory, &["init", "-q", "-b", "main"]);
+        run_git(
+            &directory,
+            &[
+                "-c",
+                "user.name=Svarm Test",
+                "-c",
+                "user.email=svarm@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "exec sleep 60"]);
+        let spawned = runtime
+            .spawn(AgentKind::Codex, &directory, 0, &config)
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot().agents[0].git.as_ref().unwrap().branch,
+            "main"
+        );
+
+        run_git(&directory, &["switch", "-q", "-c", "feature/sidebar"]);
+        runtime.git_checked.insert(
+            spawned.id,
+            Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_millis(1),
+        );
+
+        let events = runtime.poll_events();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AgentChanged { agent, .. }
+                    if agent.git.as_ref().is_some_and(|git| git.branch == "feature/sidebar")
+            )
+        }));
+
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

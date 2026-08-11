@@ -3,8 +3,11 @@ use std::path::PathBuf;
 #[cfg(test)]
 use svarm_agent::SessionSnapshot;
 use svarm_agent::{
-    AgentId, AgentKind, SessionStatus,
-    protocol::{AgentSnapshot, SessionId, SessionSummary, SvarmSessionSnapshot},
+    AgentId, AgentKind, ProcessExit, SessionStatus,
+    protocol::{
+        AgentActivity, AgentSnapshot, GitContext, RecognitionEvidence, SessionId, SessionSummary,
+        SvarmSessionSnapshot,
+    },
     server_session::sort_session_summaries,
 };
 
@@ -239,8 +242,24 @@ pub(crate) struct AgentState {
     kind: AgentKind,
     launch_directory: PathBuf,
     status: SessionStatus,
+    exit: Option<ProcessExit>,
     output_generation: u64,
     seen_generation: u64,
+    completed_generation: u64,
+    conversation_title: Option<String>,
+    activity: AgentActivity,
+    recognition: Option<RecognitionEvidence>,
+    git: Option<GitContext>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentDisplayStatus {
+    Unknown,
+    Idle,
+    Working,
+    Done,
+    NeedsYou,
+    Failed,
 }
 
 impl AgentState {
@@ -251,8 +270,14 @@ impl AgentState {
             kind: snapshot.kind,
             launch_directory: snapshot.launch_directory.clone(),
             status: snapshot.status,
+            exit: snapshot.exit.clone(),
             output_generation: snapshot.output_generation,
             seen_generation: snapshot.output_generation,
+            completed_generation: 0,
+            conversation_title: None,
+            activity: AgentActivity::Unknown,
+            recognition: None,
+            git: None,
         }
     }
 
@@ -262,30 +287,50 @@ impl AgentState {
             kind: snapshot.kind,
             launch_directory: snapshot.launch_directory.clone(),
             status: snapshot.status,
+            exit: snapshot.exit.clone(),
             output_generation: snapshot.output_generation,
             seen_generation: snapshot.seen_generation,
+            completed_generation: snapshot.completed_generation,
+            conversation_title: snapshot.conversation_title.clone(),
+            activity: snapshot.activity,
+            recognition: snapshot.recognition.clone(),
+            git: snapshot.git.clone(),
         }
     }
 
     #[cfg(test)]
     fn update(&mut self, snapshot: &SessionSnapshot) -> bool {
         let changed = self.status != snapshot.status
+            || self.exit != snapshot.exit
             || self.output_generation != snapshot.output_generation
             || self.launch_directory != snapshot.launch_directory;
         self.launch_directory = snapshot.launch_directory.clone();
         self.status = snapshot.status;
+        self.exit = snapshot.exit.clone();
         self.output_generation = snapshot.output_generation;
         changed
     }
 
     fn update_remote(&mut self, snapshot: &AgentSnapshot) -> bool {
         let changed = self.status != snapshot.status
+            || self.exit != snapshot.exit
             || self.output_generation != snapshot.output_generation
-            || self.launch_directory != snapshot.launch_directory;
+            || self.completed_generation != snapshot.completed_generation
+            || self.launch_directory != snapshot.launch_directory
+            || self.conversation_title != snapshot.conversation_title
+            || self.activity != snapshot.activity
+            || self.recognition != snapshot.recognition
+            || self.git != snapshot.git;
         self.launch_directory = snapshot.launch_directory.clone();
         self.status = snapshot.status;
+        self.exit = snapshot.exit.clone();
         self.output_generation = snapshot.output_generation;
         self.seen_generation = self.seen_generation.max(snapshot.seen_generation);
+        self.completed_generation = snapshot.completed_generation;
+        self.conversation_title = snapshot.conversation_title.clone();
+        self.activity = snapshot.activity;
+        self.recognition = snapshot.recognition.clone();
+        self.git = snapshot.git.clone();
         changed
     }
 
@@ -305,18 +350,42 @@ impl AgentState {
         self.kind
     }
 
-    pub fn workspace_name(&self) -> String {
-        self.launch_directory
-            .file_name()
-            .unwrap_or(self.launch_directory.as_os_str())
-            .to_string_lossy()
-            .into_owned()
-    }
-
     pub const fn status(&self) -> SessionStatus {
         self.status
     }
 
+    pub fn launch_directory(&self) -> &std::path::Path {
+        &self.launch_directory
+    }
+
+    pub fn conversation_title(&self) -> Option<&str> {
+        self.conversation_title.as_deref()
+    }
+
+    pub const fn git(&self) -> Option<&GitContext> {
+        self.git.as_ref()
+    }
+
+    pub fn display_status(&self) -> AgentDisplayStatus {
+        if self.status == SessionStatus::Exited {
+            return if self.exit.as_ref().is_some_and(|exit| exit.success) {
+                AgentDisplayStatus::Done
+            } else {
+                AgentDisplayStatus::Failed
+            };
+        }
+        match self.activity {
+            AgentActivity::Unknown => AgentDisplayStatus::Unknown,
+            AgentActivity::Idle if self.completed_generation > self.seen_generation => {
+                AgentDisplayStatus::Done
+            }
+            AgentActivity::Idle => AgentDisplayStatus::Idle,
+            AgentActivity::Working => AgentDisplayStatus::Working,
+            AgentActivity::Blocked => AgentDisplayStatus::NeedsYou,
+        }
+    }
+
+    #[cfg(test)]
     pub const fn has_unseen_output(&self) -> bool {
         self.output_generation > self.seen_generation
     }
@@ -868,6 +937,26 @@ mod tests {
     }
 
     #[test]
+    fn done_is_an_unviewed_idle_completion_and_blocked_remains_explicit() {
+        let mut snapshot = remote_agent(1, 2, 1);
+        snapshot.activity = AgentActivity::Idle;
+        snapshot.completed_generation = 2;
+        let mut app = app();
+        app.add_remote_agent(snapshot.clone());
+
+        assert_eq!(app.agents()[0].display_status(), AgentDisplayStatus::Done);
+        assert_eq!(app.mark_selected_seen(), Some((AgentId::new(1), 2)));
+        assert_eq!(app.agents()[0].display_status(), AgentDisplayStatus::Idle);
+
+        snapshot.activity = AgentActivity::Blocked;
+        assert!(app.update_remote_agent(snapshot));
+        assert_eq!(
+            app.agents()[0].display_status(),
+            AgentDisplayStatus::NeedsYou
+        );
+    }
+
+    #[test]
     fn removing_the_last_agent_keeps_selection_valid() {
         let mut app = app();
         app.add_agent(snapshot(1, 0));
@@ -1161,9 +1250,13 @@ mod tests {
             exit: None,
             output_generation,
             seen_generation,
+            completed_generation: 0,
             terminal_sequence: TerminalSequence(0),
             read_error: None,
+            conversation_title: None,
+            activity: AgentActivity::Unknown,
             recognition: None,
+            git: None,
         }
     }
 }

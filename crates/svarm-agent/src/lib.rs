@@ -9,6 +9,7 @@ mod base64;
 pub use vt100;
 
 pub mod framing;
+mod git;
 pub mod input;
 #[cfg(unix)]
 pub mod ipc;
@@ -18,6 +19,7 @@ mod manager;
 #[cfg(unix)]
 pub mod paths;
 pub mod protocol;
+mod recognition;
 #[cfg(unix)]
 pub mod server;
 pub mod server_session;

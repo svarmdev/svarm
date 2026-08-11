@@ -82,6 +82,7 @@ impl ThemeName {
                 accent: Color::Cyan,
                 ok: Color::Green,
                 warn: Color::Yellow,
+                error: Color::Red,
             },
             Self::Light => Theme {
                 bg: Color::Reset,
@@ -95,6 +96,7 @@ impl ThemeName {
                 accent: Color::Blue,
                 ok: Color::Green,
                 warn: Color::Magenta,
+                error: Color::Red,
             },
             Self::HighContrast => Theme {
                 bg: Color::Black,
@@ -108,6 +110,7 @@ impl ThemeName {
                 accent: Color::LightCyan,
                 ok: Color::LightGreen,
                 warn: Color::LightYellow,
+                error: Color::LightRed,
             },
             Self::Monochrome => Theme {
                 bg: Color::Reset,
@@ -121,6 +124,7 @@ impl ThemeName {
                 accent: Color::Reset,
                 ok: Color::Reset,
                 warn: Color::Reset,
+                error: Color::Reset,
             },
             Self::SolarizedDark => Theme {
                 bg: rgb(0x002b36),
@@ -134,6 +138,7 @@ impl ThemeName {
                 accent: rgb(0x268bd2),
                 ok: rgb(0x859900),
                 warn: rgb(0xb58900),
+                error: rgb(0xdc322f),
             },
             Self::SolarizedLight => Theme {
                 bg: rgb(0xfdf6e3),
@@ -147,6 +152,7 @@ impl ThemeName {
                 accent: rgb(0x268bd2),
                 ok: rgb(0x859900),
                 warn: rgb(0xcb4b16),
+                error: rgb(0xdc322f),
             },
             Self::CatppuccinMocha => Theme {
                 bg: rgb(0x1e1e2e),
@@ -160,6 +166,7 @@ impl ThemeName {
                 accent: rgb(0x89b4fa),
                 ok: rgb(0xa6e3a1),
                 warn: rgb(0xf9e2af),
+                error: rgb(0xf38ba8),
             },
             Self::CatppuccinLatte => Theme {
                 bg: rgb(0xeff1f5),
@@ -173,6 +180,7 @@ impl ThemeName {
                 accent: rgb(0x1e66f5),
                 ok: rgb(0x40a02b),
                 warn: rgb(0xdf8e1d),
+                error: rgb(0xd20f39),
             },
             Self::TokyoNight => Theme {
                 bg: rgb(0x1a1b26),
@@ -186,6 +194,7 @@ impl ThemeName {
                 accent: rgb(0x7aa2f7),
                 ok: rgb(0x9ece6a),
                 warn: rgb(0xe0af68),
+                error: rgb(0xf7768e),
             },
             Self::GruvboxDark => Theme {
                 bg: rgb(0x282828),
@@ -199,6 +208,7 @@ impl ThemeName {
                 accent: rgb(0x83a598),
                 ok: rgb(0xb8bb26),
                 warn: rgb(0xfabd2f),
+                error: rgb(0xfb4934),
             },
             Self::Nord => Theme {
                 bg: rgb(0x2e3440),
@@ -212,6 +222,7 @@ impl ThemeName {
                 accent: rgb(0x88c0d0),
                 ok: rgb(0xa3be8c),
                 warn: rgb(0xebcb8b),
+                error: rgb(0xbf616a),
             },
         }
     }
@@ -238,6 +249,7 @@ pub struct Theme {
     pub accent: Color,
     pub ok: Color,
     pub warn: Color,
+    pub error: Color,
 }
 
 impl Theme {

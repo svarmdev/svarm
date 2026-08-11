@@ -41,7 +41,7 @@ pub struct InitialAgentRequest {
 }
 
 pub(crate) enum RemoteUpdate {
-    Event(Event),
+    Event(Box<Event>),
     TerminalChanged,
     Error(String),
     Disconnected(String),
@@ -241,7 +241,7 @@ impl RemoteAgents {
                         self.terminals.remove(agent_id);
                         self.pending_resync.remove(agent_id);
                     }
-                    updates.push(RemoteUpdate::Event(event));
+                    updates.push(RemoteUpdate::Event(Box::new(event)));
                 }
                 Message::Error(error) => {
                     updates.push(RemoteUpdate::Error(error.actionable_message()))

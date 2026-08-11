@@ -235,35 +235,35 @@ fn apply_remote_update(
 ) -> bool {
     let mut dirty = false;
     match update {
-        RemoteUpdate::Event(ServerEvent::AgentAdded { agent, .. }) => {
-            app.add_remote_agent(agent);
-            dirty = true;
-        }
-        RemoteUpdate::Event(ServerEvent::AgentChanged { agent, .. }) => {
-            dirty |= app.update_remote_agent(agent);
-        }
-        RemoteUpdate::Event(ServerEvent::AgentRemoved { agent_id, .. }) => {
-            app.remove_agent(agent_id);
-            dirty = true;
-        }
-        RemoteUpdate::Event(ServerEvent::SessionNotice(notice)) => {
-            app.set_notice(notice.message);
-            dirty = true;
-        }
-        RemoteUpdate::Event(ServerEvent::LeaseRevoked { reason }) => {
-            *connection_failure = Some(reason);
-        }
-        RemoteUpdate::Event(ServerEvent::ServerStopping) => {
-            *connection_failure = Some("Svarm server is stopping".into());
-        }
-        RemoteUpdate::Event(
-            ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_),
-        ) => {
-            dirty = true;
-        }
-        RemoteUpdate::Event(ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_)) => {
-            unreachable!("terminal frames are applied by adapter")
-        }
+        RemoteUpdate::Event(event) => match *event {
+            ServerEvent::AgentAdded { agent, .. } => {
+                app.add_remote_agent(agent);
+                dirty = true;
+            }
+            ServerEvent::AgentChanged { agent, .. } => {
+                dirty |= app.update_remote_agent(agent);
+            }
+            ServerEvent::AgentRemoved { agent_id, .. } => {
+                app.remove_agent(agent_id);
+                dirty = true;
+            }
+            ServerEvent::SessionNotice(notice) => {
+                app.set_notice(notice.message);
+                dirty = true;
+            }
+            ServerEvent::LeaseRevoked { reason } => {
+                *connection_failure = Some(reason);
+            }
+            ServerEvent::ServerStopping => {
+                *connection_failure = Some("Svarm server is stopping".into());
+            }
+            ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_) => {
+                dirty = true;
+            }
+            ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_) => {
+                unreachable!("terminal frames are applied by adapter")
+            }
+        },
         RemoteUpdate::TerminalChanged => dirty = true,
         RemoteUpdate::Error(error) => {
             app.set_notice(error);

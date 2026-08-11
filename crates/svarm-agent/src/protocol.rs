@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, AgentKind, CursorStyle, ProcessExit, SessionStatus, TerminalPalette};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -329,8 +329,25 @@ pub struct SessionSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecognitionEvidence {
     pub provider: AgentKind,
-    pub claim: String,
+    pub claim: AgentActivity,
+    pub rule: String,
     pub evidence: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    #[default]
+    Unknown,
+    Idle,
+    Working,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitContext {
+    pub branch: String,
+    pub worktree: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -342,9 +359,13 @@ pub struct AgentSnapshot {
     pub exit: Option<ProcessExit>,
     pub output_generation: u64,
     pub seen_generation: u64,
+    pub completed_generation: u64,
     pub terminal_sequence: TerminalSequence,
     pub read_error: Option<String>,
+    pub conversation_title: Option<String>,
+    pub activity: AgentActivity,
     pub recognition: Option<RecognitionEvidence>,
+    pub git: Option<GitContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -586,7 +607,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_three_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_four_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -605,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_three_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_four_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,

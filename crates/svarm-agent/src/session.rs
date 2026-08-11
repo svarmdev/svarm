@@ -115,8 +115,11 @@ pub(crate) fn agent_command(kind: AgentKind, cwd: &Path) -> CommandBuilder {
     command.env("COLORTERM", "truecolor");
     command.env_remove("NO_COLOR");
     command.env("SVARM", "1");
-    if kind == AgentKind::Claude {
-        command.env_remove("CLAUDECODE");
+    match kind {
+        AgentKind::Codex => {
+            command.args(["-c", r#"tui.terminal_title=["thread_name"]"#]);
+        }
+        AgentKind::Claude => command.env_remove("CLAUDECODE"),
     }
     command
 }
@@ -135,5 +138,20 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(command.get_env("NO_COLOR"), None);
+    }
+
+    #[test]
+    fn codex_reports_only_its_thread_name_in_the_terminal_title() {
+        let cwd = std::env::current_dir().unwrap();
+        let command = agent_command(AgentKind::Codex, &cwd);
+
+        assert_eq!(
+            command.get_argv(),
+            &vec![
+                std::ffi::OsString::from("codex"),
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(r#"tui.terminal_title=["thread_name"]"#),
+            ]
+        );
     }
 }
