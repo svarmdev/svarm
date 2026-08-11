@@ -73,10 +73,52 @@ impl CursorStyle {
     }
 }
 
-/// Recognizes `CSI Ps SP q` in an agent's output. Reads arrive in arbitrary chunks, so this keeps
-/// only the position within a candidate sequence rather than buffering bytes.
+/// A question an agent asked the terminal that only Svarm can answer, because Svarm *is* the
+/// terminal the agent is talking to. Left unanswered, the agent waits out its own timeout — on
+/// every query — which is why these are worth recognizing rather than ignoring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceQuery {
+    /// `CSI 5 n` — is the terminal healthy?
+    Status,
+    /// `CSI 6 n` — where is the cursor?
+    CursorPosition,
+    /// `CSI ? 6 n` — where is the cursor, with a page number?
+    ExtendedCursorPosition,
+    /// `CSI c` — what kind of terminal is this?
+    PrimaryAttributes,
+}
+
+impl DeviceQuery {
+    /// The answer, given where the emulated cursor currently sits (zero-based, as the screen
+    /// reports it; the wire form is one-based).
+    pub(crate) fn response(self, cursor: (u16, u16)) -> String {
+        let (row, column) = (cursor.0 + 1, cursor.1 + 1);
+        match self {
+            Self::Status => "\x1b[0n".into(),
+            Self::CursorPosition => format!("\x1b[{row};{column}R"),
+            Self::ExtendedCursorPosition => format!("\x1b[?{row};{column};1R"),
+            // A VT100 with an advanced video option: the capability set the emulator actually
+            // provides. Claiming more would invite sequences Svarm would then drop.
+            Self::PrimaryAttributes => "\x1b[?1;2c".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Recognized {
+    CursorStyle(CursorStyle),
+    Query(DeviceQuery),
+}
+
+/// Recognizes the `CSI` sequences Svarm has to act on itself, because the emulator models neither
+/// the cursor's shape nor the queries an agent addresses to its terminal.
+///
+/// Reads arrive in arbitrary chunks, so this tracks position within a candidate sequence rather
+/// than buffering bytes, and reports each match with the offset just past it. Callers that answer
+/// a query need that offset: the reply must describe the screen as of the query, not as of
+/// whatever the agent wrote later in the same read.
 #[derive(Default)]
-pub(crate) struct CursorStyleDetector {
+pub(crate) struct ControlDetector {
     scan: Scan,
 }
 
@@ -85,30 +127,82 @@ enum Scan {
     #[default]
     Idle,
     Escape,
-    Parameter(u16),
-    Intermediate(u16),
+    /// Inside `CSI`, accumulating the parameter and remembering a leading `?`.
+    Csi {
+        private: bool,
+        parameter: u16,
+    },
+    /// A space intermediate has been seen, so `q` would end a cursor-style request.
+    Space(u16),
 }
 
-impl CursorStyleDetector {
-    /// Returns the last style requested in `bytes`, if any.
-    pub(crate) fn process(&mut self, bytes: &[u8]) -> Option<CursorStyle> {
-        let mut style = None;
-        for byte in bytes {
+impl ControlDetector {
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> Vec<(usize, Recognized)> {
+        let mut recognized = Vec::new();
+        for (offset, byte) in bytes.iter().enumerate() {
             self.scan = match (self.scan, byte) {
                 (_, 0x1b) => Scan::Escape,
-                (Scan::Escape, b'[') => Scan::Parameter(0),
-                (Scan::Parameter(value), b'0'..=b'9') => {
-                    Scan::Parameter(value.saturating_mul(10) + u16::from(byte - b'0'))
+                (Scan::Escape, b'[') => Scan::Csi {
+                    private: false,
+                    parameter: 0,
+                },
+                (
+                    Scan::Csi {
+                        private: false,
+                        parameter: 0,
+                    },
+                    b'?',
+                ) => Scan::Csi {
+                    private: true,
+                    parameter: 0,
+                },
+                (Scan::Csi { private, parameter }, b'0'..=b'9') => Scan::Csi {
+                    private,
+                    parameter: parameter.saturating_mul(10) + u16::from(byte - b'0'),
+                },
+                (
+                    Scan::Csi {
+                        private: false,
+                        parameter,
+                    },
+                    b' ',
+                ) => Scan::Space(parameter),
+                (Scan::Space(parameter), b'q') => {
+                    recognized.push((
+                        offset + 1,
+                        Recognized::CursorStyle(CursorStyle::from_parameter(parameter)),
+                    ));
+                    Scan::Idle
                 }
-                (Scan::Parameter(value), b' ') => Scan::Intermediate(value),
-                (Scan::Intermediate(value), b'q') => {
-                    style = Some(CursorStyle::from_parameter(value));
+                (Scan::Csi { private, parameter }, b'n') => {
+                    let query = match (private, parameter) {
+                        (false, 5) => Some(DeviceQuery::Status),
+                        (false, 6) => Some(DeviceQuery::CursorPosition),
+                        (true, 6) => Some(DeviceQuery::ExtendedCursorPosition),
+                        _ => None,
+                    };
+                    if let Some(query) = query {
+                        recognized.push((offset + 1, Recognized::Query(query)));
+                    }
+                    Scan::Idle
+                }
+                (
+                    Scan::Csi {
+                        private: false,
+                        parameter: 0,
+                    },
+                    b'c',
+                ) => {
+                    recognized.push((
+                        offset + 1,
+                        Recognized::Query(DeviceQuery::PrimaryAttributes),
+                    ));
                     Scan::Idle
                 }
                 _ => Scan::Idle,
             };
         }
-        style
+        recognized
     }
 }
 
@@ -205,39 +299,114 @@ mod tests {
         );
     }
 
+    fn styles(detector: &mut ControlDetector, bytes: &[u8]) -> Vec<CursorStyle> {
+        detector
+            .process(bytes)
+            .into_iter()
+            .filter_map(|(_, recognized)| match recognized {
+                Recognized::CursorStyle(style) => Some(style),
+                Recognized::Query(_) => None,
+            })
+            .collect()
+    }
+
+    fn queries(detector: &mut ControlDetector, bytes: &[u8]) -> Vec<DeviceQuery> {
+        detector
+            .process(bytes)
+            .into_iter()
+            .filter_map(|(_, recognized)| match recognized {
+                Recognized::Query(query) => Some(query),
+                Recognized::CursorStyle(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn cursor_styles_are_recognized_across_reads_and_default_when_unset() {
-        let mut detector = CursorStyleDetector::default();
+        let mut detector = ControlDetector::default();
 
-        assert_eq!(detector.process(b"text without a request"), None);
+        assert!(styles(&mut detector, b"text without a request").is_empty());
         assert_eq!(
-            detector.process(b"\x1b[5 q"),
-            Some(CursorStyle::BlinkingBar)
+            styles(&mut detector, b"\x1b[5 q"),
+            [CursorStyle::BlinkingBar]
         );
-        assert_eq!(detector.process(b"\x1b[2"), None, "sequence is incomplete");
-        assert_eq!(detector.process(b" q"), Some(CursorStyle::SteadyBlock));
+        assert!(
+            styles(&mut detector, b"\x1b[2").is_empty(),
+            "sequence is incomplete"
+        );
+        assert_eq!(styles(&mut detector, b" q"), [CursorStyle::SteadyBlock]);
         assert_eq!(
-            detector.process(b"\x1b[0 q"),
-            Some(CursorStyle::Default),
+            styles(&mut detector, b"\x1b[0 q"),
+            [CursorStyle::Default],
             "zero returns the cursor to the terminal's own preference"
         );
     }
 
     #[test]
-    fn cursor_detection_reports_the_last_request_and_ignores_lookalikes() {
-        let mut detector = CursorStyleDetector::default();
+    fn cursor_detection_reports_every_request_and_ignores_lookalikes() {
+        let mut detector = ControlDetector::default();
 
         assert_eq!(
-            detector.process(b"\x1b[1 q\x1b[38;5;9mred\x1b[4 q"),
-            Some(CursorStyle::SteadyUnderline),
-            "later requests supersede earlier ones within a single read"
+            styles(&mut detector, b"\x1b[1 q\x1b[38;5;9mred\x1b[4 q"),
+            [CursorStyle::BlinkingBlock, CursorStyle::SteadyUnderline]
         );
         assert_eq!(
-            detector.process(b"\x1b[?25h\x1b[6n\x1b[q\x1b[ q"),
-            Some(CursorStyle::Default),
+            styles(&mut detector, b"\x1b[?25h\x1b[q\x1b[ q"),
+            [CursorStyle::Default],
             "an empty parameter is DECSCUSR 0, while other sequences are not cursor requests"
         );
-        assert_eq!(detector.process(b"\x1b[2J\x1b[Hq"), None);
+        assert!(styles(&mut detector, b"\x1b[2J\x1b[Hq").is_empty());
+    }
+
+    #[test]
+    fn device_queries_are_recognized_and_answered_from_the_emulated_screen() {
+        let mut detector = ControlDetector::default();
+
+        assert_eq!(
+            queries(&mut detector, b"\x1b[6n"),
+            [DeviceQuery::CursorPosition]
+        );
+        assert_eq!(
+            queries(&mut detector, b"\x1b[?6n"),
+            [DeviceQuery::ExtendedCursorPosition]
+        );
+        assert_eq!(queries(&mut detector, b"\x1b[5n"), [DeviceQuery::Status]);
+        assert_eq!(
+            queries(&mut detector, b"\x1b[c\x1b[0c"),
+            [
+                DeviceQuery::PrimaryAttributes,
+                DeviceQuery::PrimaryAttributes
+            ]
+        );
+        assert!(
+            queries(&mut detector, b"\x1b[>c\x1b[3n\x1b[2J").is_empty(),
+            "only the queries Svarm can answer from its own state are claimed"
+        );
+
+        // Reports are one-based, so a cursor at the origin is row 1, column 1.
+        assert_eq!(DeviceQuery::CursorPosition.response((0, 0)), "\x1b[1;1R");
+        assert_eq!(DeviceQuery::CursorPosition.response((4, 9)), "\x1b[5;10R");
+        assert_eq!(
+            DeviceQuery::ExtendedCursorPosition.response((4, 9)),
+            "\x1b[?5;10;1R"
+        );
+        assert_eq!(DeviceQuery::Status.response((0, 0)), "\x1b[0n");
+        assert_eq!(
+            DeviceQuery::PrimaryAttributes.response((0, 0)),
+            "\x1b[?1;2c"
+        );
+    }
+
+    #[test]
+    fn recognized_offsets_point_just_past_the_sequence() {
+        let mut detector = ControlDetector::default();
+        let output = b"ab\x1b[6ncd";
+
+        assert_eq!(
+            detector.process(output),
+            [(6, Recognized::Query(DeviceQuery::CursorPosition))]
+        );
+        assert_eq!(&output[..6], b"ab\x1b[6n");
     }
 
     #[test]

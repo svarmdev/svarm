@@ -16,7 +16,7 @@ use vt100::Parser;
 use crate::{
     AgentId, AgentKind,
     terminal::{
-        ColorQueryDetector, CursorStyle, CursorStyleDetector, TerminalPalette,
+        ColorQueryDetector, ControlDetector, CursorStyle, Recognized, TerminalPalette,
         color_query_responses,
     },
 };
@@ -328,31 +328,52 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
         let mut color_queries = ColorQueryDetector::default();
-        let mut cursor_styles = CursorStyleDetector::default();
+        let mut controls = ControlDetector::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
+                    let output = &buffer[..count];
+                    let reply = |bytes: &[u8]| {
+                        let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+                        let _ = writer.write_all(bytes);
+                        let _ = writer.flush();
+                    };
                     for response in color_query_responses(
                         &mut color_queries,
                         *terminal_palette
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner()),
-                        &buffer[..count],
+                        output,
                     ) {
-                        let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
-                        let _ = writer.write_all(response.as_bytes());
-                        let _ = writer.flush();
+                        reply(response.as_bytes());
                     }
-                    if let Some(style) = cursor_styles.process(&buffer[..count]) {
-                        *cursor_style
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner()) = style;
+
+                    // Feed the emulator up to each recognized sequence before acting on it, so a
+                    // cursor report describes the screen as of the query rather than as of the
+                    // end of a read that may contain later output.
+                    let mut consumed = 0;
+                    for (offset, recognized) in controls.process(output) {
+                        let mut parser = parser.lock().unwrap_or_else(|poison| poison.into_inner());
+                        parser.process(&output[consumed..offset]);
+                        consumed = offset;
+                        match recognized {
+                            Recognized::CursorStyle(style) => {
+                                *cursor_style
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) = style;
+                            }
+                            Recognized::Query(query) => {
+                                let cursor = parser.screen().cursor_position();
+                                drop(parser);
+                                reply(query.response(cursor).as_bytes());
+                            }
+                        }
                     }
                     parser
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
-                        .process(&buffer[..count]);
+                        .process(&output[consumed..]);
                     generation.fetch_add(1, Ordering::Release);
                     if let Some(callback) = &notify {
                         callback(id);
@@ -384,6 +405,47 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
         assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
         assert_eq!(command.get_env("NO_COLOR"), None);
+    }
+
+    /// An agent that asks where the cursor is must get an answer, or it waits out its own timeout
+    /// on every query. The reply has to reflect the screen as of the query, so this one is sent
+    /// after eight characters of output on the second row.
+    #[test]
+    fn a_real_agent_receives_an_answer_to_its_cursor_position_query() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = CommandBuilder::new("sh");
+        // The reply is written to the agent's terminal input, so with echo left on it comes back
+        // out and lands on the screen — which is exactly the evidence that it was delivered.
+        command.args(["-c", "printf 'first\\r\\nprompt> \\033[6n'; sleep 1"]);
+        command.cwd(&cwd);
+        let session = AgentSession::spawn_command(
+            AgentId::new(1),
+            AgentKind::Codex,
+            &cwd,
+            PtySize {
+                rows: 10,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            command,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The cursor sat on row 2, column 9 when the query was sent, which is reported one-based
+        // as `CSI 2;9R`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.parser().screen().contents().contains("[2;9R") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let contents = session.parser().screen().contents();
+        assert!(
+            contents.contains("[2;9R"),
+            "agent did not receive a cursor report, screen was {contents:?}"
+        );
     }
 
     #[test]
