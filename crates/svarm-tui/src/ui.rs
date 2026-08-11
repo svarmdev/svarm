@@ -29,7 +29,7 @@ const MENU_WIDTH: u16 = 46;
 enum ModalSize {
     Compact,
     Standard,
-    Browser,
+    Large,
 }
 
 impl ModalSize {
@@ -37,7 +37,7 @@ impl ModalSize {
         match self {
             Self::Compact => centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, terminal),
             Self::Standard => centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, terminal),
-            Self::Browser => centered_rect(
+            Self::Large => centered_rect(
                 terminal.width.saturating_sub(4).min(100),
                 terminal.height.saturating_sub(2).min(30),
                 terminal,
@@ -592,7 +592,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let Some(browser) = app.native_browser() else {
         return;
     };
-    let area = ModalSize::Browser.area(frame.area());
+    let area = ModalSize::Large.area(frame.area());
     let visible = usize::from(area.height.saturating_sub(6));
     let content_width = usize::from(area.width.saturating_sub(8));
     let start = browser.selected.saturating_sub(visible - 1);
@@ -644,13 +644,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
         theme.muted(),
     )));
-    render_dialog(
-        frame,
-        theme,
-        " Select workspace ",
-        ModalSize::Browser,
-        lines,
-    );
+    render_dialog(frame, theme, " Select workspace ", ModalSize::Large, lines);
 }
 
 fn render_embedded_browser(
@@ -688,7 +682,7 @@ fn render_embedded_browser(
 }
 
 fn embedded_modal_area(area: Rect) -> Rect {
-    ModalSize::Browser.area(area)
+    ModalSize::Large.area(area)
 }
 
 pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
@@ -889,17 +883,17 @@ mod tests {
     }
 
     #[test]
-    fn agent_flow_is_compact_and_browsers_share_a_larger_shell() {
+    fn modal_tiers_have_canonical_areas() {
         let terminal = Rect::new(0, 0, 120, 40);
         assert_eq!(ModalSize::Compact.area(terminal), Rect::new(28, 14, 64, 12));
         assert_eq!(
             ModalSize::Standard.area(terminal),
             Rect::new(24, 11, 72, 18)
         );
-        assert_eq!(ModalSize::Browser.area(terminal), Rect::new(10, 5, 100, 30));
+        assert_eq!(ModalSize::Large.area(terminal), Rect::new(10, 5, 100, 30));
         assert_eq!(
             embedded_modal_area(terminal),
-            ModalSize::Browser.area(terminal)
+            ModalSize::Large.area(terminal)
         );
     }
 

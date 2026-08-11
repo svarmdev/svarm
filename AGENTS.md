@@ -36,7 +36,7 @@ Do not add another crate merely to enforce a conceptual layer. Prefer a focused 
 
 - **Compact — 64x12.** Short forms and pickers, including the new-agent flow.
 - **Standard — 72x18.** Confirmations, settings, and help.
-- **Browser — responsive, capped at 100x30.** Native filesystem browsing and embedded terminal tools; leave 2 rows and 4 columns around it.
+- **Large — responsive, capped at 100x30.** Content-heavy or embedded interactive views, currently the native filesystem browser and Yazi; leave 2 rows and 4 columns around it.
 
 Always center and clamp modals to the terminal. Every centered modal must pass one of these tiers to `render_dialog`; never pass raw dimensions or a precomputed `Rect`. The sidebar-anchored menu popover and full-screen startup chooser are not modals. Add another tier only when content demonstrably cannot fit an existing one at 80x24.
 
