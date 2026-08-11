@@ -69,9 +69,9 @@ fn main() -> Result<()> {
 fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {
     server_start::ensure_server(paths)?;
     let sessions = running_sessions(paths)?;
-    let requested_path = canonicalize(cli.path.as_deref().unwrap_or_else(|| Path::new(".")))?;
+    let requested_path = requested_path(&cli)?;
     let target = if cli.new_session {
-        InitialSession::Create(requested_path)
+        InitialSession::Create(requested_path.expect("new sessions require a workspace path"))
     } else if cli.attach {
         if let Some(id) = cli.workspace {
             InitialSession::Attach {
@@ -79,22 +79,23 @@ fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {
                 takeover: cli.takeover,
             }
         } else {
-            let eligible = if cli.path.is_some() {
-                sessions_for_path(sessions, &requested_path)
+            let eligible = if let Some(requested_path) = requested_path.as_deref() {
+                sessions_for_path(sessions, requested_path)
             } else {
                 sessions
             };
             let Some(target) =
-                select_launch_target(eligible, false, &requested_path, cli.takeover)?
+                select_launch_target(eligible, false, requested_path.as_deref(), cli.takeover)?
             else {
                 return Ok(());
             };
             target
         }
     } else if sessions.is_empty() {
-        InitialSession::Create(requested_path)
+        InitialSession::Create(requested_path.expect("normal startup requires a workspace path"))
     } else {
-        let Some(target) = select_launch_target(sessions, true, &requested_path, false)? else {
+        let Some(target) = select_launch_target(sessions, true, requested_path.as_deref(), false)?
+        else {
             return Ok(());
         };
         target
@@ -105,12 +106,16 @@ fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {
 fn select_launch_target(
     sessions: Vec<SessionSummary>,
     allow_new: bool,
-    requested_path: &Path,
+    requested_path: Option<&Path>,
     takeover: bool,
 ) -> Result<Option<InitialSession>> {
     match discovery_route(&sessions, allow_new) {
         DiscoveryRoute::Create => {
-            return Ok(Some(InitialSession::Create(requested_path.to_owned())));
+            return Ok(Some(InitialSession::Create(
+                requested_path
+                    .expect("create route requires a workspace path")
+                    .to_owned(),
+            )));
         }
         DiscoveryRoute::Attach(session_id) => {
             return Ok(Some(InitialSession::Attach {
@@ -130,9 +135,20 @@ fn select_launch_target(
             session_id,
             takeover,
         })),
-        StartupChoice::NewSession => Ok(Some(InitialSession::Create(requested_path.to_owned()))),
+        StartupChoice::NewSession => Ok(Some(InitialSession::Create(
+            requested_path
+                .expect("new-session choice requires a workspace path")
+                .to_owned(),
+        ))),
         StartupChoice::Cancel => Ok(None),
     }
+}
+
+fn requested_path(cli: &Cli) -> Result<Option<PathBuf>> {
+    if cli.attach && (cli.workspace.is_some() || cli.path.is_none()) {
+        return Ok(None);
+    }
+    canonicalize(cli.path.as_deref().unwrap_or_else(|| Path::new("."))).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +432,20 @@ mod tests {
     fn noninteractive_choice_error_names_both_deterministic_remedies() {
         assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--attach --workspace ID"));
         assert!(NONINTERACTIVE_CHOICE_ERROR.contains("--new-session"));
+    }
+
+    #[test]
+    fn direct_id_attach_does_not_resolve_an_irrelevant_path() {
+        let cli = Cli::try_parse_from([
+            "svarm",
+            "--attach",
+            "--workspace",
+            "7",
+            "/path/that/does/not/exist",
+        ])
+        .unwrap();
+
+        assert_eq!(requested_path(&cli).unwrap(), None);
     }
 
     fn summary(id: u64) -> SessionSummary {
