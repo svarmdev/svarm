@@ -16,11 +16,12 @@ use crate::{
     AgentKind, Mode,
     app::{App, pty_size},
     input::{encode_key, encode_mouse, encode_paste},
-    session::Result,
+    session::{Result, TerminalPalette},
     ui,
 };
 
 type SvarmTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
     let cwd = cwd.canonicalize().map_err(|error| {
@@ -29,10 +30,16 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
             cwd.to_string_lossy()
         )
     })?;
+    let palette = TerminalPalette::detect();
     let mut terminal = TerminalSession::open()?;
     let area = terminal.terminal.size()?;
     let child_area = ui::terminal_area(area.into(), true);
-    let mut app = App::new(kind, cwd, pty_size(child_area.height, child_area.width))?;
+    let mut app = App::new(
+        kind,
+        cwd,
+        pty_size(child_area.height, child_area.width),
+        palette,
+    )?;
     let mut last_stamp = Vec::new();
     let mut dirty = true;
 
@@ -46,13 +53,13 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
             dirty = false;
         }
 
-        if !event::poll(Duration::from_millis(33))? {
+        if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
         match event::read()? {
             Event::Key(key) => {
-                dirty = true;
-                let resize = handle_key(&mut app, key)?;
+                let (resize, redraw) = handle_key(&mut app, key)?;
+                dirty |= redraw;
                 if resize {
                     resize_agents(&mut app, terminal.terminal.size()?.into())?;
                 }
@@ -76,22 +83,25 @@ pub fn run(kind: AgentKind, cwd: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+fn handle_key(app: &mut App, key: KeyEvent) -> Result<(bool, bool)> {
     if key.kind == KeyEventKind::Release {
-        return Ok(false);
+        return Ok((false, false));
     }
 
+    let mut redraw = true;
     match app.mode {
         Mode::Terminal if is_prefix(key) => app.mode = Mode::Prefix,
         Mode::Terminal => {
+            redraw = false;
             if let Some(bytes) = encode_key(key)
                 && let Some(agent) = app.current()
                 && let Err(error) = agent.session.send(&bytes)
             {
                 app.notice = Some(error.to_string());
+                redraw = true;
             }
         }
-        Mode::Prefix => return handle_prefix(app, key),
+        Mode::Prefix => return handle_prefix(app, key).map(|resize| (resize, true)),
         Mode::ChooseAgent => match key.code {
             KeyCode::Char('c') => spawn(app, AgentKind::Codex),
             KeyCode::Char('a') => spawn(app, AgentKind::Claude),
@@ -138,7 +148,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             _ => {}
         },
     }
-    Ok(false)
+    Ok((false, redraw))
 }
 
 fn handle_prefix(app: &mut App, key: KeyEvent) -> Result<bool> {

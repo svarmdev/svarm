@@ -21,12 +21,47 @@ pub enum SessionStatus {
     Exited,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalPalette {
+    foreground: [u16; 3],
+    background: [u16; 3],
+}
+
+impl TerminalPalette {
+    pub fn detect() -> Option<Self> {
+        let palette = terminal_colorsaurus::color_palette(Default::default()).ok()?;
+        Some(Self {
+            foreground: [
+                palette.foreground.r,
+                palette.foreground.g,
+                palette.foreground.b,
+            ],
+            background: [
+                palette.background.r,
+                palette.background.g,
+                palette.background.b,
+            ],
+        })
+    }
+
+    fn response(self, slot: u8) -> Option<String> {
+        let [red, green, blue] = match slot {
+            10 => self.foreground,
+            11 => self.background,
+            _ => return None,
+        };
+        Some(format!(
+            "\x1b]{slot};rgb:{red:04x}/{green:04x}/{blue:04x}\x1b\\"
+        ))
+    }
+}
+
 pub struct AgentSession {
     pub id: u64,
     pub kind: AgentKind,
     pub cwd: PathBuf,
     parser: Arc<Mutex<Parser>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     status: SessionStatus,
@@ -35,9 +70,15 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub fn spawn(id: u64, kind: AgentKind, cwd: &Path, size: PtySize) -> Result<Self> {
+    pub fn spawn(
+        id: u64,
+        kind: AgentKind,
+        cwd: &Path,
+        size: PtySize,
+        palette: Option<TerminalPalette>,
+    ) -> Result<Self> {
         let command = agent_command(kind, cwd);
-        Self::spawn_command(id, kind, cwd, size, command)
+        Self::spawn_command(id, kind, cwd, size, command, palette)
     }
 
     fn spawn_command(
@@ -46,6 +87,7 @@ impl AgentSession {
         cwd: &Path,
         size: PtySize,
         command: CommandBuilder,
+        palette: Option<TerminalPalette>,
     ) -> Result<Self> {
         if !cwd.is_dir() {
             return Err(format!(
@@ -57,7 +99,7 @@ impl AgentSession {
 
         let pair = NativePtySystem::default().openpty(size)?;
         let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 
@@ -71,6 +113,8 @@ impl AgentSession {
         spawn_reader(
             reader,
             parser.clone(),
+            writer.clone(),
+            palette,
             generation.clone(),
             read_error.clone(),
         );
@@ -80,7 +124,7 @@ impl AgentSession {
             kind,
             cwd: cwd.to_path_buf(),
             parser,
-            writer: Mutex::new(writer),
+            writer,
             master: pair.master,
             child,
             status: SessionStatus::Running,
@@ -89,7 +133,7 @@ impl AgentSession {
         })
     }
 
-    pub fn parser(&self) -> MutexGuard<'_, Parser> {
+    pub(crate) fn parser(&self) -> MutexGuard<'_, Parser> {
         self.parser
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -171,15 +215,27 @@ impl Drop for AgentSession {
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<Parser>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    palette: Option<TerminalPalette>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
+        let mut color_queries = ColorQueryDetector::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
+                    color_queries.process(&buffer[..count], |slot| {
+                        let Some(response) = palette.and_then(|palette| palette.response(slot))
+                        else {
+                            return;
+                        };
+                        let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+                        let _ = writer.write_all(response.as_bytes());
+                        let _ = writer.flush();
+                    });
                     parser
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
@@ -195,6 +251,43 @@ fn spawn_reader(
             }
         }
     });
+}
+
+#[derive(Default)]
+struct ColorQueryDetector {
+    pending: Vec<u8>,
+}
+
+impl ColorQueryDetector {
+    fn process(&mut self, bytes: &[u8], mut respond: impl FnMut(u8)) {
+        const QUERIES: [(&[u8], u8); 4] = [
+            (b"\x1b]10;?\x1b\\", 10),
+            (b"\x1b]11;?\x1b\\", 11),
+            (b"\x1b]10;?\x07", 10),
+            (b"\x1b]11;?\x07", 11),
+        ];
+
+        self.pending.extend_from_slice(bytes);
+        while let Some((position, pattern, slot)) = QUERIES
+            .iter()
+            .filter_map(|(pattern, slot)| {
+                self.pending
+                    .windows(pattern.len())
+                    .position(|window| window == *pattern)
+                    .map(|position| (position, *pattern, *slot))
+            })
+            .min_by_key(|(position, _, _)| *position)
+        {
+            respond(slot);
+            self.pending.drain(..position + pattern.len());
+        }
+
+        const MAX_PARTIAL_QUERY_LEN: usize = 7;
+        if self.pending.len() > MAX_PARTIAL_QUERY_LEN {
+            self.pending
+                .drain(..self.pending.len() - MAX_PARTIAL_QUERY_LEN);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +324,7 @@ mod tests {
                 pixel_height: 0,
             },
             command,
+            None,
         )
         .unwrap();
 
@@ -264,10 +358,39 @@ mod tests {
                 pixel_height: 0,
             },
             command,
+            None,
         )
         .unwrap();
 
         session.stop().unwrap();
         assert_eq!(session.poll_status().unwrap(), SessionStatus::Exited);
+    }
+
+    #[test]
+    fn terminal_palette_formats_osc_color_responses() {
+        let palette = TerminalPalette {
+            foreground: [0xaaaa, 0xbbbb, 0xcccc],
+            background: [0x1111, 0x2222, 0x3333],
+        };
+
+        assert_eq!(
+            palette.response(10).as_deref(),
+            Some("\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\")
+        );
+        assert_eq!(
+            palette.response(11).as_deref(),
+            Some("\x1b]11;rgb:1111/2222/3333\x1b\\")
+        );
+    }
+
+    #[test]
+    fn detects_split_osc_color_queries() {
+        let mut detector = ColorQueryDetector::default();
+        let mut slots = Vec::new();
+
+        detector.process(b"before\x1b]10;?\x1b", |slot| slots.push(slot));
+        detector.process(b"\\middle\x1b]11;?\x07after", |slot| slots.push(slot));
+
+        assert_eq!(slots, [10, 11]);
     }
 }

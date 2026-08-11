@@ -4,7 +4,7 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentKind, Mode,
-    session::{AgentSession, Result, SessionStatus},
+    session::{AgentSession, Result, SessionStatus, TerminalPalette},
     theme::ThemeName,
 };
 
@@ -35,10 +35,16 @@ pub struct App {
     pub cwd: PathBuf,
     next_id: u64,
     pty_size: PtySize,
+    terminal_palette: Option<TerminalPalette>,
 }
 
 impl App {
-    pub fn new(kind: AgentKind, cwd: PathBuf, pty_size: PtySize) -> Result<Self> {
+    pub fn new(
+        kind: AgentKind,
+        cwd: PathBuf,
+        pty_size: PtySize,
+        terminal_palette: Option<TerminalPalette>,
+    ) -> Result<Self> {
         let mut app = Self {
             agents: Vec::new(),
             selected: 0,
@@ -51,13 +57,20 @@ impl App {
             cwd,
             next_id: 1,
             pty_size,
+            terminal_palette,
         };
         app.spawn(kind)?;
         Ok(app)
     }
 
     pub fn spawn(&mut self, kind: AgentKind) -> Result<()> {
-        let session = AgentSession::spawn(self.next_id, kind, &self.cwd, self.pty_size)?;
+        let session = AgentSession::spawn(
+            self.next_id,
+            kind,
+            &self.cwd,
+            self.pty_size,
+            self.terminal_palette,
+        )?;
         self.next_id += 1;
         self.agents.push(AgentEntry {
             session,
