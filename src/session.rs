@@ -36,13 +36,7 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub fn spawn(id: u64, kind: AgentKind, cwd: &Path, size: PtySize) -> Result<Self> {
-        let mut command = CommandBuilder::new(kind.command());
-        command.cwd(cwd);
-        command.env("TERM", "xterm-256color");
-        command.env("SVARM", "1");
-        if kind == AgentKind::Claude {
-            command.env_remove("CLAUDECODE");
-        }
+        let command = agent_command(kind, cwd);
         Self::spawn_command(id, kind, cwd, size, command)
     }
 
@@ -155,6 +149,19 @@ impl AgentSession {
     }
 }
 
+fn agent_command(kind: AgentKind, cwd: &Path) -> CommandBuilder {
+    let mut command = CommandBuilder::new(kind.command());
+    command.cwd(cwd);
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env_remove("NO_COLOR");
+    command.env("SVARM", "1");
+    if kind == AgentKind::Claude {
+        command.env_remove("CLAUDECODE");
+    }
+    command
+}
+
 impl Drop for AgentSession {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -192,9 +199,20 @@ fn spawn_reader(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn native_agent_owns_its_terminal_colors() {
+        let cwd = std::env::current_dir().unwrap();
+        let command = agent_command(AgentKind::Codex, &cwd);
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("NO_COLOR"), None);
+    }
 
     #[test]
     fn captures_output_from_a_real_pty() {

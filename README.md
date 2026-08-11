@@ -14,7 +14,8 @@ svarm                         # Codex in the current directory
 svarm --agent claude ../repo  # Claude Code in ../repo
 ```
 
-Svarm requires a terminal of at least 80 columns by 24 rows. It supports `NO_COLOR`.
+Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
+Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
 
 ## Keys
 
@@ -46,4 +47,3 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-
