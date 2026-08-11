@@ -35,6 +35,7 @@ const EVENT_TICK: Duration = Duration::from_millis(16);
 const EMPTY_SERVER_GRACE: Duration = Duration::from_secs(2);
 const CONNECTION_QUEUE: usize = 64;
 const INPUT_QUEUE: usize = 1_024;
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub struct ServerConfig {
@@ -159,6 +160,7 @@ struct Connection {
     protocol_version: Option<u16>,
     process_id: Option<u32>,
     attached_session: Option<SessionId>,
+    writer: Option<thread::JoinHandle<()>>,
 }
 
 struct OutgoingQueue {
@@ -1251,7 +1253,7 @@ impl Server {
 
     fn remove_connection(&mut self, id: ConnectionId, shutdown_now: bool) {
         let now = self.now_ms();
-        let Some(connection) = self.connections.remove(&id) else {
+        let Some(mut connection) = self.connections.remove(&id) else {
             return;
         };
         let mut remove_session = None;
@@ -1270,6 +1272,9 @@ impl Server {
         connection.outgoing.close();
         if shutdown_now {
             let _ = connection.stream.shutdown(Shutdown::Both);
+        }
+        if let Some(writer) = connection.writer.take() {
+            let _ = writer.join();
         }
     }
 
@@ -1391,7 +1396,11 @@ impl Server {
         for connection in self.connections.values() {
             connection.outgoing.close();
         }
-        self.connections.clear();
+        for (_, mut connection) in std::mem::take(&mut self.connections) {
+            if let Some(writer) = connection.writer.take() {
+                let _ = writer.join();
+            }
+        }
     }
 }
 
@@ -1400,6 +1409,7 @@ fn start_connection(
     stream: UnixStream,
     input: SyncSender<ServerInput>,
 ) -> io::Result<Connection> {
+    stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT))?;
     let reader = stream.try_clone()?;
     let writer = stream.try_clone()?;
     let outgoing = Arc::new(OutgoingQueue::new());
@@ -1417,7 +1427,7 @@ fn start_connection(
         let _ = reader_input.send(ServerInput::Disconnected(id));
     });
     let writer_outgoing = outgoing.clone();
-    thread::spawn(move || {
+    let writer = thread::spawn(move || {
         let mut writer = writer;
         while let Some(envelope) = writer_outgoing.pop() {
             if write_frame(&mut writer, envelope.as_ref()).is_err() {
@@ -1425,7 +1435,7 @@ fn start_connection(
             }
         }
         let _ = writer.shutdown(Shutdown::Both);
-        let _ = input.send(ServerInput::Disconnected(id));
+        let _ = input.try_send(ServerInput::Disconnected(id));
     });
     Ok(Connection {
         outgoing,
@@ -1434,6 +1444,7 @@ fn start_connection(
         protocol_version: None,
         process_id: None,
         attached_session: None,
+        writer: Some(writer),
     })
 }
 
