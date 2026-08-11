@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    sync::mpsc::{Receiver, SyncSender, sync_channel},
+};
 
 use portable_pty::PtySize;
 
@@ -14,10 +18,13 @@ pub struct AgentManager {
     next_id: Option<u64>,
     pty_size: PtySize,
     terminal_palette: Option<TerminalPalette>,
+    dirty_tx: SyncSender<AgentId>,
+    dirty_rx: Receiver<AgentId>,
 }
 
 impl AgentManager {
     pub fn new(cwd: PathBuf, pty_size: PtySize, terminal_palette: Option<TerminalPalette>) -> Self {
+        let (dirty_tx, dirty_rx) = sync_channel(1_024);
         Self {
             sessions: HashMap::new(),
             order: Vec::new(),
@@ -25,13 +32,23 @@ impl AgentManager {
             next_id: Some(1),
             pty_size,
             terminal_palette,
+            dirty_tx,
+            dirty_rx,
         }
     }
 
     pub fn spawn(&mut self, kind: AgentKind) -> Result<SessionSnapshot> {
         let id = self.allocate_id()?;
-        let session =
-            AgentSession::spawn(id, kind, &self.cwd, self.pty_size, self.terminal_palette)?;
+        let command = super::session::agent_command(kind, &self.cwd);
+        let session = AgentSession::spawn_command(
+            id,
+            kind,
+            &self.cwd,
+            self.pty_size,
+            command,
+            self.terminal_palette,
+            Some(self.dirty_tx.clone()),
+        )?;
         let snapshot = session.snapshot();
         self.sessions.insert(id, session);
         self.order.push(id);
@@ -118,6 +135,38 @@ impl AgentManager {
             }
         }
         snapshots
+    }
+
+    pub fn drain_dirty(&self) -> BTreeSet<AgentId> {
+        self.dirty_rx.try_iter().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test_command(
+        &mut self,
+        kind: AgentKind,
+        program: &str,
+        args: &[String],
+    ) -> Result<SessionSnapshot> {
+        use portable_pty::CommandBuilder;
+
+        let id = self.allocate_id()?;
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
+        command.cwd(&self.cwd);
+        let session = AgentSession::spawn_command(
+            id,
+            kind,
+            &self.cwd,
+            self.pty_size,
+            command,
+            self.terminal_palette,
+            Some(self.dirty_tx.clone()),
+        )?;
+        let snapshot = session.snapshot();
+        self.sessions.insert(id, session);
+        self.order.push(id);
+        Ok(snapshot)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {

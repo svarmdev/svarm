@@ -379,6 +379,7 @@ pub struct TerminalModes {
 pub enum MouseProtocol {
     #[default]
     None,
+    Press,
     PressRelease,
     ButtonMotion,
     AnyMotion,

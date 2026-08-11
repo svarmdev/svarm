@@ -3,8 +3,12 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 
 pub mod framing;
+#[cfg(unix)]
+pub mod ipc;
 mod manager;
 pub mod protocol;
+#[cfg(unix)]
+pub mod server;
 pub mod server_session;
 mod session;
 mod terminal;

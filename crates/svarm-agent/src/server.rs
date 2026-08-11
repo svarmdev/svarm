@@ -1,0 +1,1301 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+
+use crate::{
+    AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
+    framing::{read_frame, write_frame},
+    ipc::unix::UnixListenerGuard,
+    protocol::{
+        AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event, LeaseToken,
+        Message, MouseEncoding, MouseProtocol, ProtocolError, ProtocolRange, Request, RequestId,
+        Response, ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId,
+        SessionSummary, SessionTarget, StopSummary, SvarmSessionSnapshot, TerminalFull,
+        TerminalModes, Welcome,
+    },
+    pty_size,
+    server_session::{ServerSessionState, sort_session_summaries},
+};
+
+const EVENT_TICK: Duration = Duration::from_millis(16);
+const CONNECTION_QUEUE: usize = 64;
+const INPUT_QUEUE: usize = 1_024;
+
+pub struct ServerConfig {
+    pub socket_path: PathBuf,
+    pub application_version: String,
+    #[cfg(test)]
+    test_agent_command: Option<(String, Vec<String>)>,
+}
+
+impl ServerConfig {
+    pub fn new(socket_path: PathBuf, application_version: impl Into<String>) -> Self {
+        Self {
+            socket_path,
+            application_version: application_version.into(),
+            #[cfg(test)]
+            test_agent_command: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_agent_command(mut self, program: &str, args: &[&str]) -> Self {
+        self.test_agent_command = Some((
+            program.into(),
+            args.iter().map(|argument| (*argument).to_owned()).collect(),
+        ));
+        self
+    }
+}
+
+pub fn run_foreground(config: ServerConfig) -> AgentResult<()> {
+    Server::new(config)?.run()
+}
+
+struct Connection {
+    sender: SyncSender<Box<Envelope>>,
+    stream: UnixStream,
+    role: Option<ConnectionRole>,
+    protocol_version: Option<u16>,
+    process_id: Option<u32>,
+    attached_session: Option<SessionId>,
+}
+
+enum ServerInput {
+    Frame(ConnectionId, Box<Envelope>),
+    Disconnected(ConnectionId),
+}
+
+struct SessionRuntime {
+    state: ServerSessionState,
+    agents: AgentManager,
+    previous: HashMap<AgentId, SessionSnapshot>,
+}
+
+impl SessionRuntime {
+    fn new(state: ServerSessionState) -> Self {
+        let (rows, cols) = state.dimensions();
+        let agents = AgentManager::new(
+            state.canonical_path().clone(),
+            pty_size(rows, cols),
+            state.terminal_palette(),
+        );
+        Self {
+            state,
+            agents,
+            previous: HashMap::new(),
+        }
+    }
+
+    fn spawn(
+        &mut self,
+        kind: AgentKind,
+        now_ms: u64,
+        _config: &ServerConfig,
+    ) -> AgentResult<SessionSnapshot> {
+        #[cfg(test)]
+        let snapshot = if let Some((program, args)) = &_config.test_agent_command {
+            self.agents.spawn_test_command(kind, program, args)?
+        } else {
+            self.agents.spawn(kind)?
+        };
+        #[cfg(not(test))]
+        let snapshot = self.agents.spawn(kind)?;
+
+        self.state
+            .register_agent(snapshot.id, snapshot.output_generation, now_ms);
+        self.previous.insert(snapshot.id, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn close(&mut self, id: AgentId, now_ms: u64) -> AgentResult<()> {
+        self.agents.close(id)?;
+        self.previous.remove(&id);
+        self.state.remove_agent(id, self.agents.agent_ids(), now_ms);
+        Ok(())
+    }
+
+    fn summary(&self) -> SessionSummary {
+        self.state
+            .summary(self.agents.running_count(), self.agents.len())
+    }
+
+    fn snapshot(&self) -> SvarmSessionSnapshot {
+        let agents = self
+            .agents
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| self.agent_snapshot(snapshot))
+            .collect();
+        let (rows, cols) = self.state.dimensions();
+        SvarmSessionSnapshot {
+            summary: self.summary(),
+            selected_agent_id: self.state.selected_agent_id(),
+            rows,
+            cols,
+            agents,
+        }
+    }
+
+    fn agent_snapshot(&self, snapshot: SessionSnapshot) -> AgentSnapshot {
+        AgentSnapshot {
+            id: snapshot.id,
+            kind: snapshot.kind,
+            launch_directory: self.state.canonical_path().clone(),
+            status: snapshot.status,
+            exit: snapshot.exit,
+            output_generation: snapshot.output_generation,
+            seen_generation: self.state.seen_generation(snapshot.id).unwrap_or(0),
+            terminal_sequence: self
+                .state
+                .terminal_sequence(snapshot.id)
+                .unwrap_or(crate::protocol::TerminalSequence(0)),
+            read_error: snapshot.read_error,
+            recognition: None,
+        }
+    }
+
+    fn full_terminal(&mut self, id: AgentId) -> Option<Event> {
+        let snapshot = self.agents.snapshot(id)?;
+        let terminal = self.agents.terminal_snapshot(id)?;
+        let sequence = self.state.next_terminal_sequence(id).ok()?;
+        let screen = terminal.screen();
+        let (rows, cols) = screen.size();
+        Some(Event::TerminalFull(TerminalFull {
+            agent_id: id,
+            rows,
+            cols,
+            output_generation: snapshot.output_generation,
+            sequence,
+            formatted_screen: screen.contents_formatted(),
+            modes: terminal_modes(screen),
+        }))
+    }
+
+    fn synchronization_events(&mut self) -> Vec<Event> {
+        let ids = self.agents.agent_ids().to_vec();
+        let mut terminals = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(event) = self.full_terminal(id) {
+                terminals.push(event);
+            }
+        }
+        let mut events = vec![Event::SvarmSessionSnapshot(self.snapshot())];
+        events.extend(terminals);
+        events
+    }
+
+    fn poll_events(&mut self) -> Vec<Event> {
+        let dirty = self.agents.drain_dirty();
+        let attached = self.state.attachment().is_some();
+        let mut changed = Vec::new();
+        let mut terminal_ids = Vec::new();
+        for result in self.agents.poll() {
+            let Ok(snapshot) = result else {
+                continue;
+            };
+            let previous = self.previous.insert(snapshot.id, snapshot.clone());
+            if previous.as_ref() != Some(&snapshot) {
+                changed.push(snapshot.clone());
+            }
+            if attached
+                && (dirty.contains(&snapshot.id)
+                    || previous
+                        .as_ref()
+                        .is_some_and(|old| old.output_generation != snapshot.output_generation))
+            {
+                terminal_ids.push(snapshot.id);
+            }
+        }
+        if !changed.is_empty() {
+            self.state.metadata_changed();
+        }
+        let revision = self.state.revision();
+        let mut events = changed
+            .into_iter()
+            .map(|snapshot| Event::AgentChanged {
+                revision,
+                agent: self.agent_snapshot(snapshot),
+            })
+            .collect::<Vec<_>>();
+        for id in terminal_ids {
+            if let Some(event) = self.full_terminal(id) {
+                events.push(event);
+            }
+        }
+        events
+    }
+}
+
+struct Outcome {
+    response: Response,
+    events: Vec<(ConnectionId, Event)>,
+    disconnect: Vec<ConnectionId>,
+}
+
+impl Outcome {
+    fn new(response: Response) -> Self {
+        Self {
+            response,
+            events: Vec::new(),
+            disconnect: Vec::new(),
+        }
+    }
+}
+
+struct Server {
+    config: ServerConfig,
+    listener: UnixListenerGuard,
+    started: Instant,
+    started_ms: u64,
+    instance_id: ServerInstanceId,
+    connections: BTreeMap<ConnectionId, Connection>,
+    sessions: BTreeMap<SessionId, SessionRuntime>,
+    next_connection_id: u64,
+    next_session_id: u64,
+    next_token: u64,
+    input_tx: SyncSender<ServerInput>,
+    input_rx: Receiver<ServerInput>,
+    stopping: bool,
+}
+
+impl Server {
+    fn new(config: ServerConfig) -> AgentResult<Self> {
+        let listener = UnixListenerGuard::bind(&config.socket_path)?;
+        let started_ms = unix_time_ms();
+        let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
+        Ok(Self {
+            config,
+            listener,
+            started: Instant::now(),
+            started_ms,
+            instance_id: ServerInstanceId(format!("{:x}-{:x}", std::process::id(), started_ms)),
+            connections: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            next_connection_id: 1,
+            next_session_id: 1,
+            next_token: 1,
+            input_tx,
+            input_rx,
+            stopping: false,
+        })
+    }
+
+    fn run(mut self) -> AgentResult<()> {
+        while !self.stopping {
+            self.accept_connections()?;
+            match self.input_rx.recv_timeout(EVENT_TICK) {
+                Ok(input) => self.handle_input(input),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            while let Ok(input) = self.input_rx.try_recv() {
+                self.handle_input(input);
+            }
+            self.poll_sessions();
+        }
+        self.finish_shutdown();
+        Ok(())
+    }
+
+    fn accept_connections(&mut self) -> AgentResult<()> {
+        while let Some(stream) = self.listener.accept()? {
+            let id = ConnectionId(self.next_connection_id);
+            self.next_connection_id = self
+                .next_connection_id
+                .checked_add(1)
+                .ok_or("connection identifier space exhausted")?;
+            let connection = start_connection(id, stream, self.input_tx.clone())?;
+            self.connections.insert(id, connection);
+        }
+        Ok(())
+    }
+
+    fn handle_input(&mut self, input: ServerInput) {
+        match input {
+            ServerInput::Frame(id, envelope) => self.handle_envelope(id, *envelope),
+            ServerInput::Disconnected(id) => self.disconnect(id),
+        }
+    }
+
+    fn handle_envelope(&mut self, id: ConnectionId, envelope: Envelope) {
+        let Some(connection) = self.connections.get(&id) else {
+            return;
+        };
+        if connection.role.is_none() {
+            self.handle_hello(id, envelope);
+            return;
+        }
+        let protocol_version = connection.protocol_version.unwrap_or(0);
+        if envelope.protocol_version != protocol_version {
+            self.send_error(
+                id,
+                envelope.request_id,
+                ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "message protocol version differs from the negotiated version",
+                ),
+            );
+            return;
+        }
+        let Some(request_id) = envelope.request_id else {
+            self.send_error(
+                id,
+                None,
+                ProtocolError::new(ErrorCode::InvalidRequest, "requests require a request ID"),
+            );
+            return;
+        };
+        let Message::Request(request) = envelope.message else {
+            self.send_error(
+                id,
+                Some(request_id),
+                ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "only request messages are accepted after the handshake",
+                ),
+            );
+            return;
+        };
+        match self.apply_request(id, request) {
+            Ok(outcome) => {
+                self.send_response(id, request_id, outcome.response);
+                for (target, event) in outcome.events {
+                    self.send_event(target, event);
+                }
+                for target in outcome.disconnect {
+                    self.disconnect(target);
+                }
+            }
+            Err(error) => self.send_error(id, Some(request_id), error),
+        }
+    }
+
+    fn handle_hello(&mut self, id: ConnectionId, envelope: Envelope) {
+        let request_id = envelope.request_id;
+        let Message::Hello(hello) = envelope.message else {
+            self.send_error(
+                id,
+                request_id,
+                ProtocolError::new(ErrorCode::InvalidRequest, "Hello must be the first message"),
+            );
+            self.disconnect(id);
+            return;
+        };
+        let Some(version) = hello.protocol.negotiate(ProtocolRange::CURRENT) else {
+            self.send_error(
+                id,
+                request_id,
+                ProtocolError::incompatible(hello.protocol, ProtocolRange::CURRENT),
+            );
+            return;
+        };
+        if let Some(connection) = self.connections.get_mut(&id) {
+            connection.role = Some(hello.role);
+            connection.protocol_version = Some(version);
+            connection.process_id = hello.process_id;
+        }
+        self.send(
+            id,
+            Envelope {
+                protocol_version: version,
+                request_id,
+                message: Message::Welcome(Welcome {
+                    application_version: self.config.application_version.clone(),
+                    protocol_version: version,
+                    process_id: std::process::id(),
+                    instance_id: self.instance_id.clone(),
+                    capabilities: ServerCapabilities {
+                        takeover: true,
+                        terminal_diffs: false,
+                    },
+                    connection_id: id,
+                }),
+            },
+        );
+    }
+
+    fn apply_request(
+        &mut self,
+        id: ConnectionId,
+        request: Request,
+    ) -> Result<Outcome, ProtocolError> {
+        self.check_role(id, &request)?;
+        match request {
+            Request::CreateSession {
+                canonical_path,
+                rows,
+                cols,
+                palette,
+            } => self.create_session(id, canonical_path, rows, cols, palette),
+            Request::AttachSession {
+                session_id,
+                rows,
+                cols,
+                palette,
+                takeover,
+            } => self.attach_session(id, session_id, rows, cols, palette, takeover),
+            Request::DetachSession { lease_token } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                self.sessions
+                    .get_mut(&session_id)
+                    .expect("attached session exists")
+                    .state
+                    .detach(&lease_token, now)?;
+                self.connections.get_mut(&id).unwrap().attached_session = None;
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::SpawnAgent { lease_token, kind } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let snapshot = runtime
+                    .spawn(kind, now, &self.config)
+                    .map_err(internal_error)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((
+                    id,
+                    Event::AgentAdded {
+                        revision: runtime.state.revision(),
+                        agent: runtime.agent_snapshot(snapshot.clone()),
+                    },
+                ));
+                if let Some(event) = runtime.full_terminal(snapshot.id) {
+                    outcome.events.push((id, event));
+                }
+                Ok(outcome)
+            }
+            Request::CloseAgent {
+                lease_token,
+                agent_id,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                if runtime.agents.snapshot(agent_id).is_none() {
+                    return Err(agent_not_found());
+                }
+                runtime.close(agent_id, now).map_err(internal_error)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((
+                    id,
+                    Event::AgentRemoved {
+                        revision: runtime.state.revision(),
+                        agent_id,
+                    },
+                ));
+                Ok(outcome)
+            }
+            Request::StopAttachedSession { lease_token } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                self.stop_session_runtime(session_id, Some(id))
+            }
+            Request::InputBytes {
+                lease_token,
+                agent_id,
+                bytes,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let snapshot = runtime
+                    .agents
+                    .snapshot(agent_id)
+                    .ok_or_else(agent_not_found)?;
+                if snapshot.status == SessionStatus::Exited {
+                    return Err(ProtocolError::new(
+                        ErrorCode::AgentExited,
+                        "agent has exited",
+                    ));
+                }
+                if !bytes.is_empty() {
+                    runtime
+                        .agents
+                        .send(agent_id, &bytes)
+                        .map_err(internal_error)?;
+                }
+                runtime.state.record_activity(now);
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::ResizeSession {
+                lease_token,
+                rows,
+                cols,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                runtime.state.resize(rows, cols, now)?;
+                runtime.agents.resize(rows, cols).map_err(internal_error)?;
+                let events = runtime
+                    .agents
+                    .agent_ids()
+                    .to_vec()
+                    .into_iter()
+                    .filter_map(|agent_id| runtime.full_terminal(agent_id))
+                    .map(|event| (id, event))
+                    .collect();
+                Ok(Outcome {
+                    response: Response::Ok,
+                    events,
+                    disconnect: Vec::new(),
+                })
+            }
+            Request::SelectAgent {
+                lease_token,
+                agent_id,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                self.sessions
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .state
+                    .select_agent(agent_id, now)?;
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::MarkSeen {
+                lease_token,
+                agent_id,
+                generation,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let current = runtime
+                    .agents
+                    .snapshot(agent_id)
+                    .ok_or_else(agent_not_found)?
+                    .output_generation;
+                runtime
+                    .state
+                    .mark_seen(agent_id, generation, current, now)?;
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::ResyncTerminal {
+                lease_token,
+                agent_id,
+                ..
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let event = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .full_terminal(agent_id)
+                    .ok_or_else(agent_not_found)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((id, event));
+                Ok(outcome)
+            }
+            Request::AcknowledgeFrame {
+                lease_token,
+                agent_id,
+                ..
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                if self.sessions[&session_id]
+                    .agents
+                    .snapshot(agent_id)
+                    .is_none()
+                {
+                    return Err(agent_not_found());
+                }
+                Ok(Outcome::new(Response::Ok))
+            }
+            Request::ServerStatus => Ok(Outcome::new(Response::ServerStatus(self.status()))),
+            Request::ListSessions => {
+                let mut sessions = self
+                    .sessions
+                    .values()
+                    .map(SessionRuntime::summary)
+                    .collect::<Vec<_>>();
+                sort_session_summaries(&mut sessions);
+                Ok(Outcome::new(Response::Sessions { sessions }))
+            }
+            Request::GetSession { target } => {
+                let session_id = self.resolve_target(target)?;
+                Ok(Outcome::new(Response::Session {
+                    session: Some(self.sessions[&session_id].snapshot()),
+                }))
+            }
+            Request::StopSession { target, confirmed } => {
+                require_confirmation(confirmed)?;
+                let session_id = self.resolve_target(target)?;
+                self.stop_session_runtime(session_id, Some(id))
+            }
+            Request::StopServer { confirmed } => {
+                require_confirmation(confirmed)?;
+                let session_count = self.sessions.len();
+                let agent_count = self
+                    .sessions
+                    .values()
+                    .map(|runtime| runtime.agents.len())
+                    .sum();
+                let mut outcome = Outcome::new(Response::Stopped(StopSummary {
+                    session_count,
+                    agent_count,
+                    server_stopped: true,
+                }));
+                for connection_id in self.connections.keys().copied() {
+                    if connection_id != id {
+                        outcome.events.push((connection_id, Event::ServerStopping));
+                    }
+                }
+                self.stopping = true;
+                Ok(outcome)
+            }
+            Request::Key { .. } | Request::Paste { .. } | Request::Mouse { .. } => {
+                Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "semantic terminal input is not available in this server build",
+                ))
+            }
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        id: ConnectionId,
+        path: PathBuf,
+        rows: u16,
+        cols: u16,
+        palette: Option<crate::TerminalPalette>,
+    ) -> Result<Outcome, ProtocolError> {
+        if self.connections[&id].attached_session.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "connection is already attached to a Svarm session",
+            ));
+        }
+        let canonical_path = canonicalize(&path)?;
+        let session_id = SessionId(self.next_session_id);
+        self.next_session_id = self
+            .next_session_id
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InternalError, "session IDs exhausted"))?;
+        let now = self.now_ms();
+        let mut runtime = SessionRuntime::new(ServerSessionState::new(
+            session_id,
+            canonical_path,
+            rows,
+            cols,
+            palette,
+            now,
+        )?);
+        let token = self.lease_token();
+        runtime.state.attach(
+            id,
+            self.connections[&id].process_id,
+            token.clone(),
+            false,
+            now,
+        )?;
+        let events = runtime
+            .synchronization_events()
+            .into_iter()
+            .map(|event| (id, event))
+            .collect();
+        self.sessions.insert(session_id, runtime);
+        self.connections.get_mut(&id).unwrap().attached_session = Some(session_id);
+        Ok(Outcome {
+            response: Response::Created {
+                session_id,
+                lease_token: token,
+            },
+            events,
+            disconnect: Vec::new(),
+        })
+    }
+
+    fn attach_session(
+        &mut self,
+        id: ConnectionId,
+        session_id: SessionId,
+        rows: u16,
+        cols: u16,
+        palette: Option<crate::TerminalPalette>,
+        takeover: bool,
+    ) -> Result<Outcome, ProtocolError> {
+        if self.connections[&id].attached_session.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "connection is already attached to a Svarm session",
+            ));
+        }
+        let token = self.lease_token();
+        let now = self.now_ms();
+        let process_id = self.connections[&id].process_id;
+        let runtime = self.sessions.get_mut(&session_id).ok_or_else(|| {
+            ProtocolError::new(ErrorCode::SessionNotFound, "Svarm session was not found")
+        })?;
+        runtime.state.resize(rows, cols, now)?;
+        runtime.state.set_terminal_palette(palette, now);
+        runtime.agents.resize(rows, cols).map_err(internal_error)?;
+        runtime.agents.set_terminal_palette(palette);
+        let attach = runtime
+            .state
+            .attach(id, process_id, token.clone(), takeover, now)?;
+        let events = runtime
+            .synchronization_events()
+            .into_iter()
+            .map(|event| (id, event))
+            .collect::<Vec<_>>();
+        self.connections.get_mut(&id).unwrap().attached_session = Some(session_id);
+        let mut outcome = Outcome {
+            response: Response::Attached {
+                session_id,
+                lease_token: token,
+            },
+            events,
+            disconnect: Vec::new(),
+        };
+        if let Some(old) = attach.revoked_connection {
+            if let Some(connection) = self.connections.get_mut(&old) {
+                connection.attached_session = None;
+            }
+            outcome.events.push((
+                old,
+                Event::LeaseRevoked {
+                    reason: "another client explicitly took over this Svarm session".into(),
+                },
+            ));
+            outcome.disconnect.push(old);
+        }
+        Ok(outcome)
+    }
+
+    fn stop_session_runtime(
+        &mut self,
+        session_id: SessionId,
+        requester: Option<ConnectionId>,
+    ) -> Result<Outcome, ProtocolError> {
+        let mut runtime = self.sessions.remove(&session_id).ok_or_else(|| {
+            ProtocolError::new(ErrorCode::SessionNotFound, "Svarm session was not found")
+        })?;
+        let agent_count = runtime.agents.len();
+        let attached = runtime.state.attachment().map(|lease| lease.connection_id);
+        runtime.state.stop();
+        let _errors = runtime.agents.stop_all();
+        if let Some(connection_id) = attached
+            && let Some(connection) = self.connections.get_mut(&connection_id)
+        {
+            connection.attached_session = None;
+        }
+        let mut outcome = Outcome::new(Response::Stopped(StopSummary {
+            session_count: 1,
+            agent_count,
+            server_stopped: false,
+        }));
+        if let Some(connection_id) = attached
+            && Some(connection_id) != requester
+        {
+            outcome.events.push((
+                connection_id,
+                Event::LeaseRevoked {
+                    reason: "Svarm session was stopped by a control client".into(),
+                },
+            ));
+            outcome.disconnect.push(connection_id);
+        }
+        Ok(outcome)
+    }
+
+    fn check_role(&self, id: ConnectionId, request: &Request) -> Result<(), ProtocolError> {
+        let role = self.connections[&id].role.expect("handshake completed");
+        let allowed = match role {
+            ConnectionRole::Interactive => !matches!(
+                request,
+                Request::ServerStatus
+                    | Request::ListSessions
+                    | Request::GetSession { .. }
+                    | Request::StopSession { .. }
+                    | Request::StopServer { .. }
+            ),
+            ConnectionRole::Control => matches!(
+                request,
+                Request::ServerStatus
+                    | Request::ListSessions
+                    | Request::GetSession { .. }
+                    | Request::StopSession { .. }
+                    | Request::StopServer { .. }
+            ),
+            ConnectionRole::Probe => matches!(request, Request::ServerStatus),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "request is not permitted for this connection role",
+            ))
+        }
+    }
+
+    fn attached_session(
+        &self,
+        id: ConnectionId,
+        token: &LeaseToken,
+    ) -> Result<SessionId, ProtocolError> {
+        let session_id = self.connections[&id].attached_session.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidLease,
+                "connection has no interactive lease",
+            )
+        })?;
+        self.sessions[&session_id].state.validate_lease(token)?;
+        Ok(session_id)
+    }
+
+    fn resolve_target(&self, target: SessionTarget) -> Result<SessionId, ProtocolError> {
+        match target {
+            SessionTarget::Id(id) if self.sessions.contains_key(&id) => Ok(id),
+            SessionTarget::Id(_) => Err(ProtocolError::new(
+                ErrorCode::SessionNotFound,
+                "Svarm session was not found",
+            )),
+            SessionTarget::CanonicalPath(path) => {
+                let path = canonicalize(&path)?;
+                let matches = self
+                    .sessions
+                    .iter()
+                    .filter_map(|(id, runtime)| {
+                        (runtime.state.canonical_path() == &path).then_some(*id)
+                    })
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [id] => Ok(*id),
+                    [] => Err(ProtocolError::new(
+                        ErrorCode::SessionNotFound,
+                        "no Svarm session uses that canonical workspace path",
+                    )),
+                    _ => Err(ProtocolError::new(
+                        ErrorCode::SessionTargetAmbiguous,
+                        "multiple Svarm sessions use that workspace path; target a session ID",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn poll_sessions(&mut self) {
+        let session_ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for session_id in session_ids {
+            let Some(runtime) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            let connection_id = runtime.state.attachment().map(|lease| lease.connection_id);
+            let events = runtime.poll_events();
+            if let Some(connection_id) = connection_id {
+                for event in events {
+                    self.send_event(connection_id, event);
+                }
+            }
+        }
+    }
+
+    fn disconnect(&mut self, id: ConnectionId) {
+        let now = self.now_ms();
+        let Some(connection) = self.connections.remove(&id) else {
+            return;
+        };
+        if let Some(session_id) = connection.attached_session
+            && let Some(runtime) = self.sessions.get_mut(&session_id)
+        {
+            runtime.state.disconnect(id, now);
+        }
+        let _ = connection.stream.shutdown(Shutdown::Both);
+    }
+
+    fn send_response(&mut self, id: ConnectionId, request_id: RequestId, response: Response) {
+        self.send_message(id, Some(request_id), Message::Response(response));
+    }
+
+    fn send_error(
+        &mut self,
+        id: ConnectionId,
+        request_id: Option<RequestId>,
+        error: ProtocolError,
+    ) {
+        self.send_message(id, request_id, Message::Error(error));
+    }
+
+    fn send_event(&mut self, id: ConnectionId, event: Event) {
+        self.send_message(id, None, Message::Event(event));
+    }
+
+    fn send_message(&mut self, id: ConnectionId, request_id: Option<RequestId>, message: Message) {
+        let protocol_version = self
+            .connections
+            .get(&id)
+            .and_then(|connection| connection.protocol_version)
+            .unwrap_or(crate::protocol::PROTOCOL_VERSION);
+        self.send(
+            id,
+            Envelope {
+                protocol_version,
+                request_id,
+                message,
+            },
+        );
+    }
+
+    fn send(&mut self, id: ConnectionId, envelope: Envelope) {
+        let result = self
+            .connections
+            .get(&id)
+            .map(|connection| connection.sender.try_send(Box::new(envelope)));
+        if matches!(
+            result,
+            Some(Err(TrySendError::Full(_) | TrySendError::Disconnected(_)))
+        ) {
+            self.disconnect(id);
+        }
+    }
+
+    fn status(&self) -> ServerStatusSnapshot {
+        ServerStatusSnapshot {
+            process_id: std::process::id(),
+            application_version: self.config.application_version.clone(),
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
+            socket_path: self.listener.path().to_owned(),
+            uptime_ms: self.started.elapsed().as_millis() as u64,
+            session_count: self.sessions.len(),
+            client_count: self.connections.len(),
+        }
+    }
+
+    fn lease_token(&mut self) -> LeaseToken {
+        let token = LeaseToken(format!(
+            "{}-{:x}-{:x}",
+            self.instance_id.0, self.next_token, self.started_ms
+        ));
+        self.next_token = self.next_token.saturating_add(1);
+        token
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started_ms
+            .saturating_add(self.started.elapsed().as_millis() as u64)
+    }
+
+    fn finish_shutdown(&mut self) {
+        for runtime in self.sessions.values_mut() {
+            runtime.state.stop();
+            let _ = runtime.agents.stop_all();
+        }
+        self.sessions.clear();
+        self.connections.clear();
+    }
+}
+
+fn start_connection(
+    id: ConnectionId,
+    stream: UnixStream,
+    input: SyncSender<ServerInput>,
+) -> io::Result<Connection> {
+    let reader = stream.try_clone()?;
+    let writer = stream.try_clone()?;
+    let (sender, outgoing) = mpsc::sync_channel::<Box<Envelope>>(CONNECTION_QUEUE);
+    let reader_input = input.clone();
+    thread::spawn(move || {
+        let mut reader = reader;
+        while let Ok(Some(envelope)) = read_frame(&mut reader) {
+            if reader_input
+                .send(ServerInput::Frame(id, Box::new(envelope)))
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = reader_input.send(ServerInput::Disconnected(id));
+    });
+    thread::spawn(move || {
+        let mut writer = writer;
+        while let Ok(envelope) = outgoing.recv() {
+            if write_frame(&mut writer, envelope.as_ref()).is_err() {
+                break;
+            }
+        }
+        let _ = input.send(ServerInput::Disconnected(id));
+    });
+    Ok(Connection {
+        sender,
+        stream,
+        role: None,
+        protocol_version: None,
+        process_id: None,
+        attached_session: None,
+    })
+}
+
+fn terminal_modes(screen: &Screen) -> TerminalModes {
+    TerminalModes {
+        application_cursor: screen.application_cursor(),
+        application_keypad: screen.application_keypad(),
+        bracketed_paste: screen.bracketed_paste(),
+        mouse_protocol: match screen.mouse_protocol_mode() {
+            MouseProtocolMode::None => MouseProtocol::None,
+            MouseProtocolMode::Press => MouseProtocol::Press,
+            MouseProtocolMode::PressRelease => MouseProtocol::PressRelease,
+            MouseProtocolMode::ButtonMotion => MouseProtocol::ButtonMotion,
+            MouseProtocolMode::AnyMotion => MouseProtocol::AnyMotion,
+        },
+        mouse_encoding: match screen.mouse_protocol_encoding() {
+            MouseProtocolEncoding::Default => MouseEncoding::Default,
+            MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
+            MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
+        },
+    }
+}
+
+fn require_confirmation(confirmed: bool) -> Result<(), ProtocolError> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "destructive operation requires explicit confirmation",
+        ))
+    }
+}
+
+fn canonicalize(path: &Path) -> Result<PathBuf, ProtocolError> {
+    path.canonicalize().map_err(|error| {
+        ProtocolError::new(
+            ErrorCode::SessionNotFound,
+            format!("could not resolve workspace {}: {error}", path.display()),
+        )
+    })
+}
+
+fn agent_not_found() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::AgentNotFound,
+        "agent does not exist in this Svarm session",
+    )
+}
+
+fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
+    ProtocolError::new(ErrorCode::InternalError, error.to_string())
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, io::Write, time::SystemTime};
+
+    use super::*;
+    use crate::protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION};
+
+    struct Client {
+        stream: UnixStream,
+        next_request: u64,
+    }
+
+    impl Client {
+        fn connect(path: &Path, role: ConnectionRole) -> Self {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match UnixStream::connect(path) {
+                    Ok(stream) => break stream,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("server did not accept connections: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write_frame(
+                &mut stream,
+                &Envelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: Some(RequestId(1)),
+                    message: Message::Hello(Hello {
+                        application_version: "test".into(),
+                        protocol: ProtocolRange::CURRENT,
+                        role,
+                        process_id: Some(std::process::id()),
+                        terminal: HostTerminalCapabilities::default(),
+                    }),
+                },
+            )
+            .unwrap();
+            let welcome: Envelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(welcome.message, Message::Welcome(_)));
+            Self {
+                stream,
+                next_request: 2,
+            }
+        }
+
+        fn request(&mut self, request: Request) -> (RequestId, Response) {
+            let request_id = RequestId(self.next_request);
+            self.next_request += 1;
+            write_frame(
+                &mut self.stream,
+                &Envelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: Some(request_id),
+                    message: Message::Request(request),
+                },
+            )
+            .unwrap();
+            loop {
+                let envelope: Envelope = read_frame(&mut self.stream).unwrap().unwrap();
+                if envelope.request_id == Some(request_id) {
+                    return match envelope.message {
+                        Message::Response(response) => (request_id, response),
+                        Message::Error(error) => panic!("request failed: {error:?}"),
+                        other => panic!("unexpected request response: {other:?}"),
+                    };
+                }
+            }
+        }
+
+        fn event_until(&mut self, predicate: impl Fn(&Event) -> bool) -> Event {
+            loop {
+                let envelope: Envelope = read_frame(&mut self.stream).unwrap().unwrap();
+                if let Message::Event(event) = envelope.message
+                    && predicate(&event)
+                {
+                    return event;
+                }
+            }
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "svarm-server-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn agent_keeps_running_and_producing_output_while_detached() {
+        let directory = temp_dir();
+        let socket = directory.join("server.sock");
+        let config = ServerConfig::new(socket.clone(), "test").with_test_agent_command(
+            "sh",
+            &[
+                "-c",
+                "printf before; sleep 0.1; printf after; exec sleep 60",
+            ],
+        );
+        let server = thread::spawn(move || run_foreground(config).unwrap());
+
+        let mut client = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, created) = client.request(Request::CreateSession {
+            canonical_path: directory.clone(),
+            rows: 10,
+            cols: 40,
+            palette: None,
+        });
+        let (session_id, lease_token) = match created {
+            Response::Created {
+                session_id,
+                lease_token,
+            } => (session_id, lease_token),
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let _ = client.event_until(|event| matches!(event, Event::SvarmSessionSnapshot(_)));
+        let _ = client.request(Request::SpawnAgent {
+            lease_token: lease_token.clone(),
+            kind: AgentKind::Codex,
+        });
+        let first = client.event_until(|event| {
+            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"before"))
+        });
+        assert!(matches!(first, Event::TerminalFull(_)));
+        let _ = client.request(Request::DetachSession { lease_token });
+        drop(client);
+        thread::sleep(Duration::from_millis(200));
+
+        let mut reattached = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, attached) = reattached.request(Request::AttachSession {
+            session_id,
+            rows: 10,
+            cols: 40,
+            palette: None,
+            takeover: false,
+        });
+        let lease_token = match attached {
+            Response::Attached { lease_token, .. } => lease_token,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let _ = reattached.event_until(|event| {
+            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"after"))
+        });
+        let _ = reattached.request(Request::StopAttachedSession { lease_token });
+        drop(reattached);
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let (_, stopped) = control.request(Request::StopServer { confirmed: true });
+        assert!(matches!(
+            stopped,
+            Response::Stopped(StopSummary {
+                server_stopped: true,
+                ..
+            })
+        ));
+        drop(control);
+        server.join().unwrap();
+        assert!(!socket.exists());
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_connection_does_not_stop_the_server() {
+        let directory = temp_dir();
+        let socket = directory.join("server.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            run_foreground(ServerConfig::new(server_socket, "test")).unwrap()
+        });
+
+        let mut malformed = UnixStream::connect(&socket).unwrap_or_else(|_| {
+            let _ = Client::connect(&socket, ConnectionRole::Probe);
+            UnixStream::connect(&socket).unwrap()
+        });
+        malformed.write_all(&[0, 0, 0, 1, b'{']).unwrap();
+        drop(malformed);
+
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let (_, status) = control.request(Request::ServerStatus);
+        assert!(matches!(status, Response::ServerStatus(_)));
+        let _ = control.request(Request::StopServer { confirmed: true });
+        drop(control);
+        server.join().unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+}

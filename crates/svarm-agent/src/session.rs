@@ -88,16 +88,17 @@ impl AgentSession {
         palette: Option<TerminalPalette>,
     ) -> Result<Self> {
         let command = agent_command(kind, cwd);
-        Self::spawn_command(id, kind, cwd, size, command, palette)
+        Self::spawn_command(id, kind, cwd, size, command, palette, None)
     }
 
-    fn spawn_command(
+    pub(crate) fn spawn_command(
         id: AgentId,
         kind: AgentKind,
         cwd: &Path,
         size: PtySize,
         command: CommandBuilder,
         palette: Option<TerminalPalette>,
+        dirty: Option<std::sync::mpsc::SyncSender<AgentId>>,
     ) -> Result<Self> {
         if !cwd.is_dir() {
             return Err(format!(
@@ -128,6 +129,7 @@ impl AgentSession {
             terminal_palette.clone(),
             generation.clone(),
             read_error.clone(),
+            (id, dirty),
         );
 
         Ok(Self {
@@ -246,7 +248,7 @@ impl AgentSession {
     }
 }
 
-fn agent_command(kind: AgentKind, cwd: &Path) -> CommandBuilder {
+pub(crate) fn agent_command(kind: AgentKind, cwd: &Path) -> CommandBuilder {
     let mut command = CommandBuilder::new(kind.command());
     command.cwd(cwd);
     command.env("TERM", "xterm-256color");
@@ -272,6 +274,7 @@ fn spawn_reader(
     terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
+    dirty: (AgentId, Option<std::sync::mpsc::SyncSender<AgentId>>),
 ) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
@@ -296,6 +299,9 @@ fn spawn_reader(
                         .unwrap_or_else(|poison| poison.into_inner())
                         .process(&buffer[..count]);
                     generation.fetch_add(1, Ordering::Release);
+                    if let Some(sender) = &dirty.1 {
+                        let _ = sender.try_send(dirty.0);
+                    }
                 }
                 Err(error) => {
                     *read_error
@@ -343,6 +349,7 @@ mod tests {
             },
             command,
             None,
+            None,
         )
         .unwrap();
 
@@ -376,6 +383,7 @@ mod tests {
                 pixel_height: 0,
             },
             command,
+            None,
             None,
         )
         .unwrap();

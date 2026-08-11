@@ -209,6 +209,14 @@ impl ServerSessionState {
         self.touch(now_ms);
     }
 
+    pub fn record_activity(&mut self, now_ms: u64) {
+        self.touch(now_ms);
+    }
+
+    pub fn metadata_changed(&mut self) {
+        self.bump_revision();
+    }
+
     pub fn next_terminal_sequence(
         &mut self,
         id: AgentId,
