@@ -26,6 +26,27 @@ const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
 
 #[derive(Clone, Copy)]
+enum ModalSize {
+    Compact,
+    Standard,
+    Browser,
+}
+
+impl ModalSize {
+    fn area(self, terminal: Rect) -> Rect {
+        match self {
+            Self::Compact => centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, terminal),
+            Self::Standard => centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, terminal),
+            Self::Browser => centered_rect(
+                terminal.width.saturating_sub(4).min(100),
+                terminal.height.saturating_sub(2).min(30),
+                terminal,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct UiModel<'a> {
     pub app: &'a App,
     pub screen: Option<&'a Screen>,
@@ -442,7 +463,7 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " New agent ",
-        compact_modal_area(frame.area()),
+        ModalSize::Compact,
         vec![
             Line::from(""),
             row(NewAgentField::Workspace, "Workspace", workspace),
@@ -534,7 +555,7 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Choose workspace ",
-        compact_modal_area(frame.area()),
+        ModalSize::Compact,
         lines,
     );
 }
@@ -564,20 +585,14 @@ fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             theme.muted(),
         )),
     ]);
-    render_dialog(
-        frame,
-        theme,
-        " Choose agent ",
-        compact_modal_area(frame.area()),
-        lines,
-    );
+    render_dialog(frame, theme, " Choose agent ", ModalSize::Compact, lines);
 }
 
 fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let Some(browser) = app.native_browser() else {
         return;
     };
-    let area = browser_modal_area(frame.area());
+    let area = ModalSize::Browser.area(frame.area());
     let visible = usize::from(area.height.saturating_sub(6));
     let content_width = usize::from(area.width.saturating_sub(8));
     let start = browser.selected.saturating_sub(visible - 1);
@@ -629,7 +644,13 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
         theme.muted(),
     )));
-    render_dialog(frame, theme, " Select workspace ", area, lines);
+    render_dialog(
+        frame,
+        theme,
+        " Select workspace ",
+        ModalSize::Browser,
+        lines,
+    );
 }
 
 fn render_embedded_browser(
@@ -667,7 +688,7 @@ fn render_embedded_browser(
 }
 
 fn embedded_modal_area(area: Rect) -> Rect {
-    browser_modal_area(area)
+    ModalSize::Browser.area(area)
 }
 
 pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
@@ -685,7 +706,7 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
         frame,
         theme,
         title,
-        standard_modal_area(frame.area()),
+        ModalSize::Standard,
         vec![
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
@@ -708,7 +729,7 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Stop Svarm session? ",
-        standard_modal_area(frame.area()),
+        ModalSize::Standard,
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -739,13 +760,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
         Line::from(""),
         Line::from(Span::styled("  Esc closes", theme.muted())),
     ]);
-    render_dialog(
-        frame,
-        theme,
-        " Keybinds ",
-        standard_modal_area(frame.area()),
-        lines,
-    );
+    render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -753,7 +768,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Settings ",
-        standard_modal_area(frame.area()),
+        ModalSize::Standard,
         vec![
             Line::from(""),
             Line::from(vec![
@@ -780,9 +795,10 @@ fn render_dialog(
     frame: &mut Frame<'_>,
     theme: Theme,
     title: &str,
-    area: Rect,
+    size: ModalSize,
     lines: Vec<Line<'static>>,
 ) {
+    let area = size.area(frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -798,22 +814,6 @@ fn render_dialog(
             .style(theme.surface()),
         area,
     );
-}
-
-fn compact_modal_area(area: Rect) -> Rect {
-    centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, area)
-}
-
-fn standard_modal_area(area: Rect) -> Rect {
-    centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, area)
-}
-
-fn browser_modal_area(area: Rect) -> Rect {
-    centered_rect(
-        area.width.saturating_sub(4).min(100),
-        area.height.saturating_sub(2).min(30),
-        area,
-    )
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -891,10 +891,16 @@ mod tests {
     #[test]
     fn agent_flow_is_compact_and_browsers_share_a_larger_shell() {
         let terminal = Rect::new(0, 0, 120, 40);
-        assert_eq!(compact_modal_area(terminal), Rect::new(28, 14, 64, 12));
-        assert_eq!(standard_modal_area(terminal), Rect::new(24, 11, 72, 18));
-        assert_eq!(browser_modal_area(terminal), Rect::new(10, 5, 100, 30));
-        assert_eq!(embedded_modal_area(terminal), browser_modal_area(terminal));
+        assert_eq!(ModalSize::Compact.area(terminal), Rect::new(28, 14, 64, 12));
+        assert_eq!(
+            ModalSize::Standard.area(terminal),
+            Rect::new(24, 11, 72, 18)
+        );
+        assert_eq!(ModalSize::Browser.area(terminal), Rect::new(10, 5, 100, 30));
+        assert_eq!(
+            embedded_modal_area(terminal),
+            ModalSize::Browser.area(terminal)
+        );
     }
 
     #[test]
