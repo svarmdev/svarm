@@ -31,6 +31,7 @@ use crate::{
 };
 
 const EVENT_TICK: Duration = Duration::from_millis(16);
+const EMPTY_SERVER_GRACE: Duration = Duration::from_secs(2);
 const CONNECTION_QUEUE: usize = 64;
 const INPUT_QUEUE: usize = 1_024;
 
@@ -444,6 +445,7 @@ struct Server {
     input_tx: SyncSender<ServerInput>,
     input_rx: Receiver<ServerInput>,
     stopping: bool,
+    empty_since: Option<Instant>,
 }
 
 impl Server {
@@ -465,6 +467,7 @@ impl Server {
             input_tx,
             input_rx,
             stopping: false,
+            empty_since: Some(Instant::now()),
         })
     }
 
@@ -480,6 +483,7 @@ impl Server {
                 self.handle_input(input);
             }
             self.poll_sessions();
+            self.update_lifetime();
         }
         self.finish_shutdown();
         Ok(())
@@ -494,6 +498,7 @@ impl Server {
                 .ok_or("connection identifier space exhausted")?;
             let connection = start_connection(id, stream, self.input_tx.clone())?;
             self.connections.insert(id, connection);
+            self.empty_since = None;
         }
         Ok(())
     }
@@ -551,7 +556,7 @@ impl Server {
                     self.send_event(target, event);
                 }
                 for target in outcome.disconnect {
-                    self.disconnect(target);
+                    self.disconnect_after_flush(target);
                 }
             }
             Err(error) => self.send_error(id, Some(request_id), error),
@@ -566,7 +571,7 @@ impl Server {
                 request_id,
                 ProtocolError::new(ErrorCode::InvalidRequest, "Hello must be the first message"),
             );
-            self.disconnect(id);
+            self.disconnect_after_flush(id);
             return;
         };
         let Some(version) = hello.protocol.negotiate(ProtocolRange::CURRENT) else {
@@ -575,6 +580,7 @@ impl Server {
                 request_id,
                 ProtocolError::incompatible(hello.protocol, ProtocolRange::CURRENT),
             );
+            self.disconnect_after_flush(id);
             return;
         };
         if let Some(connection) = self.connections.get_mut(&id) {
@@ -625,16 +631,18 @@ impl Server {
             Request::DetachSession { lease_token } => {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
-                self.sessions
-                    .get_mut(&session_id)
-                    .expect("attached session exists")
-                    .state
-                    .detach(&lease_token, now)?;
-                self.sessions
-                    .get_mut(&session_id)
-                    .expect("attached session exists")
-                    .frame_bases
-                    .clear();
+                let remove = {
+                    let runtime = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .expect("attached session exists");
+                    runtime.state.detach(&lease_token, now)?;
+                    runtime.frame_bases.clear();
+                    runtime.agents.is_empty()
+                };
+                if remove {
+                    self.sessions.remove(&session_id);
+                }
                 self.connections.get_mut(&id).unwrap().attached_session = None;
                 Ok(Outcome::new(Response::Ok))
             }
@@ -1114,18 +1122,35 @@ impl Server {
     }
 
     fn disconnect(&mut self, id: ConnectionId) {
+        self.remove_connection(id, true);
+    }
+
+    fn disconnect_after_flush(&mut self, id: ConnectionId) {
+        self.remove_connection(id, false);
+    }
+
+    fn remove_connection(&mut self, id: ConnectionId, shutdown_now: bool) {
         let now = self.now_ms();
         let Some(connection) = self.connections.remove(&id) else {
             return;
         };
+        let mut remove_session = None;
         if let Some(session_id) = connection.attached_session
             && let Some(runtime) = self.sessions.get_mut(&session_id)
             && runtime.state.disconnect(id, now)
         {
             runtime.frame_bases.clear();
+            if runtime.agents.is_empty() {
+                remove_session = Some(session_id);
+            }
+        }
+        if let Some(session_id) = remove_session {
+            self.sessions.remove(&session_id);
         }
         connection.outgoing.close();
-        let _ = connection.stream.shutdown(Shutdown::Both);
+        if shutdown_now {
+            let _ = connection.stream.shutdown(Shutdown::Both);
+        }
     }
 
     fn send_response(&mut self, id: ConnectionId, request_id: RequestId, response: Response) {
@@ -1212,6 +1237,17 @@ impl Server {
         }
     }
 
+    fn update_lifetime(&mut self) {
+        if !self.sessions.is_empty() || !self.connections.is_empty() {
+            self.empty_since = None;
+            return;
+        }
+        let empty_since = self.empty_since.get_or_insert_with(Instant::now);
+        if empty_since.elapsed() >= EMPTY_SERVER_GRACE {
+            self.stopping = true;
+        }
+    }
+
     fn lease_token(&mut self) -> LeaseToken {
         let token = LeaseToken(format!(
             "{}-{:x}-{:x}",
@@ -1268,6 +1304,7 @@ fn start_connection(
                 break;
             }
         }
+        let _ = writer.shutdown(Shutdown::Both);
         let _ = input.send(ServerInput::Disconnected(id));
     });
     Ok(Connection {

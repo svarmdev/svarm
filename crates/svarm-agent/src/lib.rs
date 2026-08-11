@@ -7,6 +7,8 @@ pub mod input;
 #[cfg(unix)]
 pub mod ipc;
 mod manager;
+#[cfg(unix)]
+pub mod paths;
 pub mod protocol;
 #[cfg(unix)]
 pub mod server;
