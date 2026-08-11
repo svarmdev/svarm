@@ -1,5 +1,7 @@
 use std::{fmt, str::FromStr};
 
+pub mod cli;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {
     Codex,

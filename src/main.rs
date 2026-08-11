@@ -1,3 +1,6 @@
+use clap::Parser;
+use svarm::cli::Cli;
+
 fn main() {
-    println!("svarm");
+    let _ = Cli::parse();
 }
