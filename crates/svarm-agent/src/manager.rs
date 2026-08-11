@@ -3,7 +3,8 @@ use std::{collections::HashMap, path::PathBuf};
 use portable_pty::PtySize;
 
 use crate::{
-    AgentId, AgentKind, AgentSession, Result, SessionSnapshot, TerminalPalette, TerminalSnapshot,
+    AgentId, AgentKind, AgentSession, Result, SessionSnapshot, SessionStatus, TerminalPalette,
+    TerminalSnapshot,
 };
 
 pub struct AgentManager {
@@ -56,6 +57,57 @@ impl AgentManager {
 
     pub fn terminal_snapshot(&self, id: AgentId) -> Option<TerminalSnapshot> {
         self.sessions.get(&id).map(AgentSession::terminal_snapshot)
+    }
+
+    pub fn snapshot(&self, id: AgentId) -> Option<SessionSnapshot> {
+        self.sessions.get(&id).map(AgentSession::snapshot)
+    }
+
+    pub fn snapshots(&self) -> Vec<SessionSnapshot> {
+        self.order
+            .iter()
+            .filter_map(|id| self.snapshot(*id))
+            .collect()
+    }
+
+    pub fn agent_ids(&self) -> &[AgentId] {
+        &self.order
+    }
+
+    pub fn running_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.snapshot().status == SessionStatus::Running)
+            .count()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    pub fn set_terminal_palette(&mut self, palette: Option<TerminalPalette>) {
+        self.terminal_palette = palette;
+        for session in self.sessions.values() {
+            session.set_terminal_palette(palette);
+        }
+    }
+
+    pub fn stop_all(&mut self) -> Vec<(AgentId, String)> {
+        let mut errors = Vec::new();
+        for id in &self.order {
+            if let Some(session) = self.sessions.get_mut(id)
+                && let Err(error) = session.stop()
+            {
+                errors.push((*id, error.to_string()));
+            }
+        }
+        self.sessions.clear();
+        self.order.clear();
+        errors
     }
 
     pub fn poll(&mut self) -> Vec<Result<SessionSnapshot>> {

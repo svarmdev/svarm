@@ -64,6 +64,7 @@ pub struct AgentSession {
     child: Box<dyn Child + Send + Sync>,
     status: SessionStatus,
     exit: Option<ProcessExit>,
+    terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
 }
@@ -119,11 +120,12 @@ impl AgentSession {
         )));
         let generation = Arc::new(AtomicU64::new(0));
         let read_error = Arc::new(Mutex::new(None));
+        let terminal_palette = Arc::new(Mutex::new(palette));
         spawn_reader(
             reader,
             parser.clone(),
             writer.clone(),
-            palette,
+            terminal_palette.clone(),
             generation.clone(),
             read_error.clone(),
         );
@@ -137,6 +139,7 @@ impl AgentSession {
             child,
             status: SessionStatus::Running,
             exit: None,
+            terminal_palette,
             generation,
             read_error,
         })
@@ -152,6 +155,13 @@ impl AgentSession {
         TerminalSnapshot {
             screen: self.parser().screen().clone(),
         }
+    }
+
+    pub fn set_terminal_palette(&self, palette: Option<TerminalPalette>) {
+        *self
+            .terminal_palette
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = palette;
     }
 
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
@@ -259,7 +269,7 @@ fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    palette: Option<TerminalPalette>,
+    terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
     read_error: Arc<Mutex<Option<String>>>,
 ) {
@@ -270,9 +280,13 @@ fn spawn_reader(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    for response in
-                        color_query_responses(&mut color_queries, palette, &buffer[..count])
-                    {
+                    for response in color_query_responses(
+                        &mut color_queries,
+                        *terminal_palette
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner()),
+                        &buffer[..count],
+                    ) {
                         let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
                         let _ = writer.write_all(response.as_bytes());
                         let _ = writer.flush();

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod framing;
 mod manager;
 pub mod protocol;
+pub mod server_session;
 mod session;
 mod terminal;
 

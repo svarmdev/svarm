@@ -477,6 +477,14 @@ pub struct ProtocolError {
 }
 
 impl ProtocolError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            context: BTreeMap::new(),
+        }
+    }
+
     pub fn incompatible(client: ProtocolRange, server: ProtocolRange) -> Self {
         Self {
             code: ErrorCode::IncompatibleProtocol,
