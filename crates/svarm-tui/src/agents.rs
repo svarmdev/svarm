@@ -58,6 +58,7 @@ pub(crate) enum ClientEvent {
     Host(crossterm::event::Event),
     Remote(Incoming),
     DirectoryLoaded(crate::workspace::DirectoryLoadResult),
+    EmbeddedToolChanged,
 }
 
 struct CachedTerminal {
@@ -497,7 +498,8 @@ impl RemoteAgents {
                 Ok(
                     ClientEvent::Remote(Incoming::Envelope(_))
                     | ClientEvent::Host(_)
-                    | ClientEvent::DirectoryLoaded(_),
+                    | ClientEvent::DirectoryLoaded(_)
+                    | ClientEvent::EmbeddedToolChanged,
                 ) => {}
                 Ok(ClientEvent::Remote(Incoming::Disconnected(error))) => return Err(error.into()),
                 Err(error) => return Err(format!("Svarm server did not respond: {error}").into()),

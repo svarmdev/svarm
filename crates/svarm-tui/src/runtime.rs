@@ -1,10 +1,15 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, path::PathBuf, sync::mpsc};
 
 use crossterm::event::{
     Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerEvent};
+use svarm_agent::{
+    AgentKind, Result, SessionStatus, TerminalPalette, TerminalProcessSnapshot,
+    input::{encode_key, encode_mouse, encode_paste},
+    protocol::Event as ServerEvent,
+};
 
 use crate::{
     agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
@@ -16,7 +21,7 @@ use crate::{
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
-    workspace::DirectoryLoader,
+    workspace::{DirectoryLoader, YaziLaunchError, YaziPicker, YaziResult},
 };
 
 const EVENT_QUEUE: usize = 1_024;
@@ -24,7 +29,7 @@ const EVENT_QUEUE: usize = 1_024;
 pub fn run(
     initial_agent: InitialAgentRequest,
     invocation_directory: Option<PathBuf>,
-    _runtime_directory: PathBuf,
+    runtime_directory: PathBuf,
     socket_path: PathBuf,
     target: InitialSession,
 ) -> Result<()> {
@@ -35,10 +40,26 @@ pub fn run(
     let (width, height) = crossterm::terminal::size()?;
     let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
+    let embedded_pending = std::sync::Arc::new(AtomicBool::new(false));
     let mut browser = BrowserRuntime {
         loader: DirectoryLoader::new(events_tx.clone()),
         generation: 0,
         invocation_directory,
+        runtime_directory,
+        palette,
+        yazi: None,
+        embedded_pending: embedded_pending.clone(),
+        embedded_notify: {
+            let events = events_tx.clone();
+            let pending = embedded_pending;
+            std::sync::Arc::new(move || {
+                if !pending.swap(true, Ordering::AcqRel)
+                    && events.try_send(ClientEvent::EmbeddedToolChanged).is_err()
+                {
+                    pending.store(false, Ordering::Release);
+                }
+            })
+        },
     };
     let (mut agents, snapshot) = RemoteAgents::connect(
         &socket_path,
@@ -82,14 +103,21 @@ pub fn run(
     while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
             let selected = app.selected_agent_id();
+            let embedded = browser.snapshot();
             let model = UiModel {
                 app: &app,
                 screen: selected.and_then(|id| agents.screen(id)),
+                embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
             };
-            let cursor_style = selected
-                .and_then(|id| agents.cursor_style(id))
-                .unwrap_or_default();
+            let cursor_style = embedded.as_ref().map_or_else(
+                || {
+                    selected
+                        .and_then(|id| agents.cursor_style(id))
+                        .unwrap_or_default()
+                },
+                |snapshot| snapshot.cursor_style,
+            );
             terminal.set_cursor_style(cursor_style)?;
             terminal.terminal().draw(|frame| ui::render(frame, model))?;
             if let Some((id, generation)) = app.mark_selected_seen() {
@@ -109,11 +137,13 @@ pub fn run(
                     }
                 }
                 ClientEvent::Host(host) => {
+                    let host_area = terminal.terminal().size()?.into();
                     let resources = InteractionResources {
                         settings_store: &settings,
                         settings: &mut settings_value,
                         events: &events,
                         browser: &mut browser,
+                        host_area,
                     };
                     dirty |=
                         handle_host_event(&mut app, &mut agents, resources, &mut terminal, host)?;
@@ -121,6 +151,11 @@ pub fn run(
                 ClientEvent::DirectoryLoaded(result) => {
                     dirty |=
                         app.apply_directory_load(result.generation, result.path, result.result);
+                }
+                ClientEvent::EmbeddedToolChanged => {
+                    browser.embedded_pending.store(false, Ordering::Release);
+                    browser.poll_yazi(&mut app);
+                    dirty = true;
                 }
             }
         }
@@ -168,12 +203,29 @@ fn handle_host_event(
                 agents.paste(id, text)?;
             }
         }
+        HostEvent::Paste(text) if app.mode() == Mode::NewAgent(NewAgentPage::EmbeddedBrowser) => {
+            if let Err(error) = resources.browser.paste(&text) {
+                app.set_notice(format!("could not paste into Yazi: {error}"));
+            }
+        }
         HostEvent::Resize(width, height) => {
             dirty = true;
-            resize_agents(agents, app, Rect::new(0, 0, width, height))?;
+            let area = Rect::new(0, 0, width, height);
+            resize_agents(agents, app, area)?;
+            if let Err(error) = resources.browser.resize(area) {
+                app.set_notice(format!("could not resize Yazi: {error}"));
+                resources.browser.force_close(app);
+            }
         }
         HostEvent::Mouse(mouse) => {
-            dirty |= handle_mouse(app, agents, mouse, terminal.terminal().size()?.into())?;
+            let area = terminal.terminal().size()?.into();
+            if app.mode() == Mode::NewAgent(NewAgentPage::EmbeddedBrowser) {
+                if let Err(error) = resources.browser.mouse(mouse, area) {
+                    app.set_notice(format!("could not send mouse input to Yazi: {error}"));
+                }
+            } else {
+                dirty |= handle_mouse(app, agents, mouse, area)?;
+            }
         }
         _ => {}
     }
@@ -254,6 +306,26 @@ fn handle_key(
                 resources.settings,
                 management_command(key),
             );
+        }
+        Mode::NewAgent(NewAgentPage::EmbeddedBrowser) if is_management_prefix(key) => {
+            app.set_mode(Mode::ToolPrefix);
+        }
+        Mode::NewAgent(NewAgentPage::EmbeddedBrowser) => {
+            if let Err(error) = resources.browser.send_key(key) {
+                app.set_notice(format!("could not send input to Yazi: {error}"));
+            }
+        }
+        Mode::ToolPrefix => {
+            if is_management_prefix(key) {
+                if let Err(error) = resources.browser.send_literal_prefix() {
+                    app.set_notice(format!("could not send input to Yazi: {error}"));
+                }
+                app.open_embedded_browser();
+            } else if key.code == KeyCode::Char('x') {
+                resources.browser.force_close(app);
+            } else {
+                app.open_embedded_browser();
+            }
         }
         Mode::NewAgent(page) => {
             handle_new_agent_key(app, agents, resources, page, key);
@@ -477,7 +549,11 @@ fn handle_new_agent_key(
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
             KeyCode::Enter => app.confirm_workspace(),
-            KeyCode::Char('b') => resources.browser.open(app, resources.settings),
+            KeyCode::Char('b') => {
+                resources
+                    .browser
+                    .open(app, resources.settings, resources.host_area)
+            }
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}
         },
@@ -491,6 +567,7 @@ fn handle_new_agent_key(
             _ => {}
         },
         NewAgentPage::NativeBrowser => handle_native_browser_key(app, resources.browser, key),
+        NewAgentPage::EmbeddedBrowser => {}
     }
 }
 
@@ -499,6 +576,7 @@ struct InteractionResources<'a> {
     settings: &'a mut Settings,
     events: &'a mpsc::Receiver<ClientEvent>,
     browser: &'a mut BrowserRuntime,
+    host_area: Rect,
 }
 
 fn handle_native_browser_key(app: &mut App, browser: &mut BrowserRuntime, key: KeyEvent) {
@@ -539,10 +617,15 @@ struct BrowserRuntime {
     loader: DirectoryLoader,
     generation: u64,
     invocation_directory: Option<PathBuf>,
+    runtime_directory: PathBuf,
+    palette: Option<TerminalPalette>,
+    yazi: Option<YaziPicker>,
+    embedded_pending: std::sync::Arc<AtomicBool>,
+    embedded_notify: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
 impl BrowserRuntime {
-    fn open(&mut self, app: &mut App, settings: &Settings) {
+    fn open(&mut self, app: &mut App, settings: &Settings, area: Rect) {
         let start = app
             .new_agent()
             .and_then(|state| state.draft.workspace.clone())
@@ -565,6 +648,30 @@ impl BrowserRuntime {
                     .filter(|path| path.is_dir())
             })
             .unwrap_or_else(|| PathBuf::from("/"));
+        let content = ui::embedded_terminal_area(area);
+        let size = svarm_agent::PtySize {
+            rows: content.height.max(1),
+            cols: content.width.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        match YaziPicker::spawn(
+            &start,
+            &self.runtime_directory,
+            size,
+            self.palette,
+            self.embedded_notify.clone(),
+        ) {
+            Ok(yazi) => {
+                self.yazi = Some(yazi);
+                app.open_embedded_browser();
+            }
+            Err(YaziLaunchError::NotFound) => self.open_native(app, start),
+            Err(YaziLaunchError::Failed(error)) => app.set_notice(error),
+        }
+    }
+
+    fn open_native(&mut self, app: &mut App, start: PathBuf) {
         self.generation = self.generation.saturating_add(1);
         app.open_native_browser(start.clone(), self.generation);
         if let Err(error) = self.loader.load(self.generation, start) {
@@ -578,6 +685,107 @@ impl BrowserRuntime {
         if let Err(error) = self.loader.load(self.generation, path) {
             app.set_notice(error);
         }
+    }
+
+    fn snapshot(&self) -> Option<TerminalProcessSnapshot> {
+        self.yazi.as_ref().map(YaziPicker::snapshot)
+    }
+
+    fn send_key(&self, key: KeyEvent) -> std::result::Result<(), String> {
+        let Some(yazi) = &self.yazi else {
+            return Ok(());
+        };
+        let snapshot = yazi.snapshot();
+        if let Some(input) = key_input(key)
+            && let Some(bytes) = encode_key(&input, snapshot.modes)
+        {
+            yazi.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn send_literal_prefix(&self) -> std::result::Result<(), String> {
+        if let Some(yazi) = &self.yazi {
+            yazi.send(&[0x02])?;
+        }
+        Ok(())
+    }
+
+    fn paste(&self, text: &str) -> std::result::Result<(), String> {
+        if let Some(yazi) = &self.yazi {
+            let bytes = encode_paste(text, yazi.snapshot().modes);
+            yazi.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn mouse(&self, mouse: MouseEvent, area: Rect) -> std::result::Result<(), String> {
+        let Some(yazi) = &self.yazi else {
+            return Ok(());
+        };
+        let content = ui::embedded_terminal_area(area);
+        if !contains(content, mouse.column, mouse.row) {
+            return Ok(());
+        }
+        let translated = MouseEvent {
+            column: mouse.column - content.x,
+            row: mouse.row - content.y,
+            ..mouse
+        };
+        if let Some(bytes) = encode_mouse(&mouse_input(translated), yazi.snapshot().modes) {
+            yazi.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn resize(&self, area: Rect) -> std::result::Result<(), String> {
+        if let Some(yazi) = &self.yazi {
+            let content = ui::embedded_terminal_area(area);
+            yazi.resize(content.height.max(1), content.width.max(1))?;
+        }
+        Ok(())
+    }
+
+    fn poll_yazi(&mut self, app: &mut App) {
+        let Some(yazi) = &mut self.yazi else {
+            return;
+        };
+        let snapshot = yazi.snapshot();
+        let finished = if snapshot.read_error.is_some() {
+            let _ = yazi.stop();
+            true
+        } else {
+            match yazi.poll() {
+                Ok(SessionStatus::Running) => false,
+                Ok(SessionStatus::Exited) => true,
+                Err(error) => {
+                    app.set_notice(format!("could not poll Yazi: {error}"));
+                    true
+                }
+            }
+        };
+        if !finished {
+            return;
+        }
+        let yazi = self.yazi.take().expect("Yazi was present while polled");
+        match yazi.finish() {
+            YaziResult::Selected(path) => app.choose_browsed_workspace(path),
+            YaziResult::Cancelled => app.close_embedded_browser(),
+            YaziResult::Failed(error) => {
+                app.set_notice(error);
+                app.close_embedded_browser();
+            }
+        }
+    }
+
+    fn force_close(&mut self, app: &mut App) {
+        if let Some(yazi) = &mut self.yazi
+            && let Err(error) = yazi.stop()
+        {
+            app.set_notice(format!("could not close Yazi: {error}"));
+        }
+        self.yazi = None;
+        app.close_embedded_browser();
     }
 }
 

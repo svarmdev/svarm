@@ -13,7 +13,7 @@ use crate::{
     screen::TerminalScreen,
     theme::Theme,
 };
-use svarm_agent::{AgentKind, SessionStatus};
+use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
@@ -25,6 +25,7 @@ const MENU_WIDTH: u16 = 46;
 pub(crate) struct UiModel<'a> {
     pub app: &'a App,
     pub screen: Option<&'a Screen>,
+    pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
 }
 
@@ -63,6 +64,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::NewAgent(NewAgentPage::Workspaces) => render_workspace_choices(frame, app, theme),
         Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme),
         Mode::NewAgent(NewAgentPage::NativeBrowser) => render_native_browser(frame, app, theme),
+        Mode::NewAgent(NewAgentPage::EmbeddedBrowser) | Mode::ToolPrefix => {
+            render_embedded_browser(frame, model.embedded, theme)
+        }
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?")
         }
@@ -608,6 +612,58 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     render_dialog(frame, theme, " Select workspace ", 76, 16, lines);
 }
 
+fn render_embedded_browser(
+    frame: &mut Frame<'_>,
+    snapshot: Option<&TerminalProcessSnapshot>,
+    theme: Theme,
+) {
+    let area = embedded_modal_area(frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::bordered()
+            .title(" Select workspace · Yazi ")
+            .border_style(accent(theme))
+            .style(theme.surface()),
+        area,
+    );
+    let content = embedded_terminal_area(frame.area());
+    if let Some(snapshot) = snapshot {
+        let terminal = TerminalScreen::new(&snapshot.screen);
+        if let Some(position) = terminal.cursor_position(content) {
+            frame.set_cursor_position(position);
+        }
+        frame.render_widget(terminal, content);
+    }
+    frame.render_widget(
+        Paragraph::new("[q] use current directory  [Q] cancel  [Ctrl+B x] force close")
+            .style(theme.muted()),
+        Rect::new(
+            area.x.saturating_add(1),
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(2),
+            1,
+        ),
+    );
+}
+
+fn embedded_modal_area(area: Rect) -> Rect {
+    centered_rect(
+        area.width.saturating_sub(4).min(100),
+        area.height.saturating_sub(2).min(30),
+        area,
+    )
+}
+
+pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
+    let modal = embedded_modal_area(area);
+    Rect::new(
+        modal.x.saturating_add(1),
+        modal.y.saturating_add(1),
+        modal.width.saturating_sub(2),
+        modal.height.saturating_sub(4),
+    )
+}
+
 fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt: &str) {
     render_dialog(
         frame,
@@ -825,6 +881,7 @@ mod tests {
                         UiModel {
                             app: &app,
                             screen: None,
+                            embedded: None,
                             theme: app.theme().theme(true),
                         },
                     );
@@ -862,6 +919,7 @@ mod tests {
                         UiModel {
                             app: &app,
                             screen: None,
+                            embedded: None,
                             theme: app.theme().theme(true),
                         },
                     );
@@ -1035,6 +1093,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: Some(parser.screen()),
+                        embedded: None,
                         theme: app.theme().theme(true),
                     },
                 )
@@ -1073,6 +1132,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: Some(parser.screen()),
+                        embedded: None,
                         theme: app.theme().theme(true),
                     },
                 )
@@ -1080,6 +1140,59 @@ mod tests {
             .unwrap();
 
         assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn embedded_terminal_uses_prepared_screen_area_and_cursor_at_80x24() {
+        let mut parser = svarm_agent::vt100::Parser::new(18, 74, 0);
+        parser.process(b"yazi> ");
+        let snapshot = TerminalProcessSnapshot {
+            screen: parser.screen().clone(),
+            cursor_style: svarm_agent::CursorStyle::SteadyBar,
+            status: SessionStatus::Running,
+            exit: None,
+            read_error: None,
+            generation: 1,
+            modes: svarm_agent::protocol::TerminalModes::default(),
+        };
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            true,
+            None,
+        );
+        app.open_embedded_browser();
+        let area = Rect::new(0, 0, 80, 24);
+        let content = embedded_terminal_area(area);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: None,
+                        embedded: Some(&snapshot),
+                        theme: app.theme().theme(true),
+                    },
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(content.x + 6, content.y)
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Select workspace · Yazi"));
+        assert!(rendered.contains("force close"));
     }
 
     fn render_app_text(app: &App) -> String {
@@ -1092,6 +1205,7 @@ mod tests {
                     UiModel {
                         app,
                         screen: None,
+                        embedded: None,
                         theme: app.theme().theme(false),
                     },
                 )

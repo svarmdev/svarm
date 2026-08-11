@@ -15,6 +15,7 @@ pub(crate) enum Mode {
     #[default]
     Terminal,
     Prefix,
+    ToolPrefix,
     NewAgent(NewAgentPage),
     ConfirmClose,
     ConfirmQuit,
@@ -30,6 +31,7 @@ pub(crate) enum NewAgentPage {
     Workspaces,
     Agents,
     NativeBrowser,
+    EmbeddedBrowser,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -808,6 +810,18 @@ impl App {
     pub fn close_native_browser(&mut self) {
         if let Some(state) = &mut self.new_agent {
             state.native_browser = None;
+            self.mode = Mode::NewAgent(NewAgentPage::Workspaces);
+        }
+    }
+
+    pub fn open_embedded_browser(&mut self) {
+        if self.new_agent.is_some() {
+            self.mode = Mode::NewAgent(NewAgentPage::EmbeddedBrowser);
+        }
+    }
+
+    pub fn close_embedded_browser(&mut self) {
+        if self.new_agent.is_some() {
             self.mode = Mode::NewAgent(NewAgentPage::Workspaces);
         }
     }
