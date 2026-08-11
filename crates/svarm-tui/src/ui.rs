@@ -17,10 +17,10 @@ use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
-const COMPACT_MODAL_WIDTH: u16 = 72;
+const COMPACT_MODAL_WIDTH: u16 = 64;
 const COMPACT_MODAL_HEIGHT: u16 = 12;
-const MODAL_WIDTH: u16 = 76;
-const MODAL_HEIGHT: u16 = 18;
+const STANDARD_MODAL_WIDTH: u16 = 72;
+const STANDARD_MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = 25;
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
@@ -429,7 +429,7 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Span::styled(if selected { " > " } else { "   " }, accent(theme)),
             Span::styled(format!("{label:<12}"), text(theme)),
             Span::styled(
-                end_truncate(&value, 50),
+                end_truncate(&value, 42),
                 if selected {
                     theme.selected()
                 } else {
@@ -495,11 +495,14 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 .skip(start)
                 .take(visible)
                 .map(|(index, choice)| {
-                    let name = choice
-                        .path
-                        .file_name()
-                        .unwrap_or(choice.path.as_os_str())
-                        .to_string_lossy();
+                    let name = end_truncate(
+                        &choice
+                            .path
+                            .file_name()
+                            .unwrap_or(choice.path.as_os_str())
+                            .to_string_lossy(),
+                        14,
+                    );
                     let missing = if choice.available { "" } else { "  missing" };
                     Line::from(vec![
                         Span::styled(
@@ -510,9 +513,9 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                             },
                             accent(theme),
                         ),
-                        Span::styled(format!("{name:<16}"), text(theme)),
+                        Span::styled(format!("{name:<14}"), text(theme)),
                         Span::styled(
-                            end_truncate(&choice.path.display().to_string(), 45),
+                            end_truncate(&choice.path.display().to_string(), 32),
                             theme.muted(),
                         ),
                         Span::styled(missing, warning(theme)),
@@ -682,7 +685,7 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
         frame,
         theme,
         title,
-        modal_area(frame.area()),
+        standard_modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
@@ -705,7 +708,7 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Stop Svarm session? ",
-        modal_area(frame.area()),
+        standard_modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -736,7 +739,13 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
         Line::from(""),
         Line::from(Span::styled("  Esc closes", theme.muted())),
     ]);
-    render_dialog(frame, theme, " Keybinds ", modal_area(frame.area()), lines);
+    render_dialog(
+        frame,
+        theme,
+        " Keybinds ",
+        standard_modal_area(frame.area()),
+        lines,
+    );
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
@@ -744,7 +753,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         frame,
         theme,
         " Settings ",
-        modal_area(frame.area()),
+        standard_modal_area(frame.area()),
         vec![
             Line::from(""),
             Line::from(vec![
@@ -795,8 +804,8 @@ fn compact_modal_area(area: Rect) -> Rect {
     centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, area)
 }
 
-fn modal_area(area: Rect) -> Rect {
-    centered_rect(MODAL_WIDTH, MODAL_HEIGHT, area)
+fn standard_modal_area(area: Rect) -> Rect {
+    centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, area)
 }
 
 fn browser_modal_area(area: Rect) -> Rect {
@@ -882,8 +891,8 @@ mod tests {
     #[test]
     fn agent_flow_is_compact_and_browsers_share_a_larger_shell() {
         let terminal = Rect::new(0, 0, 120, 40);
-        assert_eq!(compact_modal_area(terminal), Rect::new(24, 14, 72, 12));
-        assert_eq!(modal_area(terminal), Rect::new(22, 11, 76, 18));
+        assert_eq!(compact_modal_area(terminal), Rect::new(28, 14, 64, 12));
+        assert_eq!(standard_modal_area(terminal), Rect::new(24, 11, 72, 18));
         assert_eq!(browser_modal_area(terminal), Rect::new(10, 5, 100, 30));
         assert_eq!(embedded_modal_area(terminal), browser_modal_area(terminal));
     }

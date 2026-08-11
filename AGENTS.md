@@ -32,6 +32,14 @@ A small terminal multiplexer for coding agents
 
 Do not add another crate merely to enforce a conceptual layer. Prefer a focused module until there is a real independent package boundary.
 
+## TUI modal sizes
+
+- **Compact — 64x12.** Short forms and pickers, including the new-agent flow.
+- **Standard — 72x18.** Confirmations, settings, and help.
+- **Browser — responsive, capped at 100x30.** Native filesystem browsing and embedded terminal tools; leave 2 rows and 4 columns around it.
+
+Always center and clamp modals to the terminal. Reuse the shared area helpers in `ui.rs`; add another size only when content demonstrably cannot fit an existing tier at 80x24.
+
 ## Working agreement
 
 - Preserve native agent terminal behavior. Normal input, control keys, paste mode, mouse protocol, color queries, and resize events must continue to flow according to the child terminal's advertised modes.
