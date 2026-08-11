@@ -445,20 +445,28 @@ impl SessionRuntime {
         });
         let (title, screen_recognition) =
             screen.unwrap_or((String::new(), ScreenRecognition::Unknown));
-        let conversation_title = if title.is_empty() {
+        let title_recognition = recognition::recognize_title(session.kind, &title);
+        let conversation_title = if let Some(title) = title_recognition
+            .as_ref()
+            .and_then(|recognized| recognized.conversation_title.clone())
+        {
+            Some(title)
+        } else if title.is_empty() || title_recognition.is_some() {
             previous
                 .as_ref()
                 .and_then(|agent| agent.conversation_title.clone())
         } else {
             Some(title)
         };
-        let recognition = match screen_recognition {
-            ScreenRecognition::Recognized(evidence) => Some(evidence),
-            ScreenRecognition::Preserve => previous
-                .as_ref()
-                .and_then(|agent| agent.recognition.clone()),
-            ScreenRecognition::Unknown => None,
-        };
+        let recognition = title_recognition
+            .map(|recognized| recognized.evidence)
+            .or_else(|| match screen_recognition {
+                ScreenRecognition::Recognized(evidence) => Some(evidence),
+                ScreenRecognition::Preserve => previous
+                    .as_ref()
+                    .and_then(|agent| agent.recognition.clone()),
+                ScreenRecognition::Unknown => None,
+            });
         let activity = recognition
             .as_ref()
             .map_or(AgentActivity::Unknown, |evidence| evidence.claim);
@@ -1813,7 +1821,7 @@ mod tests {
             "sh",
             &[
                 "-c",
-                r"printf '\033]2;Refactor sidebar\a\033[20;1HWorking  esc to interrupt'; sleep 0.2; printf '\033[20;1H\033[2KReady\033[21;1H\033[2K? for shortcuts'; sleep 2",
+                r"printf '\033]2;⠋ Working | Initial conversation\a'; sleep 0.3; printf '\033]2;⠙ Working | Refactor sidebar\a'; sleep 0.2; printf '\033]2;Ready | Refactor sidebar\a'; sleep 2",
             ],
         );
         runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
@@ -1823,17 +1831,15 @@ mod tests {
             runtime.poll_events();
             let snapshot = runtime.snapshot();
             let agent = &snapshot.agents[0];
-            if agent.activity == AgentActivity::Working {
-                assert_eq!(
-                    agent.conversation_title.as_deref(),
-                    Some("Refactor sidebar")
-                );
+            if agent.activity == AgentActivity::Working
+                && agent.conversation_title.as_deref() == Some("Initial conversation")
+            {
                 assert_eq!(
                     agent
                         .recognition
                         .as_ref()
                         .map(|evidence| evidence.rule.as_str()),
-                    Some("codex.active-turn")
+                    Some("codex.title-active")
                 );
                 let git = agent.git.as_ref().unwrap();
                 assert!(!git.branch.is_empty());
@@ -1841,6 +1847,28 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "agent metadata was not observed");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let events = runtime.poll_events();
+            let snapshot = runtime.snapshot();
+            let agent = &snapshot.agents[0];
+            if agent.conversation_title.as_deref() == Some("Refactor sidebar") {
+                assert!(events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::AgentChanged { agent, .. }
+                            if agent.conversation_title.as_deref() == Some("Refactor sidebar")
+                    )
+                }));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "conversation title update was not observed"
+            );
             thread::sleep(Duration::from_millis(5));
         }
 

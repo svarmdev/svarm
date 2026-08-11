@@ -354,10 +354,6 @@ impl AgentState {
         self.status
     }
 
-    pub fn launch_directory(&self) -> &std::path::Path {
-        &self.launch_directory
-    }
-
     pub fn conversation_title(&self) -> Option<&str> {
         self.conversation_title.as_deref()
     }

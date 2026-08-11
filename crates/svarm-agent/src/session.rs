@@ -117,9 +117,15 @@ pub(crate) fn agent_command(kind: AgentKind, cwd: &Path) -> CommandBuilder {
     command.env("SVARM", "1");
     match kind {
         AgentKind::Codex => {
-            command.args(["-c", r#"tui.terminal_title=["thread_name"]"#]);
+            command.args([
+                "-c",
+                r#"tui.terminal_title=["activity","run-state","thread-title"]"#,
+            ]);
         }
-        AgentKind::Claude => command.env_remove("CLAUDECODE"),
+        AgentKind::Claude => {
+            command.env_remove("CLAUDECODE");
+            command.env_remove("CLAUDE_CODE_DISABLE_TERMINAL_TITLE");
+        }
     }
     command
 }
@@ -141,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_reports_only_its_thread_name_in_the_terminal_title() {
+    fn codex_reports_activity_and_thread_name_in_the_terminal_title() {
         let cwd = std::env::current_dir().unwrap();
         let command = agent_command(AgentKind::Codex, &cwd);
 
@@ -150,7 +156,9 @@ mod tests {
             &vec![
                 std::ffi::OsString::from("codex"),
                 std::ffi::OsString::from("-c"),
-                std::ffi::OsString::from(r#"tui.terminal_title=["thread_name"]"#),
+                std::ffi::OsString::from(
+                    r#"tui.terminal_title=["activity","run-state","thread-title"]"#,
+                ),
             ]
         );
     }

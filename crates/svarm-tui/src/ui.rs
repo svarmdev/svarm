@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -303,7 +303,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .enumerate()
         .map(|(index, agent)| {
             let status = agent.display_status();
-            let (circle, label, status_style) = status_display(status, theme);
+            let (circle, status_style) = status_display(status, theme);
             let content_width = usize::from(agents_area.width.saturating_sub(2));
             let title = end_truncate(
                 agent
@@ -311,25 +311,15 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                     .unwrap_or("Untitled conversation"),
                 content_width.saturating_sub(2),
             );
-            let directory = start_truncate(
-                &agent.launch_directory().display().to_string(),
-                content_width.saturating_sub(2),
-            );
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{circle} "), status_style),
+                    Span::styled(format!("{} · ", index + 1), theme.muted()),
                     Span::styled(title, text(theme).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(format!("{} · ", index + 1), theme.muted()),
                     Span::styled(agent.kind().label(), text(theme)),
-                    Span::styled(" · ", theme.muted()),
-                    Span::styled(label, status_style),
-                ]),
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(directory, theme.muted()),
                 ]),
             ];
             if let Some(git) = agent.git() {
@@ -339,7 +329,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
                     .unwrap_or(git.worktree.as_os_str())
                     .to_string_lossy();
                 let value =
-                    paired_truncate(&git.branch, &worktree, content_width.saturating_sub(2));
+                    paired_truncate(&worktree, &git.branch, content_width.saturating_sub(2));
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(value, accent(theme)),
@@ -352,7 +342,7 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     frame.render_stateful_widget(
         List::new(cards)
             .highlight_symbol("▌")
-            .highlight_style(theme.selected()),
+            .highlight_style(sidebar_selection(theme)),
         agents_area,
         &mut state,
     );
@@ -394,20 +384,6 @@ fn end_truncate(value: &str, width: usize) -> String {
     truncated
 }
 
-fn start_truncate(value: &str, width: usize) -> String {
-    let characters = value.chars().collect::<Vec<_>>();
-    let length = characters.len();
-    if length <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    std::iter::once('…')
-        .chain(characters.into_iter().skip(length - (width - 1)))
-        .collect()
-}
-
 fn paired_truncate(left: &str, right: &str, width: usize) -> String {
     const SEPARATOR: &str = " · ";
     if width <= SEPARATOR.chars().count() {
@@ -424,14 +400,22 @@ fn paired_truncate(left: &str, right: &str, width: usize) -> String {
     )
 }
 
-fn status_display(status: AgentDisplayStatus, theme: Theme) -> (&'static str, &'static str, Style) {
+fn status_display(status: AgentDisplayStatus, theme: Theme) -> (&'static str, Style) {
     match status {
-        AgentDisplayStatus::Unknown => ("○", "unknown", theme.muted()),
-        AgentDisplayStatus::Idle => ("○", "idle", theme.muted()),
-        AgentDisplayStatus::Working => ("●", "working", warning(theme)),
-        AgentDisplayStatus::Done => ("●", "done", success(theme)),
-        AgentDisplayStatus::NeedsYou => ("●", "needs you", error(theme)),
-        AgentDisplayStatus::Failed => ("●", "failed", error(theme)),
+        AgentDisplayStatus::Unknown | AgentDisplayStatus::Idle => ("●", theme.muted()),
+        AgentDisplayStatus::Working => ("●", warning(theme)),
+        AgentDisplayStatus::Done => ("●", success(theme)),
+        AgentDisplayStatus::NeedsYou | AgentDisplayStatus::Failed => ("●", error(theme)),
+    }
+}
+
+fn sidebar_selection(theme: Theme) -> Style {
+    if theme.selection == Color::Reset {
+        theme.selected()
+    } else {
+        Style::default()
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -1132,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_cards_show_titles_accessible_status_and_optional_git_context() {
+    fn agent_cards_show_titles_status_markers_and_optional_git_context() {
         let summary = SessionSummary {
             id: SessionId(8),
             running_agents: 1,
@@ -1178,12 +1162,68 @@ mod tests {
             None,
         );
         let rendered = render_app_text(&app);
-        assert!(rendered.contains("Conversation 1"));
-        assert!(rendered.contains("failed"));
-        assert!(rendered.contains("Conversation 2"));
-        assert!(rendered.contains("done"));
-        assert!(rendered.contains("/tmp/project-eight"));
-        assert!(rendered.contains("feature/side… · project-eight"));
+        assert!(rendered.contains("● 1 · Conversation 1"));
+        assert!(rendered.contains("● 2 · Conversation 2"));
+        assert!(!rendered.contains("failed"));
+        assert!(!rendered.contains("done"));
+        assert!(!rendered.contains("/tmp/project-eight"));
+        assert!(rendered.contains("project-eight · feature/side…"));
+
+        let theme = crate::theme::ThemeName::Dark.theme(true);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: None,
+                        embedded: None,
+                        theme,
+                    },
+                )
+            })
+            .unwrap();
+        let circle_colors = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "●")
+            .map(|cell| cell.fg)
+            .collect::<Vec<_>>();
+        assert_eq!(circle_colors, vec![theme.error, theme.ok]);
+    }
+
+    #[test]
+    fn status_markers_share_one_glyph_and_use_semantic_colors() {
+        let theme = crate::theme::ThemeName::Dark.theme(true);
+        assert_eq!(
+            status_display(AgentDisplayStatus::Unknown, theme),
+            status_display(AgentDisplayStatus::Idle, theme)
+        );
+        for status in [
+            AgentDisplayStatus::Unknown,
+            AgentDisplayStatus::Idle,
+            AgentDisplayStatus::Working,
+            AgentDisplayStatus::Done,
+            AgentDisplayStatus::NeedsYou,
+            AgentDisplayStatus::Failed,
+        ] {
+            assert_eq!(status_display(status, theme).0, "●");
+        }
+        assert_eq!(
+            status_display(AgentDisplayStatus::Working, theme).1.fg,
+            Some(theme.warn)
+        );
+        assert_eq!(
+            status_display(AgentDisplayStatus::Done, theme).1.fg,
+            Some(theme.ok)
+        );
+        assert_eq!(
+            status_display(AgentDisplayStatus::NeedsYou, theme).1.fg,
+            Some(theme.error)
+        );
     }
 
     #[test]
@@ -1226,8 +1266,10 @@ mod tests {
         );
 
         let rendered = render_app_text(&app);
-        assert!(rendered.contains("Conversation 8"));
-        assert!(rendered.contains("Claude Code · idle"));
+        assert!(rendered.contains("8 · Conversation 8"));
+        assert!(rendered.contains("Claude Code"));
+        assert!(!rendered.contains("8 · Claude Code"));
+        assert!(!rendered.contains("idle"));
     }
 
     #[test]

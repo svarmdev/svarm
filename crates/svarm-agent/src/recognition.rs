@@ -14,6 +14,11 @@ pub(crate) enum ScreenRecognition {
     Unknown,
 }
 
+pub(crate) struct TitleRecognition {
+    pub conversation_title: Option<String>,
+    pub evidence: RecognitionEvidence,
+}
+
 struct Rule {
     id: &'static str,
     activity: AgentActivity,
@@ -94,6 +99,41 @@ const CLAUDE_RULES: &[Rule] = &[
         excluded: &[],
     },
 ];
+
+pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecognition> {
+    if kind != AgentKind::Codex {
+        return None;
+    }
+    let (status, conversation_title) = title.split_once(" | ").unwrap_or((title, ""));
+    let normalized = normalize(status);
+    let (claim, rule, evidence) = if normalized.contains("action required") {
+        (
+            AgentActivity::Blocked,
+            "codex.title-action-required",
+            "Action Required",
+        )
+    } else if let Some(state) = ["working", "thinking", "waiting"]
+        .into_iter()
+        .find(|state| normalized.contains(state))
+    {
+        (AgentActivity::Working, "codex.title-active", state)
+    } else if normalized == "ready" {
+        (AgentActivity::Idle, "codex.title-ready", "ready")
+    } else {
+        return None;
+    };
+
+    Some(TitleRecognition {
+        conversation_title: (!conversation_title.trim().is_empty())
+            .then(|| conversation_title.trim().to_owned()),
+        evidence: RecognitionEvidence {
+            provider: kind,
+            claim,
+            rule: rule.into(),
+            evidence: evidence.into(),
+        },
+    })
+}
 
 pub(crate) fn recognize(kind: AgentKind, screen: &Screen) -> ScreenRecognition {
     let (_, cols) = screen.size();
@@ -218,6 +258,28 @@ mod tests {
             claim(AgentKind::Codex, &[b"\xe2\x80\xba  \r\n? for shortcuts"]),
             Some(AgentActivity::Idle)
         );
+    }
+
+    #[test]
+    fn codex_title_reports_live_state_and_conversation_name() {
+        for (title, expected) in [
+            ("⠋ Working | Refactor sidebar", AgentActivity::Working),
+            ("⠹ Thinking | Refactor sidebar", AgentActivity::Working),
+            (
+                "[ ! ] Action Required | Refactor sidebar",
+                AgentActivity::Blocked,
+            ),
+            ("Ready | Refactor sidebar", AgentActivity::Idle),
+        ] {
+            let recognized = recognize_title(AgentKind::Codex, title).unwrap();
+            assert_eq!(recognized.evidence.claim, expected);
+            assert_eq!(
+                recognized.conversation_title.as_deref(),
+                Some("Refactor sidebar")
+            );
+        }
+        assert!(recognize_title(AgentKind::Claude, "Ready | Conversation").is_none());
+        assert!(recognize_title(AgentKind::Codex, "Conversation only").is_none());
     }
 
     #[test]
