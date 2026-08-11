@@ -137,6 +137,7 @@ impl AgentSession {
     pub fn stop(&mut self) -> Result<()> {
         if self.poll_status()? == SessionStatus::Running {
             self.child.kill()?;
+            self.child.wait()?;
             self.status = SessionStatus::Exited;
         }
         Ok(())
@@ -225,6 +226,30 @@ mod tests {
         {
             thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(session.poll_status().unwrap(), SessionStatus::Exited);
+    }
+
+    #[test]
+    fn stopping_a_session_reaps_its_process() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        command.cwd(&cwd);
+        let mut session = AgentSession::spawn_command(
+            1,
+            AgentKind::Codex,
+            &cwd,
+            PtySize {
+                rows: 10,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            command,
+        )
+        .unwrap();
+
+        session.stop().unwrap();
         assert_eq!(session.poll_status().unwrap(), SessionStatus::Exited);
     }
 }
