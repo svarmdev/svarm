@@ -10,7 +10,7 @@ Codex and/or Claude Code must already be installed and available on `PATH`.
 
 ```sh
 cargo install --path .
-svarm                         # Choose an agent in the current directory
+svarm                         # Open a clean session in the current directory
 svarm --agent codex           # Codex in the current directory
 svarm --agent claude ../repo  # Claude Code in ../repo
 svarm --new-session ../repo   # Always create a distinct Svarm session

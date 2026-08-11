@@ -285,11 +285,7 @@ impl App {
                 .map(AgentState::from_remote)
                 .collect(),
             selected,
-            mode: if snapshot.agents.is_empty() {
-                Mode::ChooseAgent
-            } else {
-                Mode::Terminal
-            },
+            mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
             theme,
@@ -587,6 +583,23 @@ mod tests {
         assert_eq!(app.exit_intent(), ExitIntent::None);
         assert_eq!(app.workspace_path(), Some(&PathBuf::from("/tmp/project-7")));
         assert!(app.agents()[1].has_unseen_output());
+    }
+
+    #[test]
+    fn empty_session_hydrates_without_opening_the_agent_chooser() {
+        let snapshot = SvarmSessionSnapshot {
+            summary: summary(7, 20),
+            selected_agent_id: None,
+            rows: 24,
+            cols: 80,
+            agents: vec![],
+        };
+
+        let app = App::hydrate(snapshot, ThemeName::Dark, None);
+
+        assert_eq!(app.mode(), Mode::Terminal);
+        assert_eq!(app.selected_agent_id(), None);
+        assert_eq!(app.exit_intent(), ExitIntent::None);
     }
 
     #[test]

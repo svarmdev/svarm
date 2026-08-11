@@ -202,8 +202,7 @@ fn handle_key(
         Mode::ChooseAgent => match key.code {
             KeyCode::Char('c') => spawn(app, agents, AgentKind::Codex)?,
             KeyCode::Char('a') => spawn(app, agents, AgentKind::Claude)?,
-            KeyCode::Esc if app.selected_agent_id().is_some() => app.set_mode(Mode::Terminal),
-            KeyCode::Esc => app.request_detach(),
+            KeyCode::Esc => app.set_mode(Mode::Terminal),
             _ => {}
         },
         Mode::ConfirmClose => match key.code {
