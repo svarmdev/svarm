@@ -102,6 +102,12 @@ impl RuntimePaths {
     pub fn remove_pid(&self) {
         let _ = fs::remove_file(&self.pid);
     }
+
+    /// The process the running server recorded for itself, for the one case where the socket
+    /// cannot be used to reach it: a server from a build whose protocol this one cannot speak.
+    pub fn read_pid(&self) -> Option<u32> {
+        fs::read_to_string(&self.pid).ok()?.trim().parse().ok()
+    }
 }
 
 fn ensure_private_log_directory(path: &Path, uid: u32) -> Result<()> {

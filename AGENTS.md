@@ -1,6 +1,6 @@
 # svarm
 
-Codign agent multiplexer
+A small terminal multiplexer for coding agents
 
 ## Architecture
 
@@ -26,6 +26,8 @@ Codign agent multiplexer
 - `crates/svarm-tui/src/runtime.rs` coordinates adapters and applies their observations to the model.
 - `crates/svarm-tui/src/input.rs` translates terminal input and contains canonical management-key metadata.
 - `crates/svarm-tui/src/ui.rs` renders immutable prepared data; `theme.rs` contains pure semantic styling.
+- `crates/svarm-tui/src/screen.rs` draws an agent's emulated screen, and owns the translation from terminal cell to buffer cell so agent colors and attributes survive rendering.
+- `crates/svarm-tui/src/screen.rs` draws an agent's emulated screen, and owns the translation from terminal cell to buffer cell so agent colors and attributes survive rendering.
 - `src` is only the executable and command-line boundary.
 
 Do not add another crate merely to enforce a conceptual layer. Prefer a focused module until there is a real independent package boundary.

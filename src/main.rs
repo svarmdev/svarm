@@ -1,7 +1,7 @@
 use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::Parser;
@@ -19,7 +19,7 @@ mod client;
 mod server_start;
 
 use cli::{Cli, Command, ServerCommand};
-use client::ControlClient;
+use client::{ControlClient, Probe};
 
 const NONINTERACTIVE_CHOICE_ERROR: &str =
     "session choice requires a terminal; use `--attach --workspace ID` or `--new-session`";
@@ -257,9 +257,15 @@ fn server_status(paths: &RuntimePaths) -> Result<()> {
 }
 
 fn stop_server(paths: &RuntimePaths, yes: bool) -> Result<()> {
-    let Some(status) = ControlClient::probe(&paths.socket)? else {
-        println!("Svarm server is not running");
-        return Ok(());
+    let status = match ControlClient::probe_socket(&paths.socket)? {
+        Probe::None => {
+            println!("Svarm server is not running");
+            return Ok(());
+        }
+        Probe::Running(status) => *status,
+        // Stopping is exactly what a user reaches for after an upgrade, so it has to work against
+        // a server this build cannot talk to. Its own socket is unusable, so signal the process.
+        Probe::Incompatible(reason) => return stop_incompatible_server(paths, yes, &reason),
     };
     let sessions = running_sessions(paths)?;
     let agents = sessions
@@ -279,6 +285,41 @@ fn stop_server(paths: &RuntimePaths, yes: bool) -> Result<()> {
         _ => return Err("Svarm server returned an invalid stop response".into()),
     }
     Ok(())
+}
+
+/// Terminates a server that cannot be asked to stop. The signal is the same one the server handles
+/// gracefully when the terminal sends it, so agents are still shut down in order.
+fn stop_incompatible_server(paths: &RuntimePaths, yes: bool, reason: &str) -> Result<()> {
+    let Some(pid) = paths.read_pid() else {
+        return Err(format!(
+            "{reason}\nThe running server did not record its process, so it cannot be stopped \
+             automatically."
+        )
+        .into());
+    };
+    println!("A Svarm server from a different build is running as process {pid}.");
+    println!("{reason}");
+    if !yes && !confirm("Stop it and every agent it owns?")? {
+        return Ok(());
+    }
+    // SAFETY: kill with a valid signal has no preconditions; a stale PID simply fails.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "could not stop Svarm server process {pid}: {}",
+            io::Error::last_os_error()
+        )
+        .into());
+    }
+
+    let deadline = SystemTime::now() + Duration::from_secs(5);
+    while SystemTime::now() < deadline {
+        if matches!(ControlClient::probe_socket(&paths.socket)?, Probe::None) {
+            println!("Svarm server stopped.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("Svarm server process {pid} did not exit").into())
 }
 
 fn running_sessions(paths: &RuntimePaths) -> Result<Vec<SessionSummary>> {

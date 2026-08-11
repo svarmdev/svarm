@@ -12,13 +12,22 @@ use svarm_agent::{
     server::{ServerConfig, run_foreground_ready},
 };
 
-use crate::client::ControlClient;
+use crate::client::{ControlClient, Probe};
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(3);
 
 pub fn ensure_server(paths: &RuntimePaths) -> Result<()> {
-    if ControlClient::probe(&paths.socket)?.is_some() {
-        return Ok(());
+    match ControlClient::probe_socket(&paths.socket)? {
+        Probe::Running(_) => return Ok(()),
+        // Starting a second server is not an option: the running one owns the socket and the
+        // lock. Name the command that clears it rather than reporting a handshake failure.
+        Probe::Incompatible(reason) => {
+            return Err(format!(
+                "{reason}\nRun `svarm server stop` to stop it, then start Svarm again."
+            )
+            .into());
+        }
+        Probe::None => {}
     }
     let executable = std::env::current_exe()?;
     let server_log = logging::writer(&paths.server_log)

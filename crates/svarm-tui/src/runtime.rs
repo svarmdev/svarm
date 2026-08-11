@@ -1,8 +1,7 @@
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{path::PathBuf, sync::mpsc};
 
 use crossterm::event::{
-    self, Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use svarm_agent::{AgentKind, Result, TerminalPalette, protocol::Event as ServerEvent};
@@ -41,7 +40,7 @@ pub fn run(kind: Option<AgentKind>, socket_path: PathBuf, target: InitialSession
     }
 
     let mut terminal = TerminalSession::open()?;
-    spawn_host_input(events_tx);
+    terminal.spawn_input(move |event| events_tx.send(ClientEvent::Host(event)).is_ok());
     let mut dirty = true;
     let mut connection_failure = None;
     while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
@@ -115,18 +114,6 @@ fn canonicalize_target(target: InitialSession) -> Result<InitialSession> {
         }
         target => Ok(target),
     }
-}
-
-/// Reads host input on its own thread so the interface can block on one channel carrying both
-/// keystrokes and server frames, and never has to wake up just to check whether input arrived.
-fn spawn_host_input(events: mpsc::SyncSender<ClientEvent>) {
-    thread::spawn(move || {
-        while let Ok(event) = event::read() {
-            if events.send(ClientEvent::Host(event)).is_err() {
-                break;
-            }
-        }
-    });
 }
 
 fn handle_host_event(

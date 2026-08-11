@@ -1,10 +1,10 @@
-use std::io;
+use std::{io, thread};
 
 use crossterm::{
     cursor::{SetCursorStyle, Show},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -60,6 +60,21 @@ impl TerminalSession {
 
     pub fn terminal(&mut self) -> &mut SvarmTerminal {
         &mut self.terminal
+    }
+
+    /// Reads host input on its own thread, so the interface can block on one channel carrying both
+    /// keystrokes and server frames instead of waking up to check whether input arrived.
+    ///
+    /// Started after the terminal is configured, so the first read already sees raw mode, the
+    /// bracketed paste and mouse modes, and any keyboard enhancement this session enabled.
+    pub fn spawn_input(&self, mut deliver: impl FnMut(Event) -> bool + Send + 'static) {
+        thread::spawn(move || {
+            while let Ok(event) = event::read() {
+                if !deliver(event) {
+                    break;
+                }
+            }
+        });
     }
 
     /// Asks the host terminal for the cursor the agent requested. `Default` restores the user's
