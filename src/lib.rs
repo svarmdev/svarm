@@ -4,6 +4,7 @@ pub mod app;
 pub mod cli;
 pub mod input;
 pub mod session;
+pub mod ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {

@@ -8,4 +8,5 @@ description = "A small terminal multiplexer for coding agents"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 portable-pty = "0.9"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 tui-term = "0.3"
