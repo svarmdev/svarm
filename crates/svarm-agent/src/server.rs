@@ -1687,6 +1687,14 @@ mod tests {
     }
 
     #[test]
+    fn relative_agent_directories_are_canonicalized_at_the_server_edge() {
+        assert_eq!(
+            canonicalize_agent_directory(Path::new(".")).unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn one_session_launches_agents_in_distinct_validated_directories() {
         let directory = temp_dir();
         let first = directory.join("first");
@@ -1754,8 +1762,32 @@ mod tests {
         assert_eq!(snapshot.agents.len(), 2);
         assert_eq!(snapshot.selected_agent_id, Some(snapshot.agents[1].id));
 
-        let _ = client.request(Request::StopAttachedSession { lease_token });
+        let _ = client.request(Request::DetachSession { lease_token });
         drop(client);
+        let mut reattached = Client::connect(&socket, ConnectionRole::Interactive);
+        let (_, attached) = reattached.request(Request::AttachSession {
+            session_id,
+            rows: 10,
+            cols: 40,
+            palette: None,
+            takeover: false,
+        });
+        let reattached_lease = match attached {
+            Response::Attached { lease_token, .. } => lease_token,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let restored = reattached.event_until(|event| {
+            matches!(event, Event::SvarmSessionSnapshot(snapshot) if snapshot.agents.len() == 2)
+        });
+        let Event::SvarmSessionSnapshot(restored) = restored else {
+            unreachable!()
+        };
+        assert_eq!(restored.agents[0].launch_directory, first);
+        assert_eq!(restored.agents[1].launch_directory, second);
+        let _ = reattached.request(Request::StopAttachedSession {
+            lease_token: reattached_lease,
+        });
+        drop(reattached);
         let _ = control.request(Request::StopServer { confirmed: true });
         drop(control);
         server.join().unwrap();

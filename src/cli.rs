@@ -127,4 +127,43 @@ mod tests {
         assert_eq!(current.session, Some(7));
         assert_eq!(alias.session, Some(8));
     }
+
+    #[test]
+    fn documented_agent_workspace_invocations_parse_without_session_path_semantics() {
+        let path_only = Cli::try_parse_from(["svarm", "/tmp/workspace"]).unwrap();
+        assert_eq!(path_only.path, Some(PathBuf::from("/tmp/workspace")));
+        assert_eq!(path_only.agent, None);
+
+        let direct = Cli::try_parse_from(["svarm", "--agent", "codex", "/tmp/workspace"]).unwrap();
+        assert_eq!(direct.agent, Some(AgentKind::Codex));
+        assert_eq!(direct.path, Some(PathBuf::from("/tmp/workspace")));
+
+        let remembered = Cli::try_parse_from(["svarm", "--agent", "claude"]).unwrap();
+        assert_eq!(remembered.agent, Some(AgentKind::Claude));
+        assert_eq!(remembered.path, None);
+
+        let new = Cli::try_parse_from(["svarm", "--new-session", "/tmp/workspace"]).unwrap();
+        assert!(new.new_session);
+        assert_eq!(new.path, Some(PathBuf::from("/tmp/workspace")));
+
+        let attached = Cli::try_parse_from([
+            "svarm",
+            "--attach",
+            "--session",
+            "7",
+            "--agent",
+            "codex",
+            "/tmp/workspace",
+        ])
+        .unwrap();
+        assert_eq!(attached.session, Some(7));
+        assert_eq!(attached.agent, Some(AgentKind::Codex));
+        assert_eq!(attached.path, Some(PathBuf::from("/tmp/workspace")));
+    }
+
+    #[test]
+    fn noninteractive_stop_confirmation_requires_a_session_id() {
+        assert!(Cli::try_parse_from(["svarm", "stop", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["svarm", "stop", "--session", "7", "--yes"]).is_ok());
+    }
 }
