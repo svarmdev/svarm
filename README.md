@@ -57,6 +57,10 @@ The workspace is split by responsibility:
 - `svarm-tui` owns application state, terminal input, rendering, themes, and settings.
 - the root `svarm` package contains only the executable entry point and CLI arguments.
 
+Inside `svarm-tui`, the application model contains no terminal, process, or filesystem
+resources. Runtime adapters prepare immutable observations for state updates and rendering,
+while the renderer only draws the prepared frame.
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings

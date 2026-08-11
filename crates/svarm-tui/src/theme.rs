@@ -60,11 +60,12 @@ impl ThemeName {
         *self = Self::ALL[next];
     }
 
-    pub fn theme(self) -> Theme {
-        if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
-            return Self::Monochrome.palette();
+    pub fn theme(self, colors_enabled: bool) -> Theme {
+        if colors_enabled {
+            self.palette()
+        } else {
+            Self::Monochrome.palette()
         }
-        self.palette()
     }
 
     fn palette(self) -> Theme {
@@ -291,5 +292,13 @@ mod tests {
                     .any(|other| other.palette() == palette)
             );
         }
+    }
+
+    #[test]
+    fn disabled_colors_always_use_the_monochrome_palette() {
+        assert_eq!(
+            ThemeName::TokyoNight.theme(false),
+            ThemeName::Monochrome.palette()
+        );
     }
 }

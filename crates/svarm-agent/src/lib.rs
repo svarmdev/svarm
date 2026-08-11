@@ -1,9 +1,20 @@
 use std::{fmt, str::FromStr};
 
 mod session;
+mod terminal;
 
 pub use portable_pty::PtySize;
-pub use session::{AgentSession, Result, SessionStatus, TerminalPalette};
+pub use session::{AgentSession, Result, SessionSnapshot, SessionStatus};
+pub use terminal::TerminalPalette;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AgentId(u64);
+
+impl AgentId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {

@@ -13,6 +13,40 @@ pub struct Settings {
     pub theme: ThemeName,
 }
 
+pub(crate) struct SettingsStore {
+    path: Option<PathBuf>,
+}
+
+impl SettingsStore {
+    pub fn discover() -> Self {
+        Self {
+            path: settings_path(),
+        }
+    }
+
+    pub fn load(&self) -> (ThemeName, Option<String>) {
+        let Some(path) = self.path.as_deref() else {
+            return (ThemeName::default(), None);
+        };
+        match Settings::load(path) {
+            Ok(settings) => (settings.theme, None),
+            Err(error) => (
+                ThemeName::default(),
+                Some(format!("could not load {}: {error}", path.display())),
+            ),
+        }
+    }
+
+    pub fn save_theme(&self, theme: ThemeName) -> Result<(), String> {
+        let Some(path) = self.path.as_deref() else {
+            return Err("could not save settings: HOME is not set".into());
+        };
+        (Settings { theme })
+            .save(path)
+            .map_err(|error| format!("could not save {}: {error}", path.display()))
+    }
+}
+
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         match fs::read(path) {
@@ -31,7 +65,7 @@ impl Settings {
     }
 }
 
-pub fn settings_path() -> Option<PathBuf> {
+fn settings_path() -> Option<PathBuf> {
     env::var_os("XDG_CONFIG_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)

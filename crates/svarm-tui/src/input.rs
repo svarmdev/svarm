@@ -3,6 +3,87 @@ use crossterm::event::{
 };
 use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagementCommand {
+    LiteralPrefix,
+    NextAgent,
+    PreviousAgent,
+    ChooseAgent,
+    CloseAgent,
+    ConfirmQuit,
+    ToggleSidebar,
+    OpenMenu,
+    OpenKeybinds,
+    SelectAgent(usize),
+    Cancel,
+    Unknown,
+}
+
+pub(crate) struct Keybinding {
+    pub keys: &'static str,
+    pub action: &'static str,
+}
+
+pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
+    Keybinding {
+        keys: "Ctrl+B, j/k or arrows",
+        action: "next/previous agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, 1..9",
+        action: "select agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, n",
+        action: "start an agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, x",
+        action: "close selected agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, b",
+        action: "toggle sidebar",
+    },
+    Keybinding {
+        keys: "Ctrl+B, m",
+        action: "open menu",
+    },
+    Keybinding {
+        keys: "Ctrl+B, Ctrl+B",
+        action: "send Ctrl+B to agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, q",
+        action: "stop all agents and quit",
+    },
+];
+
+pub(crate) fn is_management_prefix(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL
+}
+
+pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
+    match key.code {
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ManagementCommand::LiteralPrefix
+        }
+        KeyCode::Char('j') | KeyCode::Down => ManagementCommand::NextAgent,
+        KeyCode::Char('k') | KeyCode::Up => ManagementCommand::PreviousAgent,
+        KeyCode::Char('n') => ManagementCommand::ChooseAgent,
+        KeyCode::Char('x') => ManagementCommand::CloseAgent,
+        KeyCode::Char('q') => ManagementCommand::ConfirmQuit,
+        KeyCode::Char('b') => ManagementCommand::ToggleSidebar,
+        KeyCode::Char('m') => ManagementCommand::OpenMenu,
+        KeyCode::Char('?') => ManagementCommand::OpenKeybinds,
+        KeyCode::Char(digit @ '1'..='9') => {
+            ManagementCommand::SelectAgent(digit as usize - '1' as usize)
+        }
+        KeyCode::Esc => ManagementCommand::Cancel,
+        _ => ManagementCommand::Unknown,
+    }
+}
+
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~"].concat()
@@ -284,6 +365,22 @@ mod tests {
         assert_eq!(
             encode_mouse(event, MouseProtocolMode::None, MouseProtocolEncoding::Sgr),
             None
+        );
+    }
+
+    #[test]
+    fn management_keys_have_one_canonical_mapping() {
+        assert!(is_management_prefix(key(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        )));
+        assert_eq!(
+            management_command(key(KeyCode::Char('2'), KeyModifiers::NONE)),
+            ManagementCommand::SelectAgent(1)
+        );
+        assert_eq!(
+            management_command(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            ManagementCommand::LiteralPrefix
         );
     }
 }

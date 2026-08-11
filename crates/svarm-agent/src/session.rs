@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,10 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use tui_term::vt100::Parser;
 
-use crate::AgentKind;
+use crate::{
+    AgentId, AgentKind,
+    terminal::{ColorQueryDetector, TerminalPalette, color_query_responses},
+};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -21,45 +24,9 @@ pub enum SessionStatus {
     Exited,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct TerminalPalette {
-    foreground: [u16; 3],
-    background: [u16; 3],
-}
-
-impl TerminalPalette {
-    pub fn detect() -> Option<Self> {
-        let palette = terminal_colorsaurus::color_palette(Default::default()).ok()?;
-        Some(Self {
-            foreground: [
-                palette.foreground.r,
-                palette.foreground.g,
-                palette.foreground.b,
-            ],
-            background: [
-                palette.background.r,
-                palette.background.g,
-                palette.background.b,
-            ],
-        })
-    }
-
-    fn response(self, slot: u8) -> Option<String> {
-        let [red, green, blue] = match slot {
-            10 => self.foreground,
-            11 => self.background,
-            _ => return None,
-        };
-        Some(format!(
-            "\x1b]{slot};rgb:{red:04x}/{green:04x}/{blue:04x}\x1b\\"
-        ))
-    }
-}
-
 pub struct AgentSession {
-    pub id: u64,
-    pub kind: AgentKind,
-    pub cwd: PathBuf,
+    id: AgentId,
+    kind: AgentKind,
     parser: Arc<Mutex<Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
@@ -69,9 +36,18 @@ pub struct AgentSession {
     read_error: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSnapshot {
+    pub id: AgentId,
+    pub kind: AgentKind,
+    pub status: SessionStatus,
+    pub output_generation: u64,
+    pub read_error: Option<String>,
+}
+
 impl AgentSession {
     pub fn spawn(
-        id: u64,
+        id: AgentId,
         kind: AgentKind,
         cwd: &Path,
         size: PtySize,
@@ -82,7 +58,7 @@ impl AgentSession {
     }
 
     fn spawn_command(
-        id: u64,
+        id: AgentId,
         kind: AgentKind,
         cwd: &Path,
         size: PtySize,
@@ -122,7 +98,6 @@ impl AgentSession {
         Ok(Self {
             id,
             kind,
-            cwd: cwd.to_path_buf(),
             parser,
             writer,
             master: pair.master,
@@ -161,15 +136,11 @@ impl AgentSession {
         Ok(())
     }
 
-    pub fn poll_status(&mut self) -> Result<SessionStatus> {
+    fn poll_status(&mut self) -> Result<SessionStatus> {
         if self.status == SessionStatus::Running && self.child.try_wait()?.is_some() {
             self.status = SessionStatus::Exited;
         }
         Ok(self.status)
-    }
-
-    pub const fn status(&self) -> SessionStatus {
-        self.status
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -181,15 +152,30 @@ impl AgentSession {
         Ok(())
     }
 
-    pub fn generation(&self) -> u64 {
+    fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub fn read_error(&self) -> Option<String> {
+    fn read_error(&self) -> Option<String> {
         self.read_error
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    pub fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            id: self.id,
+            kind: self.kind,
+            status: self.status,
+            output_generation: self.generation(),
+            read_error: self.read_error(),
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<SessionSnapshot> {
+        self.poll_status()?;
+        Ok(self.snapshot())
     }
 }
 
@@ -227,15 +213,13 @@ fn spawn_reader(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    color_queries.process(&buffer[..count], |slot| {
-                        let Some(response) = palette.and_then(|palette| palette.response(slot))
-                        else {
-                            return;
-                        };
+                    for response in
+                        color_query_responses(&mut color_queries, palette, &buffer[..count])
+                    {
                         let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
                         let _ = writer.write_all(response.as_bytes());
                         let _ = writer.flush();
-                    });
+                    }
                     parser
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
@@ -251,43 +235,6 @@ fn spawn_reader(
             }
         }
     });
-}
-
-#[derive(Default)]
-struct ColorQueryDetector {
-    pending: Vec<u8>,
-}
-
-impl ColorQueryDetector {
-    fn process(&mut self, bytes: &[u8], mut respond: impl FnMut(u8)) {
-        const QUERIES: [(&[u8], u8); 4] = [
-            (b"\x1b]10;?\x1b\\", 10),
-            (b"\x1b]11;?\x1b\\", 11),
-            (b"\x1b]10;?\x07", 10),
-            (b"\x1b]11;?\x07", 11),
-        ];
-
-        self.pending.extend_from_slice(bytes);
-        while let Some((position, pattern, slot)) = QUERIES
-            .iter()
-            .filter_map(|(pattern, slot)| {
-                self.pending
-                    .windows(pattern.len())
-                    .position(|window| window == *pattern)
-                    .map(|position| (position, *pattern, *slot))
-            })
-            .min_by_key(|(position, _, _)| *position)
-        {
-            respond(slot);
-            self.pending.drain(..position + pattern.len());
-        }
-
-        const MAX_PARTIAL_QUERY_LEN: usize = 7;
-        if self.pending.len() > MAX_PARTIAL_QUERY_LEN {
-            self.pending
-                .drain(..self.pending.len() - MAX_PARTIAL_QUERY_LEN);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -314,7 +261,7 @@ mod tests {
         command.args(["-c", "printf svarm"]);
         command.cwd(&cwd);
         let mut session = AgentSession::spawn_command(
-            1,
+            AgentId::new(1),
             AgentKind::Codex,
             &cwd,
             PtySize {
@@ -348,7 +295,7 @@ mod tests {
         command.args(["-c", "exec sleep 60"]);
         command.cwd(&cwd);
         let mut session = AgentSession::spawn_command(
-            1,
+            AgentId::new(1),
             AgentKind::Codex,
             &cwd,
             PtySize {
@@ -364,33 +311,5 @@ mod tests {
 
         session.stop().unwrap();
         assert_eq!(session.poll_status().unwrap(), SessionStatus::Exited);
-    }
-
-    #[test]
-    fn terminal_palette_formats_osc_color_responses() {
-        let palette = TerminalPalette {
-            foreground: [0xaaaa, 0xbbbb, 0xcccc],
-            background: [0x1111, 0x2222, 0x3333],
-        };
-
-        assert_eq!(
-            palette.response(10).as_deref(),
-            Some("\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\")
-        );
-        assert_eq!(
-            palette.response(11).as_deref(),
-            Some("\x1b]11;rgb:1111/2222/3333\x1b\\")
-        );
-    }
-
-    #[test]
-    fn detects_split_osc_color_queries() {
-        let mut detector = ColorQueryDetector::default();
-        let mut slots = Vec::new();
-
-        detector.process(b"before\x1b]10;?\x1b", |slot| slots.push(slot));
-        detector.process(b"\\middle\x1b]11;?\x07after", |slot| slots.push(slot));
-
-        assert_eq!(slots, [10, 11]);
     }
 }
