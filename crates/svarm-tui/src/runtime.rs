@@ -73,13 +73,9 @@ pub fn run(
     let explicit_kind = initial_agent.kind;
     let explicit_workspace = initial_agent.workspace;
     let default_kind = explicit_kind.or(settings_value.last_agent);
-    let default_workspace = explicit_workspace.clone().or_else(|| {
-        settings_value
-            .workspaces
-            .iter()
-            .find(|path| path.is_dir())
-            .cloned()
-    });
+    let default_workspace = explicit_workspace
+        .clone()
+        .or_else(|| remembered_workspace(&settings_value));
     if explicit_kind.is_some()
         && let (Some(kind), Some(launch_directory)) = (default_kind, default_workspace.clone())
     {
@@ -400,11 +396,7 @@ fn handle_management_command(
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::ChooseAgent => app.open_new_agent(
-            settings
-                .workspaces
-                .iter()
-                .find(|path| path.is_dir())
-                .cloned(),
+            remembered_workspace(settings),
             settings.last_agent,
             workspace_choices(settings, None),
         ),
@@ -821,6 +813,14 @@ fn workspace_choices(settings: &Settings, extra: Option<&PathBuf>) -> Vec<Worksp
     choices
 }
 
+fn remembered_workspace(settings: &Settings) -> Option<PathBuf> {
+    settings
+        .workspaces
+        .first()
+        .filter(|path| path.is_dir())
+        .cloned()
+}
+
 fn sync_selection(app: &App, agents: &mut RemoteAgents) -> Result<()> {
     if let Some(id) = app.selected_agent_id() {
         agents.select(id)?;
@@ -897,5 +897,18 @@ mod tests {
         );
         assert!(revoked.lines().all(|line| line.chars().count() <= 80));
         assert!(revoked.starts_with("another client explicitly took over"));
+    }
+
+    #[test]
+    fn a_missing_most_recent_workspace_does_not_silently_select_an_older_one() {
+        let settings = Settings {
+            workspaces: vec![
+                PathBuf::from("/svarm-test-definitely-missing"),
+                std::env::current_dir().unwrap(),
+            ],
+            ..Settings::default()
+        };
+
+        assert_eq!(remembered_workspace(&settings), None);
     }
 }
