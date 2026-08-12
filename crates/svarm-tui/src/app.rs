@@ -226,8 +226,8 @@ impl MenuItem {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Detach => "Detach — agents keep running",
-            Self::StopSession => "Stop session — terminates all agents",
+            Self::Detach => "Detach",
+            Self::StopSession => "Stop session",
             Self::Keybinds => "Keybinds",
             Self::Settings => "Settings",
         }

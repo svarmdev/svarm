@@ -1964,13 +1964,13 @@ mod tests {
         );
         app.set_mode(Mode::Keybinds);
         let keybinds = render_app_text(&app);
-        assert!(keybinds.contains("detach — agents keep running"));
-        assert!(keybinds.contains("stop session — terminates all agents"));
+        assert!(keybinds.contains("detach"));
+        assert!(keybinds.contains("stop session"));
 
         app.set_mode(Mode::Menu);
         let menu = render_app_text(&app);
-        assert!(menu.contains("Detach — agents keep running"));
-        assert!(menu.contains("Stop session — terminates all agents"));
+        assert!(menu.contains("Detach"));
+        assert!(menu.contains("Stop session"));
         assert!(menu.contains("[1] Detach"));
         assert!(menu.contains("[4] Settings"));
     }
