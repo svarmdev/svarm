@@ -61,7 +61,10 @@ struct CachedTerminal {
     snapshot: TerminalSnapshot,
     tracker: TerminalFrameTracker,
     scrollback: Option<ScrollbackView>,
+    /// The request currently awaiting a viewport response.
     scrollback_request: Option<usize>,
+    /// The latest offset requested by input while a response is in flight.
+    scrollback_target: Option<usize>,
 }
 
 struct ScrollbackView {
@@ -246,8 +249,9 @@ impl RemoteAgents {
                     }
                 }
                 Message::Event(Event::TerminalViewport(viewport)) => {
-                    self.apply_viewport(viewport);
-                    updates.push(RemoteUpdate::TerminalChanged);
+                    if self.apply_viewport(viewport) {
+                        updates.push(RemoteUpdate::TerminalChanged);
+                    }
                 }
                 Message::Event(event) => {
                     if let Event::AgentRemoved { agent_id, .. } = &event {
@@ -312,7 +316,7 @@ impl RemoteAgents {
             return Ok(());
         };
         let current = terminal
-            .scrollback_request
+            .scrollback_target
             .or_else(|| terminal.scrollback.as_ref().map(|view| view.offset))
             .unwrap_or(0);
         let requested = if rows >= 0 {
@@ -324,8 +328,19 @@ impl RemoteAgents {
             self.show_live(agent_id);
             return Ok(());
         }
-        if let Some(terminal) = self.terminals.get_mut(&agent_id) {
-            terminal.scrollback_request = Some(requested);
+        let send = if let Some(terminal) = self.terminals.get_mut(&agent_id) {
+            terminal.scrollback_target = Some(requested);
+            if terminal.scrollback_request.is_none() {
+                terminal.scrollback_request = Some(requested);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !send {
+            return Ok(());
         }
         self.send(Request::TerminalViewport {
             lease_token: self.lease_token.clone(),
@@ -338,7 +353,7 @@ impl RemoteAgents {
         let Some(terminal) = self.terminals.get_mut(&agent_id) else {
             return false;
         };
-        terminal.scrollback_request = None;
+        terminal.scrollback_target = None;
         terminal.scrollback.take().is_some()
     }
 
@@ -404,6 +419,7 @@ impl RemoteAgents {
         for terminal in self.terminals.values_mut() {
             terminal.scrollback = None;
             terminal.scrollback_request = None;
+            terminal.scrollback_target = None;
         }
         self.send(Request::ResizeSession {
             lease_token: self.lease_token.clone(),
@@ -467,12 +483,14 @@ impl RemoteAgents {
                 tracker: TerminalFrameTracker::default(),
                 scrollback: None,
                 scrollback_request: None,
+                scrollback_target: None,
             });
         let disposition = terminal.tracker.accept_full(frame.sequence);
         if disposition == FrameDisposition::Apply {
             terminal.snapshot = frame.snapshot;
             terminal.scrollback = None;
             terminal.scrollback_request = None;
+            terminal.scrollback_target = None;
             self.pending_resync.remove(&frame.agent_id);
         }
         disposition
@@ -482,42 +500,53 @@ impl RemoteAgents {
         let Some(terminal) = self.terminals.get_mut(&frame.agent_id) else {
             return FrameDisposition::Gap;
         };
-        let snapshot = match terminal.snapshot.applied(&frame.diff) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                terminal.tracker.reset();
-                return FrameDisposition::Gap;
-            }
-        };
         let disposition = terminal
             .tracker
             .accept_diff(frame.base_sequence, frame.sequence);
         if disposition == FrameDisposition::Apply {
-            terminal.snapshot = snapshot;
+            if terminal.snapshot.apply(&frame.diff).is_err() {
+                terminal.tracker.reset();
+                return FrameDisposition::Gap;
+            }
         }
         disposition
     }
 
-    fn apply_viewport(&mut self, viewport: TerminalViewport) {
+    fn apply_viewport(&mut self, viewport: TerminalViewport) -> bool {
         let Some(terminal) = self.terminals.get_mut(&viewport.agent_id) else {
-            return;
+            return false;
         };
         if terminal.scrollback_request != Some(viewport.requested_scrollback) {
-            return;
+            return false;
+        }
+        terminal.scrollback_request = None;
+        if terminal.scrollback_target != Some(viewport.requested_scrollback) {
+            let Some(requested) = terminal.scrollback_target else {
+                return false;
+            };
+            terminal.scrollback_request = Some(requested);
+            let request = Request::TerminalViewport {
+                lease_token: self.lease_token.clone(),
+                agent_id: viewport.agent_id,
+                scrollback: requested,
+            };
+            let _ = self.send(request);
+            return false;
         }
         if viewport.scrollback == 0 {
             terminal.scrollback = None;
-            terminal.scrollback_request = None;
-            return;
+            terminal.scrollback_target = None;
+            return true;
         }
         if viewport.snapshot.validate().is_err() {
-            return;
+            return false;
         }
         terminal.scrollback = Some(ScrollbackView {
             snapshot: viewport.snapshot,
             offset: viewport.scrollback,
         });
-        terminal.scrollback_request = Some(viewport.scrollback);
+        terminal.scrollback_target = Some(viewport.scrollback);
+        true
     }
 
     fn after_frame(
@@ -767,6 +796,7 @@ mod tests {
                     tracker: TerminalFrameTracker::default(),
                     scrollback: None,
                     scrollback_request: Some(4),
+                    scrollback_target: Some(4),
                 },
             )]),
             pending_resync: HashSet::new(),
@@ -797,6 +827,7 @@ mod tests {
                 tracker: TerminalFrameTracker::default(),
                 scrollback: None,
                 scrollback_request: None,
+                scrollback_target: None,
             }
         };
         let mut agents = RemoteAgents {
@@ -859,6 +890,7 @@ mod tests {
                     tracker: TerminalFrameTracker::default(),
                     scrollback: None,
                     scrollback_request: None,
+                    scrollback_target: None,
                 },
             )]),
             pending_resync: HashSet::new(),
@@ -867,32 +899,38 @@ mod tests {
         agents.scroll(id, 3).unwrap();
         agents.scroll(id, 3).unwrap();
 
-        let offsets = [(); 2].map(|()| {
-            let envelope: Envelope = read_frame(&mut peer).unwrap().unwrap();
-            let Message::Request(Request::TerminalViewport { scrollback, .. }) = envelope.message
-            else {
-                panic!("expected viewport request");
-            };
-            scrollback
-        });
-        assert_eq!(offsets, [3, 6]);
+        let envelope: Envelope = read_frame(&mut peer).unwrap().unwrap();
+        let Message::Request(Request::TerminalViewport { scrollback, .. }) = envelope.message
+        else {
+            panic!("expected viewport request");
+        };
+        assert_eq!(scrollback, 3);
 
-        agents.apply_viewport(TerminalViewport {
+        assert!(!agents.apply_viewport(TerminalViewport {
             agent_id: id,
             requested_scrollback: 3,
             scrollback: 3,
             snapshot: snapshot("stale"),
-        });
+        }));
         assert!(agents.terminals[&id].scrollback.is_none());
         assert_eq!(agents.terminals[&id].scrollback_request, Some(6));
+        assert_eq!(agents.terminals[&id].scrollback_target, Some(6));
 
-        agents.apply_viewport(TerminalViewport {
+        let envelope: Envelope = read_frame(&mut peer).unwrap().unwrap();
+        let Message::Request(Request::TerminalViewport { scrollback, .. }) = envelope.message
+        else {
+            panic!("expected coalesced viewport request");
+        };
+        assert_eq!(scrollback, 6);
+
+        assert!(agents.apply_viewport(TerminalViewport {
             agent_id: id,
             requested_scrollback: 6,
             scrollback: 5,
             snapshot: snapshot("latest"),
-        });
+        }));
         assert_eq!(agents.terminals[&id].scrollback.as_ref().unwrap().offset, 5);
-        assert_eq!(agents.terminals[&id].scrollback_request, Some(5));
+        assert_eq!(agents.terminals[&id].scrollback_request, None);
+        assert_eq!(agents.terminals[&id].scrollback_target, Some(5));
     }
 }

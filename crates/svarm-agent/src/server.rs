@@ -201,7 +201,13 @@ impl OutgoingQueue {
             return QueueResult::Full;
         }
         if state.frames.len() == CONNECTION_QUEUE {
-            let Some((agent_id, full)) = terminal_frame(envelope.as_ref()) else {
+            let incoming_terminal = terminal_frame(envelope.as_ref());
+            let Some((agent_id, full)) = incoming_terminal.or_else(|| {
+                state
+                    .frames
+                    .iter()
+                    .find_map(|queued| terminal_frame(queued.as_ref()))
+            }) else {
                 return QueueResult::Full;
             };
             state.frames.retain(|queued| {
@@ -209,6 +215,11 @@ impl OutgoingQueue {
             });
             if state.frames.len() == CONNECTION_QUEUE {
                 return QueueResult::Full;
+            }
+            if incoming_terminal.is_none() {
+                state.frames.push_back(envelope);
+                self.ready.notify_one();
+                return QueueResult::NeedsFull(agent_id);
             }
             if !full {
                 return QueueResult::NeedsFull(agent_id);
@@ -1688,6 +1699,7 @@ fn terminal_frame(envelope: &Envelope) -> Option<(AgentId, bool)> {
     match &envelope.message {
         Message::Event(Event::TerminalFull(frame)) => Some((frame.agent_id, true)),
         Message::Event(Event::TerminalDiff(frame)) => Some((frame.agent_id, false)),
+        Message::Event(Event::TerminalViewport(frame)) => Some((frame.agent_id, true)),
         _ => None,
     }
 }
@@ -2560,6 +2572,63 @@ mod tests {
             QueueResult::Queued
         ));
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn terminal_queue_pressure_preserves_control_responses() {
+        let queue = OutgoingQueue::new();
+        for sequence in 1..=CONNECTION_QUEUE as u64 {
+            assert!(matches!(
+                queue.push(Box::new(terminal_envelope(false, sequence))),
+                QueueResult::Queued
+            ));
+        }
+        let response = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some(RequestId(99)),
+            message: Message::Response(Response::Ok),
+        };
+
+        assert!(matches!(
+            queue.push(Box::new(response)),
+            QueueResult::NeedsFull(agent_id) if agent_id == AgentId::new(1)
+        ));
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            Message::Response(Response::Ok)
+        ));
+    }
+
+    #[test]
+    fn viewport_replaces_obsolete_terminal_frames_under_pressure() {
+        let queue = OutgoingQueue::new();
+        for sequence in 1..=CONNECTION_QUEUE as u64 {
+            assert!(matches!(
+                queue.push(Box::new(terminal_envelope(false, sequence))),
+                QueueResult::Queued
+            ));
+        }
+        let viewport = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            message: Message::Event(Event::TerminalViewport(TerminalViewport {
+                agent_id: AgentId::new(1),
+                requested_scrollback: 20,
+                scrollback: 20,
+                snapshot: TerminalSnapshot::blank(TerminalSize::new(1, 1)),
+            })),
+        };
+
+        assert!(matches!(
+            queue.push(Box::new(viewport)),
+            QueueResult::Queued
+        ));
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            Message::Event(Event::TerminalViewport(_))
+        ));
     }
 
     fn terminal_event_contains(event: &Event, needle: &str) -> bool {
