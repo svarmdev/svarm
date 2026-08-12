@@ -71,12 +71,12 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
     },
     Keybinding {
         keys: "Ctrl+B, d",
-        action: "detach — agents keep running",
+        action: "detach",
         command: ManagementCommand::Detach,
     },
     Keybinding {
         keys: "Ctrl+B, q",
-        action: "stop session — terminates all agents",
+        action: "stop session",
         command: ManagementCommand::ConfirmQuit,
     },
     Keybinding {
@@ -232,8 +232,7 @@ mod tests {
         assert!(
             MANAGEMENT_KEYBINDINGS
                 .iter()
-                .any(|binding| binding.keys == "Ctrl+B, d"
-                    && binding.action.contains("keep running"))
+                .any(|binding| binding.keys == "Ctrl+B, d" && binding.action == "detach")
         );
     }
 

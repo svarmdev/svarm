@@ -19,6 +19,7 @@ use crate::{
     git,
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
+    naming::TitleNamer,
     protocol::{
         AgentActivity, AgentSnapshot, ArchivedConversation, ConnectionId, ConnectionRole, Envelope,
         ErrorCode, Event, GitContext, KeyCode, KeyInput, LeaseToken, Message, ProtocolError,
@@ -310,6 +311,7 @@ struct SessionRuntime {
     git_checked: HashMap<AgentId, Instant>,
     frame_bases: HashMap<AgentId, FrameBasis>,
     archived: Vec<ArchivedConversation>,
+    namer: TitleNamer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,12 +331,27 @@ struct InputDraft {
     chars: Vec<char>,
     cursor: usize,
     title: Option<String>,
+    /// Every message submitted while the conversation is still waiting for a generated name.
+    prompts: Vec<String>,
+    /// The name a generator produced. Preferred over the first message once it arrives.
+    generated: Option<String>,
+    /// A generator is running for this conversation, so no second one is started.
+    naming: bool,
 }
 
 impl InputDraft {
-    fn apply_key(&mut self, input: &KeyInput) {
-        if self.title.is_some() {
-            return;
+    /// A conversation that already carries its final name, such as a resumed archived one.
+    fn named(title: String) -> Self {
+        Self {
+            generated: Some(title),
+            ..Self::default()
+        }
+    }
+
+    /// Records a key and reports whether it submitted a message.
+    fn apply_key(&mut self, input: &KeyInput) -> bool {
+        if self.settled() {
+            return false;
         }
         let control = input.modifiers.control;
         let alt = input.modifiers.alt;
@@ -345,7 +362,7 @@ impl InputDraft {
             KeyCode::Character('e') if control => self.cursor = self.chars.len(),
             KeyCode::Character(character) if !control && !alt => self.insert(*character),
             KeyCode::Enter if input.modifiers.shift => self.insert('\n'),
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => return self.submit(),
             KeyCode::Backspace => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -364,18 +381,21 @@ impl InputDraft {
             KeyCode::Up | KeyCode::Down | KeyCode::Escape => self.clear(),
             _ => {}
         }
+        false
     }
 
-    fn apply_paste(&mut self, text: &str) {
-        if self.title.is_some() {
-            return;
+    /// Records pasted text and reports whether it submitted a message.
+    fn apply_paste(&mut self, text: &str) -> bool {
+        if self.settled() {
+            return false;
         }
         for character in text.chars() {
             self.insert(character);
         }
         if text.ends_with('\n') || text.ends_with('\r') {
-            self.submit();
+            return self.submit();
         }
+        false
     }
 
     fn insert(&mut self, character: char) {
@@ -383,14 +403,19 @@ impl InputDraft {
         self.cursor += 1;
     }
 
-    fn submit(&mut self) {
-        let title = self.chars.iter().collect::<String>();
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !title.is_empty() && !title.starts_with('/') {
-            self.title = Some(title);
-        }
+    fn submit(&mut self) -> bool {
+        let message = self.chars.iter().collect::<String>();
+        let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
         self.chars.clear();
         self.cursor = 0;
+        if message.is_empty() || message.starts_with('/') {
+            return false;
+        }
+        if self.title.is_none() {
+            self.title = Some(message.clone());
+        }
+        self.prompts.push(message);
+        true
     }
 
     fn clear(&mut self) {
@@ -398,8 +423,14 @@ impl InputDraft {
         self.cursor = 0;
     }
 
+    /// Once a name has been generated the conversation is named for good, and there is nothing left
+    /// for the draft to observe.
+    const fn settled(&self) -> bool {
+        self.generated.is_some()
+    }
+
     fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+        self.generated.as_deref().or(self.title.as_deref())
     }
 }
 
@@ -419,6 +450,20 @@ enum FramePayload {
 
 impl SessionRuntime {
     fn new(state: ServerSessionState, wake: Option<crate::session::OutputNotifier>) -> Self {
+        // Tests must never invoke a real coding agent to name a conversation; they opt into a
+        // stubbed generator explicitly with `with_namer`.
+        #[cfg(test)]
+        let namer = TitleNamer::disabled();
+        #[cfg(not(test))]
+        let namer = TitleNamer::from_environment();
+        Self::with_namer(state, wake, namer)
+    }
+
+    fn with_namer(
+        state: ServerSessionState,
+        wake: Option<crate::session::OutputNotifier>,
+        namer: TitleNamer,
+    ) -> Self {
         let (rows, cols) = state.dimensions();
         let agents = AgentManager::new(pty_size(rows, cols), state.terminal_palette(), wake);
         Self {
@@ -429,6 +474,7 @@ impl SessionRuntime {
             git_checked: HashMap::new(),
             frame_bases: HashMap::new(),
             archived: Vec::new(),
+            namer,
         }
     }
 
@@ -543,13 +589,8 @@ impl SessionRuntime {
             .map_err(internal_error)?;
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
-        self.input_drafts.insert(
-            snapshot.id,
-            InputDraft {
-                title: Some(conversation.title),
-                ..InputDraft::default()
-            },
-        );
+        self.input_drafts
+            .insert(snapshot.id, InputDraft::named(conversation.title));
         let observed = self.observe(snapshot.clone(), Instant::now(), true);
         self.previous.insert(snapshot.id, observed);
         self.archived.remove(index);
@@ -658,14 +699,26 @@ impl SessionRuntime {
             let _ = title_recognition
                 .as_ref()
                 .and_then(|recognized| recognized.conversation_title.as_ref());
-            match screen_recognition {
+            let from_screen = match screen_recognition {
                 ScreenRecognition::Recognized(evidence) => Some(evidence),
                 ScreenRecognition::Preserve => previous
                     .as_ref()
                     .and_then(|agent| agent.recognition.clone()),
-                ScreenRecognition::Unknown => {
-                    title_recognition.map(|recognized| recognized.evidence)
+                ScreenRecognition::Unknown => None,
+            };
+            let from_title = title_recognition.map(|recognized| recognized.evidence);
+            // A provider that explicitly reports action required outranks any
+            // other screen claim: the title is the provider's own statement that
+            // the turn is waiting on the user.
+            match (from_screen, from_title) {
+                (Some(screen), Some(title))
+                    if title.claim == AgentActivity::Blocked
+                        && screen.claim != AgentActivity::Blocked =>
+                {
+                    Some(title)
                 }
+                (Some(screen), _) => Some(screen),
+                (None, title) => title,
             }
         } else {
             previous
@@ -735,14 +788,68 @@ impl SessionRuntime {
     }
 
     fn record_key(&mut self, id: AgentId, input: &KeyInput) {
-        if let Some(draft) = self.input_drafts.get_mut(&id) {
-            draft.apply_key(input);
+        if self
+            .input_drafts
+            .get_mut(&id)
+            .is_some_and(|draft| draft.apply_key(input))
+        {
+            self.request_name(id);
         }
     }
 
     fn record_paste(&mut self, id: AgentId, text: &str) {
+        if self
+            .input_drafts
+            .get_mut(&id)
+            .is_some_and(|draft| draft.apply_paste(text))
+        {
+            self.request_name(id);
+        }
+    }
+
+    /// Ask a generator to name this conversation. One request per conversation: the first submitted
+    /// message says what the work is for, and a name that keeps changing under the user is worse
+    /// than a slightly stale one.
+    fn request_name(&mut self, id: AgentId) {
+        let Some(draft) = self.input_drafts.get(&id) else {
+            return;
+        };
+        if draft.naming || draft.settled() {
+            return;
+        }
+        let conversation_id = self
+            .previous
+            .get(&id)
+            .and_then(|observed| observed.session.conversation_id.clone());
+        let kind = match self.agents.snapshot(id) {
+            Some(snapshot) => snapshot.kind,
+            None => return,
+        };
+        let started = self
+            .namer
+            .request(id, conversation_id, kind, &draft.prompts);
         if let Some(draft) = self.input_drafts.get_mut(&id) {
-            draft.apply_paste(text);
+            draft.naming = started;
+        }
+    }
+
+    /// Apply names that finished generating. A name is dropped when its agent is gone or has since
+    /// moved to another conversation, so a `/clear` mid-generation cannot mislabel the new thread.
+    fn apply_generated_names(&mut self) {
+        for result in self.namer.drain() {
+            let current = self
+                .previous
+                .get(&result.agent)
+                .and_then(|observed| observed.session.conversation_id.clone());
+            let Some(draft) = self.input_drafts.get_mut(&result.agent) else {
+                continue;
+            };
+            if current != result.conversation_id || draft.settled() {
+                continue;
+            }
+            draft.generated = Some(result.title);
+            draft.naming = false;
+            draft.clear();
         }
     }
 
@@ -856,6 +963,7 @@ impl SessionRuntime {
     }
 
     fn poll_events(&mut self) -> Vec<Event> {
+        self.apply_generated_names();
         let dirty = self.agents.drain_dirty();
         let attached = self.state.attachment().is_some();
         let now = Instant::now();
@@ -883,13 +991,8 @@ impl SessionRuntime {
                 {
                     let reactivated = self.archived.remove(index);
                     reactivated_id = Some(reactivated.conversation_id);
-                    self.input_drafts.insert(
-                        snapshot.id,
-                        InputDraft {
-                            title: Some(reactivated.title),
-                            ..InputDraft::default()
-                        },
-                    );
+                    self.input_drafts
+                        .insert(snapshot.id, InputDraft::named(reactivated.title));
                 } else {
                     self.input_drafts.insert(snapshot.id, InputDraft::default());
                 }
@@ -2003,6 +2106,7 @@ mod tests {
     use super::*;
     use crate::{
         CursorStyle,
+        naming::TitleResult,
         protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull},
         terminal_backend::Vt100Backend,
         terminal_model::{TerminalBackend, TerminalSize},
@@ -2195,6 +2299,104 @@ mod tests {
     }
 
     #[test]
+    fn submissions_are_collected_until_a_name_is_generated() {
+        let mut draft = InputDraft::default();
+        assert!(draft.apply_paste("first task\n"));
+        assert!(draft.apply_paste("second task\n"));
+        assert!(!draft.apply_paste("/status\n"));
+        assert_eq!(draft.prompts, vec!["first task", "second task"]);
+        assert_eq!(draft.title(), Some("first task"));
+
+        draft.generated = Some("Sidebar work".into());
+        assert_eq!(draft.title(), Some("Sidebar work"));
+        // A named conversation stops observing input entirely.
+        assert!(!draft.apply_paste("third task\n"));
+        assert_eq!(draft.prompts, vec!["first task", "second task"]);
+    }
+
+    #[test]
+    fn a_resumed_conversation_keeps_its_name_and_asks_for_no_other() {
+        let mut draft = InputDraft::named("Archived work".into());
+
+        assert!(!draft.apply_paste("a new message\n"));
+        assert_eq!(draft.title(), Some("Archived work"));
+    }
+
+    #[test]
+    fn a_generated_name_replaces_the_first_message_in_agent_updates() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::with_namer(
+            state,
+            None,
+            TitleNamer::fixed("printf", &["Generated sidebar name\\n"]),
+        );
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 1"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        runtime.record_paste(snapshot.id, "fix teh sidbar truncation pls\n");
+        runtime.poll_events();
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("fix teh sidbar truncation pls"),
+            "the first message names the conversation until a generated name arrives"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let renamed = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events.into_iter().find(|event| {
+                matches!(event, Event::AgentChanged { agent, .. }
+                    if agent.conversation_title.as_deref() == Some("Generated sidebar name"))
+            }) {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "no generated name arrived");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(matches!(renamed, Event::AgentChanged { .. }));
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("Generated sidebar name")
+        );
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn a_name_for_an_abandoned_conversation_is_discarded() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 1"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+        runtime.record_paste(snapshot.id, "first task\n");
+        runtime.poll_events();
+        runtime
+            .previous
+            .get_mut(&snapshot.id)
+            .unwrap()
+            .session
+            .conversation_id = Some("129ff1d3-375e-7a72-a176-c47497827e49".into());
+
+        // The generator answers for the conversation the agent has since left.
+        runtime.namer.deliver(TitleResult {
+            agent: snapshot.id,
+            conversation_id: Some("019ff1d3-375e-7a72-a176-c47497827e49".into()),
+            title: "Stale name".into(),
+        });
+        runtime.apply_generated_names();
+
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("first task")
+        );
+        runtime.agents.stop_all();
+    }
+
+    #[test]
     fn runtime_publishes_the_first_message_title_with_agent_updates() {
         let cwd = std::env::current_dir().unwrap();
         let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
@@ -2223,6 +2425,36 @@ mod tests {
                 if agent.conversation_title.as_deref() == Some("name this thread")
         )));
         runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn action_required_titles_outrank_a_non_blocked_screen_claim() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let session = SessionSnapshot {
+            id: AgentId(1),
+            kind: AgentKind::Codex,
+            launch_directory: cwd,
+            status: SessionStatus::Running,
+            output_generation: 1,
+            read_error: None,
+            exit: None,
+            conversation_id: None,
+        };
+
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process(
+            "\x1b]2;[ ! ] Action Required | Task\x07\x1b[20;1H❯\r\n? for shortcuts".as_bytes(),
+        );
+        let screen = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        assert!(matches!(
+            recognition::recognize(AgentKind::Codex, &screen),
+            ScreenRecognition::Recognized(evidence) if evidence.claim == AgentActivity::Idle
+        ));
+
+        let observed = runtime.observe_with_terminal(session, Instant::now(), false, Some(&screen));
+        assert_eq!(observed.activity, AgentActivity::Blocked);
     }
 
     #[test]

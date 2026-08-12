@@ -645,6 +645,7 @@ fn apply_click_action(
                 Mode::ArchiveUnavailable => app.set_mode(Mode::Terminal),
                 Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
                 Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
+                Mode::Menu => app.set_mode(Mode::Terminal),
                 _ => {}
             }
             Ok((false, true))

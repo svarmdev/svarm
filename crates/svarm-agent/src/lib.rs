@@ -12,6 +12,8 @@ pub mod ipc;
 pub mod logging;
 mod manager;
 #[cfg(unix)]
+mod naming;
+#[cfg(unix)]
 pub mod paths;
 pub mod protocol;
 mod recognition;
