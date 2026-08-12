@@ -21,13 +21,27 @@ use ratatui::{
 };
 use svarm_agent::terminal_model::{TerminalCell, TerminalColor, TerminalSnapshot};
 
+use crate::selection::VisibleSelection;
+
 pub(crate) struct TerminalScreen<'a> {
     screen: &'a TerminalSnapshot,
+    selection: Option<VisibleSelection>,
+    selection_style: Style,
 }
 
 impl<'a> TerminalScreen<'a> {
-    pub const fn new(screen: &'a TerminalSnapshot) -> Self {
-        Self { screen }
+    pub fn new(screen: &'a TerminalSnapshot) -> Self {
+        Self {
+            screen,
+            selection: None,
+            selection_style: Style::default(),
+        }
+    }
+
+    pub fn with_selection(mut self, selection: Option<VisibleSelection>, style: Style) -> Self {
+        self.selection = selection;
+        self.selection_style = style;
+        self
     }
 
     /// Where the host terminal should place its own cursor, in frame coordinates, or `None` when
@@ -55,6 +69,14 @@ impl Widget for TerminalScreen<'_> {
                     buffer_cell.set_symbol(if contents.is_empty() { " " } else { contents });
                 });
                 buffer_cell.set_style(style(cell));
+                let selected = self.selection.is_some_and(|selection| {
+                    selection.contains(row, column)
+                        || (cell.wide_continuation
+                            && selection.contains(row, column.saturating_sub(1)))
+                });
+                if selected {
+                    buffer_cell.set_style(self.selection_style);
+                }
             }
         }
     }
@@ -116,7 +138,13 @@ fn ansi(index: u8) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use svarm_agent::terminal_model::{TerminalAttributes, TerminalPosition, TerminalSize};
+    use svarm_agent::{
+        AgentId,
+        protocol::{InputModifiers, MouseButton, MouseInput, MouseKind},
+        terminal_model::{TerminalAttributes, TerminalPosition, TerminalSize},
+    };
+
+    use crate::selection::TerminalSelection;
 
     use super::*;
 
@@ -182,6 +210,73 @@ mod tests {
         let buffer = render(&screen("plain"));
         assert_eq!(buffer[(0, 0)].fg, Color::Reset);
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn visible_selection_overrides_agent_cell_style() {
+        let screen = screen("plain");
+        let mut selection = TerminalSelection::begin(
+            AgentId::new(1),
+            1,
+            0,
+            MouseInput {
+                kind: MouseKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: InputModifiers::default(),
+            },
+            false,
+            &screen,
+        );
+        selection.drag(3, 0, &screen);
+        let area = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(area);
+        TerminalScreen::new(&screen)
+            .with_selection(
+                selection.visible(&screen),
+                Style::default().add_modifier(Modifier::REVERSED),
+            )
+            .render(area, &mut buffer);
+
+        assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        for column in 1..=3 {
+            assert!(buffer[(column, 0)].modifier.contains(Modifier::REVERSED));
+        }
+        assert!(!buffer[(4, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn selecting_a_wide_grapheme_highlights_its_continuation_cell() {
+        let mut screen = screen("ab");
+        screen.cell_mut(0, 0).unwrap().contents = "界".into();
+        screen.cell_mut(0, 0).unwrap().wide = true;
+        screen.cell_mut(0, 1).unwrap().contents = "".into();
+        screen.cell_mut(0, 1).unwrap().wide_continuation = true;
+        let mut selection = TerminalSelection::begin(
+            AgentId::new(1),
+            1,
+            0,
+            MouseInput {
+                kind: MouseKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: InputModifiers::default(),
+            },
+            false,
+            &screen,
+        );
+        selection.drag(1, 0, &screen);
+        let area = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(area);
+        TerminalScreen::new(&screen)
+            .with_selection(
+                selection.visible(&screen),
+                Style::default().add_modifier(Modifier::REVERSED),
+            )
+            .render(area, &mut buffer);
+
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

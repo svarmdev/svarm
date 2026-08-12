@@ -1,6 +1,7 @@
 use std::{io, thread};
 
 use crossterm::{
+    clipboard::CopyToClipboard,
     cursor::{SetCursorStyle, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -88,6 +89,16 @@ impl TerminalSession {
         execute!(self.terminal.backend_mut(), cursor_style(style))?;
         Ok(())
     }
+
+    /// Writes through the terminal protocol so copying also works over SSH and through
+    /// multiplexers that pass OSC 52 to the outer terminal.
+    pub fn copy_to_clipboard(&mut self, text: &str) -> Result<()> {
+        execute!(
+            self.terminal.backend_mut(),
+            CopyToClipboard::to_clipboard_from(text)
+        )?;
+        Ok(())
+    }
 }
 
 const fn cursor_style(style: CursorStyle) -> SetCursorStyle {
@@ -122,4 +133,19 @@ impl Drop for TerminalSession {
 
 pub(crate) fn colors_enabled() -> bool {
     !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::{Command, clipboard::CopyToClipboard};
+
+    #[test]
+    fn clipboard_command_uses_osc_52_clipboard_destination() {
+        let mut output = String::new();
+        CopyToClipboard::to_clipboard_from("copy me")
+            .write_ansi(&mut output)
+            .unwrap();
+        assert!(output.starts_with("\x1b]52;c;"));
+        assert!(output.contains("Y29weSBtZQ=="));
+    }
 }

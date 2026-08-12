@@ -39,6 +39,7 @@ pub struct InitialAgentRequest {
 pub(crate) enum RemoteUpdate {
     Event(Box<Event>),
     TerminalChanged(AgentId),
+    TerminalViewportChanged(AgentId),
     Error(String),
     Disconnected(String),
 }
@@ -253,7 +254,7 @@ impl RemoteAgents {
                 Message::Event(Event::TerminalViewport(viewport)) => {
                     let id = viewport.agent_id;
                     if self.apply_viewport(viewport) {
-                        updates.push(RemoteUpdate::TerminalChanged(id));
+                        updates.push(RemoteUpdate::TerminalViewportChanged(id));
                     }
                 }
                 Message::Event(event) => {
@@ -299,6 +300,12 @@ impl RemoteAgents {
         self.terminals
             .get(&id)
             .is_some_and(|terminal| terminal.scrollback.is_some())
+    }
+
+    pub fn scrollback_request_pending(&self, id: AgentId) -> bool {
+        self.terminals
+            .get(&id)
+            .is_some_and(|terminal| terminal.scrollback_request.is_some())
     }
 
     pub fn wheel_routing(&self, id: AgentId) -> WheelRouting {

@@ -1,5 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{env, path::PathBuf, sync::mpsc};
+use std::{
+    env,
+    path::PathBuf,
+    sync::mpsc::{self, RecvTimeoutError},
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{
     Event as HostEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -22,6 +27,7 @@ use crate::{
         WorkspaceChoice,
     },
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
+    selection::{ScrollDirection, TerminalSelection},
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
@@ -29,6 +35,77 @@ use crate::{
 };
 
 const EVENT_QUEUE: usize = 1_024;
+const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(75);
+const SELECTION_SCROLL_ROWS: isize = 3;
+const TOAST_DURATION: Duration = Duration::from_secs(2);
+
+struct Toast {
+    message: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct InteractionState {
+    selection: Option<TerminalSelection>,
+    selection_scroll_at: Option<Instant>,
+    toast: Option<Toast>,
+}
+
+impl InteractionState {
+    fn next_timeout(&self, now: Instant) -> Option<Duration> {
+        self.selection_scroll_at
+            .into_iter()
+            .chain(self.toast.as_ref().map(|toast| toast.expires_at))
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+    }
+
+    fn schedule_selection_scroll(&mut self, now: Instant) {
+        self.selection_scroll_at = self
+            .selection
+            .as_ref()
+            .and_then(TerminalSelection::scroll_direction)
+            .map(|_| now + SELECTION_SCROLL_INTERVAL);
+    }
+
+    fn show_copied(&mut self, characters: usize, now: Instant) {
+        self.toast = Some(Toast {
+            message: format!("Copied {characters} characters to clipboard"),
+            expires_at: now + TOAST_DURATION,
+        });
+    }
+
+    fn tick(&mut self, agents: &mut RemoteAgents, now: Instant) -> Result<bool> {
+        let mut dirty = false;
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.expires_at <= now)
+        {
+            self.toast = None;
+            dirty = true;
+        }
+        if self
+            .selection_scroll_at
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.selection_scroll_at = None;
+            if let Some(selection) = self.selection.as_ref()
+                && let Some(direction) = selection.scroll_direction()
+            {
+                if !agents.scrollback_request_pending(selection.agent_id()) {
+                    let rows = match direction {
+                        ScrollDirection::Older => SELECTION_SCROLL_ROWS,
+                        ScrollDirection::Newer => -SELECTION_SCROLL_ROWS,
+                    };
+                    agents.scroll(selection.agent_id(), rows)?;
+                }
+                self.selection_scroll_at = Some(now + SELECTION_SCROLL_INTERVAL);
+            }
+        }
+        Ok(dirty)
+    }
+}
 
 pub fn run(
     initial_agent: InitialAgentRequest,
@@ -101,17 +178,30 @@ pub fn run(
     let mut dirty = true;
     let mut pointer = None;
     let mut connection_failure = None;
-    while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
+    let mut interaction = InteractionState::default();
+    'runtime: while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
             if let Some((id, generation)) = app.mark_selected_seen() {
                 agents.mark_seen(id, generation)?;
             }
             let selected = app.selected_agent_id();
             let embedded = browser.snapshot();
+            let screen = selected.and_then(|id| agents.screen(id));
             let model = UiModel {
                 app: &app,
-                screen: selected.and_then(|id| agents.screen(id)),
+                screen,
                 scrolled: selected.is_some_and(|id| agents.is_scrolled(id)),
+                selection: selected.zip(screen).and_then(|(id, screen)| {
+                    interaction
+                        .selection
+                        .as_ref()
+                        .filter(|selection| selection.agent_id() == id)
+                        .and_then(|selection| selection.visible(screen))
+                }),
+                toast: interaction
+                    .toast
+                    .as_ref()
+                    .map(|toast| toast.message.as_str()),
                 embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
@@ -132,11 +222,63 @@ pub fn run(
 
         // Sleep until something actually happens, then absorb everything else already queued so a
         // burst of agent output costs one redraw instead of one redraw per frame.
-        let Ok(first) = events.recv() else { break };
+        let first = if let Some(timeout) = interaction.next_timeout(Instant::now()) {
+            match events.recv_timeout(timeout) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    dirty |= interaction.tick(&mut agents, Instant::now())?;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break 'runtime,
+            }
+        } else {
+            let Ok(event) = events.recv() else {
+                break 'runtime;
+            };
+            event
+        };
         for event in std::iter::once(first).chain(events.try_iter()) {
             match event {
                 ClientEvent::Remote(incoming) => {
                     for update in agents.apply(incoming) {
+                        match &update {
+                            RemoteUpdate::TerminalChanged(agent_id)
+                                if interaction
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|selection| selection.agent_id() == *agent_id) =>
+                            {
+                                dirty |= cancel_selection(&mut interaction, &mut agents, true)?;
+                            }
+                            RemoteUpdate::TerminalViewportChanged(agent_id)
+                                if interaction
+                                    .selection
+                                    .as_ref()
+                                    .is_some_and(|selection| selection.agent_id() == *agent_id) =>
+                            {
+                                if let Some(screen) = agents.screen(*agent_id)
+                                    && let Some(selection) = interaction.selection.as_mut()
+                                {
+                                    selection.absorb(screen);
+                                    interaction.schedule_selection_scroll(Instant::now());
+                                }
+                            }
+                            RemoteUpdate::Event(event)
+                                if matches!(
+                                    event.as_ref(),
+                                    ServerEvent::AgentRemoved { agent_id, .. }
+                                        | ServerEvent::AgentArchived { agent_id, .. }
+                                        if interaction.selection.as_ref().is_some_and(
+                                            |selection| selection.agent_id() == *agent_id
+                                        )
+                                ) =>
+                            {
+                                interaction.selection = None;
+                                interaction.selection_scroll_at = None;
+                                dirty = true;
+                            }
+                            _ => {}
+                        }
                         dirty |= apply_remote_update(&mut app, &mut connection_failure, update);
                     }
                 }
@@ -154,6 +296,7 @@ pub fn run(
                         &mut agents,
                         resources,
                         &mut terminal,
+                        &mut interaction,
                         host,
                         &mut pointer,
                     )?;
@@ -197,12 +340,16 @@ fn handle_host_event(
     agents: &mut RemoteAgents,
     mut resources: InteractionResources<'_>,
     terminal: &mut TerminalSession,
+    interaction: &mut InteractionState,
     event: HostEvent,
     pointer: &mut Option<(u16, u16)>,
 ) -> Result<bool> {
     let mut dirty = false;
     match event {
         HostEvent::Key(key) => {
+            if key.kind != KeyEventKind::Release {
+                dirty |= cancel_selection(interaction, agents, true)?;
+            }
             let (resize, redraw) = handle_key(app, agents, &mut resources, key)?;
             dirty |= redraw;
             if resize {
@@ -210,6 +357,7 @@ fn handle_host_event(
             }
         }
         HostEvent::Paste(text) if app.mode() == Mode::Terminal => {
+            dirty |= cancel_selection(interaction, agents, true)?;
             if let Some(id) = app.selected_agent_id() {
                 dirty |= agents.show_live(id);
                 agents.paste(id, text)?;
@@ -221,6 +369,8 @@ fn handle_host_event(
             }
         }
         HostEvent::Resize(width, height) => {
+            interaction.selection = None;
+            interaction.selection_scroll_at = None;
             dirty = true;
             let area = Rect::new(0, 0, width, height);
             resize_agents(agents, app, area)?;
@@ -235,7 +385,15 @@ fn handle_host_event(
                 pointer.and_then(|(column, row)| ui::hover_action(app, area, column, row));
             *pointer = Some((mouse.column, mouse.row));
             dirty |= previous != ui::hover_action(app, area, mouse.column, mouse.row);
-            let (resize, redraw) = handle_mouse(app, agents, &mut resources, mouse, area)?;
+            let (resize, redraw) = handle_mouse(
+                app,
+                agents,
+                &mut resources,
+                terminal,
+                interaction,
+                mouse,
+                area,
+            )?;
             dirty |= redraw;
             if resize {
                 resize_agents(agents, app, terminal.terminal().size()?.into())?;
@@ -244,6 +402,21 @@ fn handle_host_event(
         _ => {}
     }
     Ok(dirty)
+}
+
+fn cancel_selection(
+    interaction: &mut InteractionState,
+    agents: &mut RemoteAgents,
+    replay_pending: bool,
+) -> Result<bool> {
+    let Some(selection) = interaction.selection.take() else {
+        return Ok(false);
+    };
+    interaction.selection_scroll_at = None;
+    if replay_pending && let Some((down, true)) = selection.pending_click() {
+        agents.mouse(selection.agent_id(), down.clone())?;
+    }
+    Ok(selection.is_dragging())
 }
 
 fn apply_remote_update(
@@ -310,6 +483,9 @@ fn apply_remote_update(
             }
         },
         RemoteUpdate::TerminalChanged(agent_id) => {
+            dirty = app.selected_agent_id() == Some(agent_id)
+        }
+        RemoteUpdate::TerminalViewportChanged(agent_id) => {
             dirty = app.selected_agent_id() == Some(agent_id)
         }
         RemoteUpdate::Error(error) => {
@@ -527,9 +703,55 @@ fn handle_mouse(
     app: &mut App,
     agents: &mut RemoteAgents,
     resources: &mut InteractionResources<'_>,
+    terminal: &mut TerminalSession,
+    interaction: &mut InteractionState,
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<(bool, bool)> {
+    let child_area = ui::terminal_area(area, app.sidebar_visible());
+    if let Some(agent_id) = interaction
+        .selection
+        .as_ref()
+        .map(TerminalSelection::agent_id)
+    {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(screen) = agents.screen(agent_id) else {
+                    interaction.selection = None;
+                    interaction.selection_scroll_at = None;
+                    return Ok((false, true));
+                };
+                let translated = relative_mouse(mouse, child_area);
+                if let Some(selection) = interaction.selection.as_mut() {
+                    selection.drag(translated.column, translated.row, screen);
+                }
+                interaction.schedule_selection_scroll(Instant::now());
+                return Ok((false, true));
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let translated = relative_mouse(mouse, child_area);
+                let selection = interaction.selection.take().unwrap();
+                interaction.selection_scroll_at = None;
+                if let Some((down, true)) = selection.pending_click() {
+                    let redraw = agents.show_live(agent_id);
+                    agents.mouse(agent_id, down.clone())?;
+                    agents.mouse(agent_id, mouse_input(translated))?;
+                    return Ok((false, redraw));
+                }
+                if let Some(text) = selection.text()
+                    && !text.is_empty()
+                {
+                    match terminal.copy_to_clipboard(&text) {
+                        Ok(()) => interaction.show_copied(text.chars().count(), Instant::now()),
+                        Err(error) => app.set_notice(format!("could not copy selection: {error}")),
+                    }
+                }
+                return Ok((false, true));
+            }
+            _ => {}
+        }
+    }
+
     if app.mode() == Mode::Terminal && handle_sidebar_wheel(app, mouse, area) {
         return Ok((false, true));
     }
@@ -551,7 +773,6 @@ fn handle_mouse(
     if app.mode() != Mode::Terminal {
         return Ok((false, false));
     }
-    let child_area = ui::terminal_area(area, app.sidebar_visible());
     if !contains(child_area, mouse.column, mouse.row) {
         return Ok((false, false));
     }
@@ -572,6 +793,20 @@ fn handle_mouse(
             }
         }
     }
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(screen) = agents.screen(id)
+    {
+        let translated = relative_mouse(mouse, child_area);
+        interaction.selection = Some(TerminalSelection::begin(
+            id,
+            translated.column,
+            translated.row,
+            mouse_input(translated),
+            agents.wheel_routing(id) == WheelRouting::ChildMouse,
+            screen,
+        ));
+        return Ok((false, false));
+    }
     if agents.wheel_routing(id) != WheelRouting::ChildMouse {
         return Ok((false, false));
     }
@@ -583,6 +818,21 @@ fn handle_mouse(
     };
     agents.mouse(id, mouse_input(translated))?;
     Ok((false, redraw))
+}
+
+fn relative_mouse(mouse: MouseEvent, area: Rect) -> MouseEvent {
+    MouseEvent {
+        column: clamp_axis(mouse.column, area.x, area.width),
+        row: clamp_axis(mouse.row, area.y, area.height),
+        ..mouse
+    }
+}
+
+fn clamp_axis(position: u16, start: u16, length: u16) -> u16 {
+    if length == 0 {
+        return 0;
+    }
+    position.clamp(start, start.saturating_add(length - 1)) - start
 }
 
 fn apply_click_action(
@@ -1267,6 +1517,32 @@ mod tests {
             area,
         ));
         assert_eq!(app.sidebar_scroll(), Some(3));
+    }
+
+    #[test]
+    fn selection_pointer_is_clamped_to_the_agent_pane_not_the_sidebar() {
+        let pane = Rect::new(28, 0, 52, 24);
+        let left = relative_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 2,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            },
+            pane,
+        );
+        assert_eq!((left.column, left.row), (0, 12));
+
+        let bottom_right = relative_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: u16::MAX,
+                row: u16::MAX,
+                modifiers: KeyModifiers::NONE,
+            },
+            pane,
+        );
+        assert_eq!((bottom_right.column, bottom_right.row), (51, 23));
     }
 
     #[test]
