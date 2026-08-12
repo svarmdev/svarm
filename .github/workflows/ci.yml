@@ -24,23 +24,24 @@ jobs:
       - run: cargo fmt --all --check
 
   test:
-    name: test (${{ matrix.os }})
+    name: ${{ matrix.validation }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env:
-      TMPDIR: /tmp
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            validation: test
             test_args: --workspace
           - os: macos-15
-            test_args: -p svarm-tui --lib
+            validation: build
+            test_args: --workspace
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --locked
-      - run: cargo test ${{ matrix.test_args }} --locked
+      - if: matrix.validation == 'test'
+        run: cargo test ${{ matrix.test_args }} --locked
 
   clippy:
     name: clippy
