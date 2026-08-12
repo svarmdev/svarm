@@ -767,7 +767,6 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
 pub(crate) fn hover_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
     match click_action(app, area, column, row)? {
         ClickAction::Cancel if app.mode() == Mode::Menu => None,
-        ClickAction::SidebarItem(_) => None,
         ClickAction::Management(ManagementCommand::ChooseAgent) => {
             new_agent_button_area(area, app.sidebar_visible())
                 .filter(|button| contains(*button, column, row))
@@ -787,6 +786,16 @@ fn chrome_style(theme: Theme, hovered: bool, selected: bool, base: Style) -> Sty
 
 fn hover_style(theme: Theme, hovered: bool, base: Style) -> Style {
     if hovered { theme.selected() } else { base }
+}
+
+fn fill_card_line(line: Line<'static>, width: u16, style: Style) -> Line<'static> {
+    let used = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    let pad = width.saturating_sub(used);
+    let mut spans = line.spans;
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(usize::from(pad))));
+    }
+    Line::from(spans).style(style)
 }
 
 pub(crate) fn session_chooser_click(
@@ -1007,6 +1016,12 @@ fn render_sidebar(
         } else {
             lines.push(Line::from(Span::styled(marker, accent(theme))));
         }
+        if hovered == Some(ClickAction::SidebarItem(index)) {
+            lines = lines
+                .into_iter()
+                .map(|line| fill_card_line(line, agents_area.width, theme.hover_fill()))
+                .collect();
+        }
         rows.append(&mut lines);
     }
     if !app.archived().is_empty() {
@@ -1024,10 +1039,15 @@ fn render_sidebar(
                         &conversation.title,
                         usize::from(agents_area.width).saturating_sub(number.chars().count()),
                     );
-                    Line::from(vec![
+                    let line = Line::from(vec![
                         Span::styled(number, theme.muted()),
                         Span::styled(title, text(theme)),
-                    ])
+                    ]);
+                    if hovered == Some(ClickAction::SidebarItem(app.agents().len() + index)) {
+                        fill_card_line(line, agents_area.width, theme.hover_fill())
+                    } else {
+                        line
+                    }
                 }),
         );
     }
@@ -2174,6 +2194,92 @@ mod tests {
             hint.backend().buffer()[(standard.x + 2, standard.y + 3)]
                 .modifier
                 .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn hovering_an_agent_thread_fills_the_whole_card() {
+        let area = Rect::new(0, 0, 80, 24);
+        let active = AgentSnapshot {
+            id: svarm_agent::AgentId::new(1),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/plain-directory"),
+            working_directory: None,
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 1,
+            seen_generation: 1,
+            completed_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            conversation_title: Some("Live thread".into()),
+            conversation_id: None,
+            activity: AgentActivity::Idle,
+            recognition: None,
+            git: None,
+        };
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: SessionSummary {
+                    id: SessionId(10),
+                    running_agents: 1,
+                    total_agents: 1,
+                    attachment: None,
+                    last_user_activity_ms: 1,
+                    revision: SessionRevision(1),
+                },
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active],
+                archived: vec![ArchivedConversation {
+                    conversation_id: "archived-id".into(),
+                    title: "Archived title".into(),
+                    kind: svarm_agent::AgentKind::Claude,
+                    launch_directory: "/tmp/hidden-archive-directory".into(),
+                }],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        assert_eq!(
+            hover_action(&app, area, 2, 1),
+            Some(ClickAction::SidebarItem(0))
+        );
+        assert_eq!(
+            hover_action(&app, area, 2, 5),
+            Some(ClickAction::SidebarItem(1))
+        );
+
+        let edge = sidebar_area(area).width.saturating_sub(2);
+        let hovered_card = draw_app(&app, Some((2, 1)));
+        for row in 1..4 {
+            assert!(
+                hovered_card.backend().buffer()[(edge, row)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "active card row {row} should fill to the sidebar edge"
+            );
+        }
+        assert!(
+            !hovered_card.backend().buffer()[(edge, 5)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "archived row should stay unfilled while another card is hovered"
+        );
+
+        let hovered_archived = draw_app(&app, Some((2, 5)));
+        assert!(
+            hovered_archived.backend().buffer()[(edge, 5)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !hovered_archived.backend().buffer()[(edge, 4)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "the Archived header is not a card"
         );
     }
 

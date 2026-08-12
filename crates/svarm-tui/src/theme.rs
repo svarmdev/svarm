@@ -284,6 +284,14 @@ impl Theme {
                 .add_modifier(Modifier::BOLD)
         }
     }
+
+    pub fn hover_fill(self) -> Style {
+        if self.selection == Color::Reset {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().bg(self.selection)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +317,18 @@ mod tests {
                     .any(|other| other.palette() == palette)
             );
         }
+    }
+
+    #[test]
+    fn hover_fill_is_lighter_than_selected() {
+        assert_eq!(
+            ThemeName::Monochrome.palette().hover_fill(),
+            Style::default().add_modifier(Modifier::REVERSED)
+        );
+        assert_eq!(
+            ThemeName::Dark.palette().hover_fill(),
+            Style::default().bg(Color::DarkGray)
+        );
     }
 
     #[test]
