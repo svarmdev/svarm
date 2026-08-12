@@ -1,6 +1,6 @@
 # svarm
 
-A small terminal multiplexer for coding agents
+A terminal workspace for coding agents
 
 ## Architecture
 

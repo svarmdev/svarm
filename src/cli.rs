@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use svarm_tui::AgentKind;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "A small terminal multiplexer for coding agents")]
+#[command(version, about = "A terminal workspace for coding agents")]
 pub struct Cli {
     /// Attach only; never create a Svarm session.
     #[arg(long, conflicts_with = "new_session")]

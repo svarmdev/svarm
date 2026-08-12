@@ -1,17 +1,17 @@
 # Svarm
 
-Svarm is a small terminal multiplexer specifically for coding agents. It runs the native Codex, Claude Code, or Grok Build TUI in a real PTY, keeps open agents in a fixed sidebar, and shows one agent at a time. A per-user background server owns the agents, so the UI can detach and reconnect later.
+Svarm is a terminal workspace for coding agents. It runs the native Codex, Claude Code, or Grok Build TUI in a real PTY, keeps multiple agents in one session, and provides a sidebar for switching between them. A per-user background server owns the agents, so the UI can detach and reconnect later.
 
-The local client/server [terminal frame protocol](docs/protocol.md) uses backend-independent
-semantic snapshots and diffs.
-
-It does not speak ACP, Codex app-server, or Claude's streaming protocol. Normal input goes directly to the focused agent.
+Normal input goes directly to the focused agent, preserving the behavior of the native agent TUI.
 
 ## Install and run
 
 Codex, Claude Code, and/or Grok Build must already be installed and available on `PATH`.
 
+Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
+
 ```sh
+# From a checkout of this repository:
 cargo install --path .
 svarm                         # Open or create a workspace-neutral session
 svarm .                       # Open the new-agent form with this workspace
@@ -23,58 +23,8 @@ svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
 ```
 
-Sessions are process groups and attachment targets, not workspaces. Agents in one
-session can run in different directories, and an empty session remains usable.
-Normal startup discovers every live session and asks whether to open one or start a
-new one. `--attach --session ID` opens a listed session directly; `--workspace ID`
-is a hidden compatibility alias for one release. Add `--takeover` only when you
-deliberately want to disconnect its current UI.
-
-If startup needs a choice but stdin or stdout is not a terminal, Svarm prints the
-eligible sessions and exits. Automation must choose explicitly with
-`--attach --session ID` or `--new-session`.
-
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
-
-## Keys
-
-Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, release it, then press a command:
-
-| Command | Action |
-| --- | --- |
-| `j`, `k`, or arrows | Select the next or previous agent |
-| `1`–`9` | Select an agent directly |
-| `PageUp`, `PageDown` | Scroll the selected agent's terminal history |
-| `n` | Open the workspace/agent/start form |
-| `b` | Toggle the sidebar |
-| `m` | Open the sidebar menu |
-| `x` | Close the selected agent, after confirmation |
-| `d` | Detach — agents keep running |
-| `q` | Stop session — terminates all agents, after confirmation |
-| `?` | Show keybinds directly |
-| `Ctrl+B` | Send a literal `Ctrl+B` to the agent (Grok Build uses this to background a running command) |
-
-The Menu control at the bottom of the sidebar is also clickable. Its Keybinds and
-Settings entries work with the mouse or with arrows and Enter. Settings currently
-contains the available theme palettes; the selected theme is saved in
-`$XDG_CONFIG_HOME/svarm/settings.json` (or `~/.config/svarm/settings.json`).
-
-Pasting respects the focused application's bracketed-paste mode. The mouse wheel scrolls an
-overflowing sidebar. Over an agent, wheel events follow native terminal rules: applications that
-requested the mouse receive them, alternate-screen applications that enable alternate scrolling
-receive cursor input, and normal terminal output uses Svarm's bounded history. Use
-`Ctrl+B, PageUp` to enter history explicitly.
-Typing or pasting returns to the live screen. Clicks are forwarded only when the application has
-requested mouse input. `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through normally.
-
-The new-agent form defaults to the last successfully launched workspace and agent.
-Workspace history is kept in most-recently-used order. From the workspace list,
-press `b` to open Yazi inside Svarm. If `yazi` is not installed, Svarm opens its
-keyboard-only native directory browser instead. While Yazi is focused, input belongs
-only to Yazi; `Ctrl+B, x` force-closes it and `Ctrl+B, Ctrl+B` sends a literal prefix.
-Yazi image previews are not composited, but text previews, colors, attributes, mouse,
-paste, resize, and its cursor are supported.
 
 ## Session and server lifecycle
 
@@ -92,18 +42,6 @@ This is live-process persistence, not durable checkpointing. Agents do not survi
 
 The server exits after a short grace period when it has no sessions and no connected clients. An exited agent remains visible and keeps its session alive until explicitly closed.
 
-## Runtime files and privacy
-
-The Unix socket, singleton lock, and diagnostic PID file live in the private per-user runtime directory (`$XDG_RUNTIME_DIR/svarm` when safe, otherwise a UID-specific temporary directory). The directory is mode `0700`, the socket is private, and Linux/macOS peer credentials are checked.
-
-Rotating `server.log` and `client.log` files live under `$XDG_STATE_HOME/svarm`, `~/.local/state/svarm`, or the private runtime fallback and are mode `0600`. Each is limited to roughly 1 MiB with two retained rotations. Default logs contain lifecycle information only: never terminal output, reconstructed screens, typed keys, pasted text, prompts, tokens, environment dumps, or full protocol payloads.
-
-Yazi cwd-result files are created with mode `0600` in the private runtime directory
-and removed after selection, cancellation, failure, force-close, or client shutdown.
-Settings persist only the theme, canonical workspace history, and last agent kind. Grok Build
-conversation tracking installs `~/.grok/hooks/svarm-conversation.json` if that file is missing;
-the hook is a no-op unless Svarm launched the process.
-
 ## Troubleshooting
 
 - Run `svarm server status`, then `svarm list`, to distinguish a missing server from a missing session.
@@ -112,10 +50,6 @@ the hook is a no-op unless Svarm launched the process.
 - After a client connection error, Svarm restores the host terminal and prints the exact `svarm --attach --session ID` command. Agents may still be running.
 - Missing remembered workspaces remain visible with a `missing` marker and cannot be selected. Press `b` to browse to another directory.
 - If Yazi cannot be found on `PATH`, the native browser opens automatically. Permission and invalid-executable errors are reported instead of being treated as absence.
-
-## Scope
-
-Svarm deliberately has no remote listener, shells, tabs, pane splitting, arbitrary commands, or simultaneous writable clients for one session. It recognizes Codex, Claude Code, and Grok Build. Provider-specific blocked or idle states are not inferred from timing or vague screen matches.
 
 ## Develop
 
