@@ -26,7 +26,6 @@ const AGENT_CARD_HEIGHT: u16 = 3;
 /// Marks a directory that is a linked git worktree rather than the repository's main checkout.
 const LINKED_WORKTREE: &str = "⑂";
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
-const MENU_WIDTH: u16 = 46;
 
 #[derive(Clone, Copy)]
 enum ModalSize {
@@ -308,7 +307,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     }
 
     if app.sidebar_visible() {
-        render_sidebar(frame, app, sidebar_area(area), theme, model.colors_enabled);
+        render_sidebar(frame, app, area, theme, model.colors_enabled);
     }
     render_terminal(
         frame,
@@ -801,9 +800,15 @@ fn menu_popup_area(button: Rect) -> Rect {
     Rect::new(
         button.x,
         button.y.saturating_sub(MENU_HEIGHT),
-        MENU_WIDTH.max(button.width),
+        button.width,
         MENU_HEIGHT,
     )
+}
+
+fn trailing_shortcut(label: Span<'static>, shortcut: Span<'static>, width: u16) -> Line<'static> {
+    let used = label.content.chars().count() + shortcut.content.chars().count();
+    let gap = usize::from(width).saturating_sub(used);
+    Line::from(vec![label, Span::raw(" ".repeat(gap)), shortcut])
 }
 
 fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
@@ -846,19 +851,20 @@ fn render_sidebar(
     theme: Theme,
     colors_enabled: bool,
 ) {
+    let sidebar = sidebar_area(area);
     let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
     let block = Block::new()
         .title(title)
         .borders(Borders::TOP | Borders::RIGHT)
         .border_style(border(theme))
         .style(Style::default().bg(Color::Reset));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = block.inner(sidebar);
+    frame.render_widget(block, sidebar);
 
     let new_button =
         new_agent_button_area(area, true).expect("visible sidebar has a new-agent button");
     let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
-    let agents_area = agent_list_area(app, area);
+    let agents_area = agent_list_area(app, sidebar);
 
     let mut rows = Vec::new();
     for (index, agent) in app.agents().iter().enumerate() {
@@ -986,13 +992,14 @@ fn render_sidebar(
 
     let new_button_style = text(theme);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
+        Paragraph::new(trailing_shortcut(
             Span::styled(
                 " + New agent",
                 new_button_style.add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   ^B n", new_button_style),
-        ]))
+            Span::styled("^B n", new_button_style),
+            new_button.width,
+        ))
         .style(new_button_style),
         new_button,
     );
@@ -1007,10 +1014,11 @@ fn render_sidebar(
         text(theme)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
+        Paragraph::new(trailing_shortcut(
             Span::styled(" ≡ Menu", button_style.add_modifier(Modifier::BOLD)),
-            Span::styled("   ^B m", button_style),
-        ]))
+            Span::styled("^B m", button_style),
+            button.width,
+        ))
         .style(button_style),
         button,
     );
@@ -1576,6 +1584,8 @@ mod tests {
             Some(Rect::new(0, 38, 27, 1))
         );
         assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 27, 1)));
+        let popup = menu_popup_area(menu_button_area(area, true).unwrap());
+        assert_eq!(popup, Rect::new(0, 33, 27, 6));
         assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
         assert_eq!(menu_item_at(area, 50, 36), None);
@@ -1606,15 +1616,19 @@ mod tests {
             })
             .unwrap();
 
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("+ New agent"));
-        assert!(rendered.contains("≡ Menu"));
+        let area = Rect::new(0, 0, 80, 24);
+        let buffer = terminal.backend().buffer();
+        let row = |button: Rect| {
+            (button.x..button.right())
+                .map(|x| buffer[(x, button.y)].symbol())
+                .collect::<String>()
+        };
+        let new_button = row(new_agent_button_area(area, true).unwrap());
+        let menu_button = row(menu_button_area(area, true).unwrap());
+        assert!(new_button.starts_with(" + New agent"));
+        assert!(new_button.ends_with("^B n"));
+        assert!(menu_button.starts_with(" ≡ Menu"));
+        assert!(menu_button.ends_with("^B m"));
     }
 
     #[test]
