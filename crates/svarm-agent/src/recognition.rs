@@ -36,11 +36,32 @@ const CODEX_RULES: &[Rule] = &[
         any: &[
             "would you like to run the following command",
             "would you like to apply the following changes",
+            "allow codex to run",
+            "allow codex to apply proposed code changes",
             "approval required",
             "needs your approval",
             "allow this command",
         ],
-        excluded: &[],
+        excluded: &["esc to interrupt"],
+    },
+    // Codex phrases each approval differently but always offers a verbatim
+    // affirmative option, so the option labels identify the prompt when the
+    // question itself has scrolled out of the dialog window.
+    Rule {
+        id: "codex.approval-options",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &[],
+        any: &[
+            "yes, and allow these permissions for this session",
+            "yes, and allow this host in the future",
+            "yes, grant these permissions for this session",
+            "yes, grant these permissions for this turn",
+            "yes, provide the requested info",
+            "yes, implement this plan",
+            "yes, continue anyway",
+        ],
+        excluded: &["esc to interrupt"],
     },
     Rule {
         id: "codex.question-selector",
@@ -76,10 +97,34 @@ const CLAUDE_RULES: &[Rule] = &[
         required: &[],
         any: &[
             "do you want to proceed?",
+            "do you want to continue?",
+            "do you want to make this edit to",
+            "do you want to create",
+            "do you want to delete",
+            "do you want to allow",
+            "do you want to use this",
+            "no, and tell claude what to do differently",
+            "yes, and don't ask again for",
             "permission required",
             "allow this tool",
         ],
-        excluded: &[],
+        excluded: &["esc to interrupt"],
+    },
+    // Claude renders every permission prompt as a numbered option list with the
+    // selection marker on the first entry, which distinguishes it from the idle
+    // composer prompt that also starts with the same marker.
+    Rule {
+        id: "claude.option-selector",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &["❯ 1."],
+        any: &[],
+        excluded: &[
+            "esc to interrupt",
+            "select model",
+            "select theme",
+            "resume session",
+        ],
     },
     Rule {
         id: "claude.question-selector",
@@ -237,9 +282,14 @@ pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRec
     }
 
     if kind == AgentKind::Claude
-        && let Some(evidence) = bottom(&raw, STATUS_ROWS)
-            .iter()
-            .find(|row| row.trim_start().starts_with('❯'))
+        && let Some(evidence) = bottom(&raw, STATUS_ROWS).iter().find(|row| {
+            let row = row.trim_start();
+            row.starts_with('❯')
+                && !row
+                    .trim_start_matches('❯')
+                    .trim_start()
+                    .starts_with(|character: char| character.is_ascii_digit())
+        })
     {
         return ScreenRecognition::Recognized(RecognitionEvidence {
             provider: kind,
@@ -398,12 +448,65 @@ mod tests {
     }
 
     #[test]
+    fn claude_recognizes_approvals_that_do_not_say_proceed() {
+        assert_eq!(
+            claim(
+                AgentKind::Claude,
+                &["Do you want to make this edit to recognition.rs?\r\n❯ 1. Yes\r\n".as_bytes()]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Claude,
+                &["❯ 1. Yes\r\n  2. Yes, and don't ask again for ls commands\r\n".as_bytes()]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Claude,
+                &["  3. No, and tell Claude what to do differently (esc)".as_bytes()]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+    }
+
+    #[test]
+    fn codex_recognizes_approvals_phrased_as_allow_or_option_labels() {
+        assert_eq!(
+            claim(
+                AgentKind::Codex,
+                &[b"Allow Codex to run `ls -la` in `~/dev/svarm`?\r\n1. Yes"]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Codex,
+                &[b"Allow Codex to apply proposed code changes?"]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Codex,
+                &[b"2. Yes, grant these permissions for this session\r\n? for shortcuts"]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+    }
+
+    #[test]
     fn partial_or_historical_question_text_does_not_claim_blocked() {
         assert_eq!(claim(AgentKind::Claude, &[b"Do you want to proc"]), None);
         assert_eq!(
             claim(AgentKind::Codex, &[b"Working (4s)  esc to inter"]),
             None
         );
+        // A half-drawn option row is neither the composer prompt nor a complete
+        // option list, so it must not claim idle.
+        assert_eq!(claim(AgentKind::Claude, &["❯ 1".as_bytes()]), None);
         let parser = screen(&[
             b"Do you want to proceed?\r\n",
             b"\x1b[20;1H",

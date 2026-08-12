@@ -656,14 +656,26 @@ impl SessionRuntime {
             let _ = title_recognition
                 .as_ref()
                 .and_then(|recognized| recognized.conversation_title.as_ref());
-            match screen_recognition {
+            let from_screen = match screen_recognition {
                 ScreenRecognition::Recognized(evidence) => Some(evidence),
                 ScreenRecognition::Preserve => previous
                     .as_ref()
                     .and_then(|agent| agent.recognition.clone()),
-                ScreenRecognition::Unknown => {
-                    title_recognition.map(|recognized| recognized.evidence)
+                ScreenRecognition::Unknown => None,
+            };
+            let from_title = title_recognition.map(|recognized| recognized.evidence);
+            // A provider that explicitly reports action required outranks any
+            // other screen claim: the title is the provider's own statement that
+            // the turn is waiting on the user.
+            match (from_screen, from_title) {
+                (Some(screen), Some(title))
+                    if title.claim == AgentActivity::Blocked
+                        && screen.claim != AgentActivity::Blocked =>
+                {
+                    Some(title)
                 }
+                (Some(screen), _) => Some(screen),
+                (None, title) => title,
             }
         } else {
             previous
@@ -2209,6 +2221,36 @@ mod tests {
                 if agent.conversation_title.as_deref() == Some("name this thread")
         )));
         runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn action_required_titles_outrank_a_non_blocked_screen_claim() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let session = SessionSnapshot {
+            id: AgentId(1),
+            kind: AgentKind::Codex,
+            launch_directory: cwd,
+            status: SessionStatus::Running,
+            output_generation: 1,
+            read_error: None,
+            exit: None,
+            conversation_id: None,
+        };
+
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process(
+            "\x1b]2;[ ! ] Action Required | Task\x07\x1b[20;1H❯\r\n? for shortcuts".as_bytes(),
+        );
+        let screen = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        assert!(matches!(
+            recognition::recognize(AgentKind::Codex, &screen),
+            ScreenRecognition::Recognized(evidence) if evidence.claim == AgentActivity::Idle
+        ));
+
+        let observed = runtime.observe_with_terminal(session, Instant::now(), false, Some(&screen));
+        assert_eq!(observed.activity, AgentActivity::Blocked);
     }
 
     #[test]
