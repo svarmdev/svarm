@@ -369,4 +369,17 @@ mod tests {
 
         assert!(backend.parser.screen().hyperlink_storage_bytes() <= 1_000_000);
     }
+
+    #[test]
+    fn default_budget_serves_narrow_history_beyond_ten_thousand_rows() {
+        let mut backend = Vt100Backend::new_with_scrollback_bytes(
+            TerminalSize::new(2, 40),
+            crate::session::SCROLLBACK_BYTES,
+        );
+        fill_history(&mut backend, 11_000);
+
+        assert!(backend.parser.screen().scrollback_filled() > 10_000);
+        let viewport = backend.viewport(10_500, CursorStyle::default(), TerminalModes::default());
+        assert_eq!(viewport.state.scrollback.position, 10_500);
+    }
 }

@@ -14,7 +14,7 @@ use crate::{
 /// Called when an agent's terminal changes so its owner can wake immediately.
 pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
 
-const SCROLLBACK_BYTES: usize = 25_000_000;
+pub(crate) const SCROLLBACK_BYTES: usize = 25_000_000;
 
 pub struct AgentSession {
     id: AgentId,
