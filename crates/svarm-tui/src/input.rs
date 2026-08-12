@@ -15,6 +15,7 @@ pub(crate) enum ManagementCommand {
     ScrollTerminalDown,
     ChooseAgent,
     CloseAgent,
+    ArchiveAgent,
     Detach,
     ConfirmQuit,
     ToggleSidebar,
@@ -37,7 +38,7 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
     },
     Keybinding {
         keys: "Ctrl+B, 1..9",
-        action: "select agent",
+        action: "select conversation",
     },
     Keybinding {
         keys: "Ctrl+B, PageUp/PageDown",
@@ -50,6 +51,10 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
     Keybinding {
         keys: "Ctrl+B, x",
         action: "close selected agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, a",
+        action: "archive selected conversation",
     },
     Keybinding {
         keys: "Ctrl+B, d",
@@ -88,6 +93,7 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         HostKeyCode::PageDown => ManagementCommand::ScrollTerminalDown,
         HostKeyCode::Char('n') => ManagementCommand::ChooseAgent,
         HostKeyCode::Char('x') => ManagementCommand::CloseAgent,
+        HostKeyCode::Char('a') => ManagementCommand::ArchiveAgent,
         HostKeyCode::Char('d') => ManagementCommand::Detach,
         HostKeyCode::Char('q') => ManagementCommand::ConfirmQuit,
         HostKeyCode::Char('b') => ManagementCommand::ToggleSidebar,
@@ -190,6 +196,10 @@ mod tests {
         assert_eq!(
             management_command(key(HostKeyCode::PageUp, KeyModifiers::NONE)),
             ManagementCommand::ScrollTerminalUp
+        );
+        assert_eq!(
+            management_command(key(HostKeyCode::Char('a'), KeyModifiers::NONE)),
+            ManagementCommand::ArchiveAgent
         );
         assert!(
             MANAGEMENT_KEYBINDINGS

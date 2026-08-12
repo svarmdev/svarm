@@ -136,7 +136,7 @@ pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecog
     })
 }
 
-fn looks_like_uuid(value: &str) -> bool {
+pub(crate) fn looks_like_uuid(value: &str) -> bool {
     value.len() == 36
         && value.char_indices().all(|(index, character)| {
             if [8, 13, 18, 23].contains(&index) {
@@ -145,6 +145,72 @@ fn looks_like_uuid(value: &str) -> bool {
                 character.is_ascii_hexdigit()
             }
         })
+}
+
+pub(crate) struct ConversationIdDetector {
+    kind: AgentKind,
+    pending: Vec<u8>,
+}
+
+impl ConversationIdDetector {
+    pub(crate) const fn new(kind: AgentKind) -> Self {
+        Self {
+            kind,
+            pending: Vec::new(),
+        }
+    }
+
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut found = None;
+        let mut consumed = 0;
+        while let Some(start) = self.pending[consumed..]
+            .windows(2)
+            .position(|window| window == b"\x1b]")
+            .map(|offset| consumed + offset)
+        {
+            let body = start + 2;
+            let Some((end, terminator)) = osc_end(&self.pending[body..]) else {
+                if start > 0 {
+                    self.pending.drain(..start);
+                }
+                return found;
+            };
+            let end = body + end;
+            let value = String::from_utf8_lossy(&self.pending[body..end]);
+            let candidate = match self.kind {
+                AgentKind::Codex if value.starts_with("0;") || value.starts_with("2;") => value
+                    .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
+                    .find(|value| looks_like_uuid(value)),
+                AgentKind::Claude => value.strip_prefix("777;svarm-conversation="),
+                _ => None,
+            };
+            if let Some(candidate) = candidate.filter(|value| looks_like_uuid(value)) {
+                found = Some(candidate.to_ascii_lowercase());
+            }
+            consumed = end + terminator;
+        }
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        if self.pending.len() > 512 {
+            let keep = self.pending.len() - 512;
+            self.pending.drain(..keep);
+        }
+        found
+    }
+}
+
+fn osc_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes.iter().enumerate().find_map(|(index, byte)| {
+        if *byte == 0x07 {
+            Some((index, 1))
+        } else if *byte == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+            Some((index, 2))
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRecognition {
@@ -359,5 +425,32 @@ mod tests {
             recognize(AgentKind::Codex, &parser),
             ScreenRecognition::Preserve
         ));
+    }
+
+    #[test]
+    fn conversation_ids_are_detected_from_provider_specific_osc_sequences() {
+        let id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let mut codex = ConversationIdDetector::new(AgentKind::Codex);
+        assert_eq!(codex.process(b"before\x1b]2;Ready | 019ff1d3-375e"), None);
+        assert_eq!(
+            codex.process(b"-7a72-a176-c47497827e49\x1b\\after"),
+            Some(id.into())
+        );
+
+        let mut claude = ConversationIdDetector::new(AgentKind::Claude);
+        assert_eq!(
+            claude.process(format!("\x1b]777;svarm-conversation={id}\x07").as_bytes()),
+            Some(id.into())
+        );
+    }
+
+    #[test]
+    fn conversation_id_detector_rejects_wrong_provider_and_malformed_ids() {
+        let mut codex = ConversationIdDetector::new(AgentKind::Codex);
+        assert_eq!(
+            codex.process(b"\x1b]777;svarm-conversation=019ff1d3-375e-7a72-a176-c47497827e49\x07"),
+            None
+        );
+        assert_eq!(codex.process(b"\x1b]2;Ready | not-a-uuid\x07"), None);
     }
 }

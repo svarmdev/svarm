@@ -254,6 +254,31 @@ fn apply_remote_update(
                 app.remove_agent(agent_id);
                 dirty = true;
             }
+            ServerEvent::AgentArchived {
+                agent_id,
+                conversation,
+                ..
+            } => {
+                app.archive_remote_agent(agent_id, conversation);
+                dirty = true;
+            }
+            ServerEvent::ArchivedResumed {
+                conversation_id,
+                agent,
+                ..
+            } => {
+                app.resume_remote_agent(&conversation_id, *agent);
+                dirty = true;
+            }
+            ServerEvent::ConversationSwitched {
+                agent,
+                archived,
+                reactivated_id,
+                ..
+            } => {
+                app.apply_conversation_switch(*agent, archived, reactivated_id.as_deref());
+                dirty = true;
+            }
             ServerEvent::SessionNotice(notice) => {
                 app.set_notice(notice.message);
                 dirty = true;
@@ -343,6 +368,16 @@ fn handle_key(
             KeyCode::Char('n') | KeyCode::Esc => app.set_mode(Mode::Terminal),
             _ => {}
         },
+        Mode::ConfirmArchive => match key.code {
+            KeyCode::Char('y') => archive_selected(app, agents)?,
+            KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirmation(),
+            _ => {}
+        },
+        Mode::ConfirmResume => match key.code {
+            KeyCode::Char('y') => resume_selected_archive(app, agents)?,
+            KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirmation(),
+            _ => {}
+        },
         Mode::ConfirmQuit => match key.code {
             KeyCode::Char('y') => app.request_stop(),
             KeyCode::Char('n') | KeyCode::Esc => app.set_mode(Mode::Terminal),
@@ -430,6 +465,11 @@ fn handle_management_command(
         ManagementCommand::CloseAgent if app.selected_agent_id().is_some() => {
             app.set_mode(Mode::ConfirmClose);
         }
+        ManagementCommand::ArchiveAgent => {
+            if app.request_archive_selected() {
+                archive_selected(app, agents)?;
+            }
+        }
         ManagementCommand::ConfirmQuit => app.set_mode(Mode::ConfirmQuit),
         ManagementCommand::Detach => app.request_detach(),
         ManagementCommand::ToggleSidebar => {
@@ -446,9 +486,10 @@ fn handle_management_command(
         }
         ManagementCommand::OpenKeybinds => app.set_mode(Mode::Keybinds),
         ManagementCommand::SelectAgent(index) => {
-            app.select(index);
-            sync_selection(app, agents)?;
-            app.set_mode(Mode::Terminal);
+            if app.select_sidebar_index(index) {
+                sync_selection(app, agents)?;
+                app.set_mode(Mode::Terminal);
+            }
         }
         ManagementCommand::Cancel => app.set_mode(Mode::Terminal),
         ManagementCommand::Unknown | ManagementCommand::CloseAgent => {
@@ -505,8 +546,9 @@ fn handle_mouse(
         if app.mode() == Mode::Terminal
             && let Some(index) = ui::agent_item_at(app, area, mouse.column, mouse.row)
         {
-            app.select(index);
-            sync_selection(app, agents)?;
+            if app.select_sidebar_index(index) {
+                sync_selection(app, agents)?;
+            }
             return Ok(true);
         }
     }
@@ -555,6 +597,26 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
     };
     agents.close(id)?;
     app.set_mode(Mode::Terminal);
+    Ok(())
+}
+
+fn archive_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
+    let Some(id) = app.selected_agent_id() else {
+        app.cancel_confirmation();
+        return Ok(());
+    };
+    agents.archive(id)?;
+    app.set_mode(Mode::Terminal);
+    Ok(())
+}
+
+fn resume_selected_archive(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
+    let Some(id) = app.pending_resume().map(str::to_owned) else {
+        app.cancel_confirmation();
+        return Ok(());
+    };
+    agents.resume_archived(id)?;
+    app.cancel_confirmation();
     Ok(())
 }
 
@@ -1006,6 +1068,7 @@ mod tests {
                 output_generation: 0,
                 read_error: None,
                 exit: None,
+                conversation_id: None,
             });
         }
         let area = Rect::new(0, 0, 80, 24);
@@ -1019,7 +1082,7 @@ mod tests {
             },
             area,
         ));
-        assert_eq!(app.sidebar_scroll(), Some(1));
+        assert_eq!(app.sidebar_scroll(), Some(3));
     }
 
     #[test]

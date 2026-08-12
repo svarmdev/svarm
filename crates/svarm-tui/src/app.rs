@@ -5,8 +5,8 @@ use svarm_agent::SessionSnapshot;
 use svarm_agent::{
     AgentId, AgentKind, ProcessExit, SessionStatus,
     protocol::{
-        AgentActivity, AgentSnapshot, GitContext, RecognitionEvidence, SessionId, SessionSummary,
-        SvarmSessionSnapshot,
+        AgentActivity, AgentSnapshot, ArchivedConversation, GitContext, RecognitionEvidence,
+        SessionId, SessionSummary, SvarmSessionSnapshot,
     },
     server_session::sort_session_summaries,
 };
@@ -21,6 +21,8 @@ pub(crate) enum Mode {
     ToolPrefix,
     NewAgent(NewAgentPage),
     ConfirmClose,
+    ConfirmArchive,
+    ConfirmResume,
     ConfirmQuit,
     Menu,
     Keybinds,
@@ -247,6 +249,7 @@ pub(crate) struct AgentState {
     seen_generation: u64,
     completed_generation: u64,
     conversation_title: Option<String>,
+    conversation_id: Option<String>,
     activity: AgentActivity,
     recognition: Option<RecognitionEvidence>,
     git: Option<GitContext>,
@@ -275,6 +278,7 @@ impl AgentState {
             seen_generation: snapshot.output_generation,
             completed_generation: 0,
             conversation_title: None,
+            conversation_id: snapshot.conversation_id.clone(),
             activity: AgentActivity::Unknown,
             recognition: None,
             git: None,
@@ -292,6 +296,7 @@ impl AgentState {
             seen_generation: snapshot.seen_generation,
             completed_generation: snapshot.completed_generation,
             conversation_title: snapshot.conversation_title.clone(),
+            conversation_id: snapshot.conversation_id.clone(),
             activity: snapshot.activity,
             recognition: snapshot.recognition.clone(),
             git: snapshot.git.clone(),
@@ -318,6 +323,7 @@ impl AgentState {
             || self.completed_generation != snapshot.completed_generation
             || self.launch_directory != snapshot.launch_directory
             || self.conversation_title != snapshot.conversation_title
+            || self.conversation_id != snapshot.conversation_id
             || self.activity != snapshot.activity
             || self.recognition != snapshot.recognition
             || self.git != snapshot.git;
@@ -328,6 +334,7 @@ impl AgentState {
         self.seen_generation = self.seen_generation.max(snapshot.seen_generation);
         self.completed_generation = snapshot.completed_generation;
         self.conversation_title = snapshot.conversation_title.clone();
+        self.conversation_id = snapshot.conversation_id.clone();
         self.activity = snapshot.activity;
         self.recognition = snapshot.recognition.clone();
         self.git = snapshot.git.clone();
@@ -362,6 +369,10 @@ impl AgentState {
         self.conversation_title.as_deref()
     }
 
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.conversation_id.as_deref()
+    }
+
     pub const fn git(&self) -> Option<&GitContext> {
         self.git.as_ref()
     }
@@ -393,6 +404,7 @@ impl AgentState {
 
 pub(crate) struct App {
     agents: Vec<AgentState>,
+    archived: Vec<ArchivedConversation>,
     selected: usize,
     sidebar_scroll: Option<usize>,
     mode: Mode,
@@ -403,6 +415,7 @@ pub(crate) struct App {
     exit_intent: ExitIntent,
     session_id: Option<SessionId>,
     new_agent: Option<NewAgentState>,
+    pending_resume: Option<String>,
 }
 
 impl App {
@@ -415,6 +428,7 @@ impl App {
     ) -> Self {
         Self {
             agents: Vec::new(),
+            archived: Vec::new(),
             selected: 0,
             sidebar_scroll: None,
             mode: Mode::Terminal,
@@ -425,6 +439,7 @@ impl App {
             exit_intent: ExitIntent::None,
             session_id: None,
             new_agent: None,
+            pending_resume: None,
         }
         .with_test_new_agent(choose_agent)
     }
@@ -444,6 +459,7 @@ impl App {
                 .iter()
                 .map(AgentState::from_remote)
                 .collect(),
+            archived: snapshot.archived,
             selected,
             sidebar_scroll: None,
             mode: Mode::Terminal,
@@ -454,6 +470,7 @@ impl App {
             exit_intent: ExitIntent::None,
             session_id: Some(snapshot.summary.id),
             new_agent: None,
+            pending_resume: None,
         }
     }
 
@@ -511,6 +528,38 @@ impl App {
         self.mode = Mode::Terminal;
     }
 
+    pub fn archive_remote_agent(&mut self, id: AgentId, conversation: ArchivedConversation) {
+        self.remove_agent(id);
+        self.archived
+            .retain(|item| item.conversation_id != conversation.conversation_id);
+        self.archived.insert(0, conversation);
+    }
+
+    pub fn resume_remote_agent(&mut self, conversation_id: &str, snapshot: AgentSnapshot) {
+        self.archived
+            .retain(|item| item.conversation_id != conversation_id);
+        self.add_remote_agent(snapshot);
+        self.pending_resume = None;
+    }
+
+    pub fn apply_conversation_switch(
+        &mut self,
+        snapshot: AgentSnapshot,
+        archived: Option<ArchivedConversation>,
+        reactivated_id: Option<&str>,
+    ) {
+        if let Some(id) = reactivated_id {
+            self.archived.retain(|item| item.conversation_id != id);
+        }
+        if let Some(conversation) = archived {
+            self.archived
+                .retain(|item| item.conversation_id != conversation.conversation_id);
+            self.archived.insert(0, conversation);
+        }
+        self.update_remote_agent(snapshot);
+        self.sidebar_scroll = None;
+    }
+
     pub fn select_next(&mut self) {
         if !self.agents.is_empty() {
             self.selected = (self.selected + 1) % self.agents.len();
@@ -536,12 +585,13 @@ impl App {
     }
 
     pub fn scroll_sidebar(&mut self, rows: isize, visible: usize) {
-        let max = self.agents.len().saturating_sub(visible.max(1));
+        let max = self.sidebar_content_height().saturating_sub(visible.max(1));
         let current = self.sidebar_scroll.unwrap_or_else(|| {
-            self.selected
-                .saturating_sub(visible.saturating_sub(1))
+            (self.selected * 3)
+                .saturating_sub(visible.saturating_sub(3))
                 .min(max)
         });
+        let rows = rows.saturating_mul(3);
         self.sidebar_scroll = Some(if rows >= 0 {
             current.saturating_add(rows as usize).min(max)
         } else {
@@ -617,6 +667,58 @@ impl App {
 
     pub fn agents(&self) -> &[AgentState] {
         &self.agents
+    }
+
+    pub fn archived(&self) -> &[ArchivedConversation] {
+        &self.archived
+    }
+
+    pub fn sidebar_content_height(&self) -> usize {
+        self.agents.len() * 3
+            + if self.archived.is_empty() {
+                0
+            } else {
+                1 + self.archived.len()
+            }
+    }
+
+    pub fn select_sidebar_index(&mut self, index: usize) -> bool {
+        if index < self.agents.len() {
+            self.select(index);
+            return true;
+        }
+        if let Some(conversation) = self.archived.get(index - self.agents.len()) {
+            self.pending_resume = Some(conversation.conversation_id.clone());
+            self.mode = Mode::ConfirmResume;
+        }
+        false
+    }
+
+    pub fn request_archive_selected(&mut self) -> bool {
+        let Some(agent) = self.agents.get(self.selected) else {
+            return false;
+        };
+        if agent.conversation_title().is_none() || agent.conversation_id().is_none() {
+            self.set_notice("unnamed conversations cannot be archived");
+            self.mode = Mode::Terminal;
+            return false;
+        }
+        if agent.status() == SessionStatus::Running
+            && !matches!(agent.activity, AgentActivity::Idle)
+        {
+            self.mode = Mode::ConfirmArchive;
+            return false;
+        }
+        true
+    }
+
+    pub fn pending_resume(&self) -> Option<&str> {
+        self.pending_resume.as_deref()
+    }
+
+    pub fn cancel_confirmation(&mut self) {
+        self.pending_resume = None;
+        self.mode = Mode::Terminal;
     }
 
     pub const fn selected_index(&self) -> usize {
@@ -945,6 +1047,7 @@ mod tests {
             output_generation: generation,
             read_error: None,
             exit: None,
+            conversation_id: None,
         }
     }
 
@@ -1004,9 +1107,9 @@ mod tests {
         }
 
         app.scroll_sidebar(-1, 7);
-        assert_eq!(app.sidebar_scroll(), Some(0));
+        assert_eq!(app.sidebar_scroll(), Some(14));
         app.scroll_sidebar(99, 7);
-        assert_eq!(app.sidebar_scroll(), Some(1));
+        assert_eq!(app.sidebar_scroll(), Some(17));
 
         app.select_previous();
         assert_eq!(app.sidebar_scroll(), None);
@@ -1212,6 +1315,7 @@ mod tests {
             rows: 24,
             cols: 80,
             agents: vec![first, second],
+            archived: Vec::new(),
         };
 
         let app = App::hydrate(snapshot, ThemeName::Light, Some("notice".into()));
@@ -1232,6 +1336,7 @@ mod tests {
             rows: 24,
             cols: 80,
             agents: vec![],
+            archived: Vec::new(),
         };
 
         let app = App::hydrate(snapshot, ThemeName::Dark, None);
@@ -1239,6 +1344,97 @@ mod tests {
         assert_eq!(app.mode(), Mode::Terminal);
         assert_eq!(app.selected_agent_id(), None);
         assert_eq!(app.exit_intent(), ExitIntent::None);
+    }
+
+    #[test]
+    fn only_named_resumable_conversations_can_be_archived() {
+        let mut unnamed = app();
+        unnamed.add_agent(snapshot(1, 0));
+        assert!(!unnamed.request_archive_selected());
+        assert_eq!(unnamed.mode(), Mode::Terminal);
+        assert!(unnamed.notice().unwrap().contains("unnamed"));
+
+        let mut active = remote_agent(1, 0, 0);
+        active.conversation_title = Some("Archive work".into());
+        active.conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e49".into());
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active.clone()],
+                archived: Vec::new(),
+            },
+            ThemeName::Dark,
+            None,
+        );
+        assert!(!app.request_archive_selected());
+        assert_eq!(app.mode(), Mode::ConfirmArchive);
+
+        active.activity = AgentActivity::Idle;
+        app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active],
+                archived: Vec::new(),
+            },
+            ThemeName::Dark,
+            None,
+        );
+        assert!(app.request_archive_selected());
+    }
+
+    #[test]
+    fn archived_numbers_open_reactivation_confirmation_without_selecting_an_agent() {
+        let active = remote_agent(1, 0, 0);
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active],
+                archived: vec![archived("first", "First archived")],
+            },
+            ThemeName::Dark,
+            None,
+        );
+
+        assert!(!app.select_sidebar_index(1));
+        assert_eq!(app.mode(), Mode::ConfirmResume);
+        assert_eq!(app.pending_resume(), Some("first"));
+        assert_eq!(app.selected_agent_id(), Some(AgentId::new(1)));
+    }
+
+    #[test]
+    fn conversation_switch_archives_the_old_id_and_removes_a_reactivated_id() {
+        let mut active = remote_agent(1, 0, 0);
+        active.conversation_id = Some("new".into());
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active.clone()],
+                archived: vec![archived("new", "Previously archived")],
+            },
+            ThemeName::Dark,
+            None,
+        );
+
+        app.apply_conversation_switch(
+            active,
+            Some(archived("old", "Old conversation")),
+            Some("new"),
+        );
+
+        assert_eq!(app.archived().len(), 1);
+        assert_eq!(app.archived()[0].conversation_id, "old");
     }
 
     #[test]
@@ -1297,9 +1493,19 @@ mod tests {
             terminal_sequence: TerminalSequence(0),
             read_error: None,
             conversation_title: None,
+            conversation_id: None,
             activity: AgentActivity::Unknown,
             recognition: None,
             git: None,
+        }
+    }
+
+    fn archived(id: &str, title: &str) -> ArchivedConversation {
+        ArchivedConversation {
+            conversation_id: id.into(),
+            title: title.into(),
+            kind: AgentKind::Codex,
+            launch_directory: "/tmp".into(),
         }
     }
 }

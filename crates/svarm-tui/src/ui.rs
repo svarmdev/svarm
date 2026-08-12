@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use svarm_agent::terminal_model::TerminalSnapshot;
 
@@ -99,6 +99,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?")
         }
+        Mode::ConfirmArchive => render_confirmation(
+            frame,
+            theme,
+            " Archive conversation? ",
+            "Stop this active agent and archive its conversation?",
+        ),
+        Mode::ConfirmResume => render_confirmation(
+            frame,
+            theme,
+            " Reactivate conversation? ",
+            "Start this archived conversation again?",
+        ),
         Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme),
         Mode::Keybinds => render_keybinds(frame, theme),
         Mode::Settings => render_settings(frame, app, theme),
@@ -284,12 +296,13 @@ pub fn agent_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     if column < agents.x || column >= agents.right() || row < agents.y || row >= agents.bottom() {
         return None;
     }
-    let slot = usize::from((row - agents.y) / AGENT_CARD_HEIGHT);
-    if slot >= usize::from(agents.height / AGENT_CARD_HEIGHT) {
-        return None;
+    let content_row = sidebar_row_start(app, agents) + usize::from(row - agents.y);
+    let active_height = app.agents().len() * usize::from(AGENT_CARD_HEIGHT);
+    if content_row < active_height {
+        return Some(content_row / usize::from(AGENT_CARD_HEIGHT));
     }
-    let index = agent_list_start(app, agents) + slot;
-    (index < app.agents().len()).then_some(index)
+    let archived_row = content_row.checked_sub(active_height + 1)?;
+    (archived_row < app.archived().len()).then_some(app.agents().len() + archived_row)
 }
 
 fn menu_popup_area(button: Rect) -> Rect {
@@ -319,16 +332,19 @@ fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
     )
 }
 
-fn agent_list_start(app: &App, area: Rect) -> usize {
-    let visible = usize::from((area.height / AGENT_CARD_HEIGHT).max(1));
-    let max = app.agents().len().saturating_sub(visible);
+fn sidebar_row_start(app: &App, area: Rect) -> usize {
+    let visible = usize::from(area.height.max(1));
+    let max = app.sidebar_content_height().saturating_sub(visible);
     app.sidebar_scroll()
-        .unwrap_or_else(|| app.selected_index().saturating_sub(visible - 1))
+        .unwrap_or_else(|| {
+            (app.selected_index() * usize::from(AGENT_CARD_HEIGHT))
+                .saturating_sub(visible.saturating_sub(usize::from(AGENT_CARD_HEIGHT)))
+        })
         .min(max)
 }
 
 pub fn agent_list_page_size(app: &App, area: Rect) -> usize {
-    usize::from(agent_list_area(app, sidebar_area(area)).height / AGENT_CARD_HEIGHT).max(1)
+    usize::from(agent_list_area(app, sidebar_area(area)).height).max(1)
 }
 
 fn render_sidebar(
@@ -352,91 +368,110 @@ fn render_sidebar(
     let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
     let agents_area = agent_list_area(app, area);
 
-    let cards = app
-        .agents()
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| {
-            let selected = index == app.selected_index();
-            let marker = if selected { "▌" } else { " " };
-            let status = agent.display_status();
-            let (circle, status_style) = status_display(status, colors_enabled);
-            let content_width = usize::from(agents_area.width.saturating_sub(2));
-            let number = format!("{} · ", index + 1);
-            let title = end_truncate(
-                agent.conversation_title().unwrap_or("Unnamed conversation"),
-                usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
-            );
-            let directory = agent
-                .git()
-                .map(|git| git.worktree.as_path())
-                .unwrap_or_else(|| agent.launch_directory());
-            let directory = directory
-                .file_name()
-                .unwrap_or(directory.as_os_str())
-                .to_string_lossy();
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(marker, accent(theme)),
-                    Span::styled(format!("{circle} "), status_style),
-                    Span::styled(number, theme.muted()),
-                    Span::styled(title, text(theme).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    Span::styled(marker, accent(theme)),
-                    Span::raw(" "),
-                    Span::styled(agent.kind().label(), text(theme)),
-                    Span::styled(" · ", theme.muted()),
-                    Span::styled(
-                        end_truncate(
-                            &directory,
-                            content_width.saturating_sub(agent.kind().label().chars().count() + 5),
-                        ),
-                        text(theme),
+    let mut rows = Vec::new();
+    for (index, agent) in app.agents().iter().enumerate() {
+        let selected = index == app.selected_index();
+        let marker = if selected { "▌" } else { " " };
+        let status = agent.display_status();
+        let (circle, status_style) = status_display(status, colors_enabled);
+        let content_width = usize::from(agents_area.width.saturating_sub(2));
+        let number = format!("{} · ", index + 1);
+        let title = end_truncate(
+            agent.conversation_title().unwrap_or("Unnamed conversation"),
+            usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
+        );
+        let directory = agent
+            .git()
+            .map(|git| git.worktree.as_path())
+            .unwrap_or_else(|| agent.launch_directory());
+        let directory = directory
+            .file_name()
+            .unwrap_or(directory.as_os_str())
+            .to_string_lossy();
+        let selected_style = if selected {
+            text(theme).add_modifier(Modifier::BOLD)
+        } else {
+            text(theme)
+        };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(marker, accent(theme)),
+                Span::styled(format!("{circle} "), status_style),
+                Span::styled(number, theme.muted()),
+                Span::styled(title, selected_style.add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(marker, accent(theme)),
+                Span::raw(" "),
+                Span::styled(agent.kind().label(), text(theme)),
+                Span::styled(" · ", theme.muted()),
+                Span::styled(
+                    end_truncate(
+                        &directory,
+                        content_width.saturating_sub(agent.kind().label().chars().count() + 5),
                     ),
-                ]),
-            ];
-            if let Some(git) = agent.git() {
-                let tracking = git
-                    .ahead
-                    .zip(git.behind)
-                    .filter(|(ahead, behind)| *ahead != 0 || *behind != 0)
-                    .map_or_else(String::new, |(ahead, behind)| {
-                        format!(" ↑{ahead} ↓{behind}")
-                    });
-                let (additions, deletions) = if git.additions == 0 && git.deletions == 0 {
-                    (String::new(), String::new())
-                } else {
-                    (
-                        format!(" +{}", git.additions),
-                        format!(" -{}", git.deletions),
-                    )
-                };
-                let branch_width = content_width
-                    .saturating_sub(2)
-                    .saturating_sub(additions.chars().count())
-                    .saturating_sub(deletions.chars().count())
-                    .saturating_sub(tracking.chars().count());
-                lines.push(Line::from(vec![
-                    Span::styled(marker, accent(theme)),
-                    Span::raw(" "),
-                    Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
-                    Span::styled(additions, success(theme)),
-                    Span::styled(deletions, Style::default().fg(theme.error)),
-                    Span::styled(tracking, theme.muted()),
-                ]));
+                    text(theme),
+                ),
+            ]),
+        ];
+        if let Some(git) = agent.git() {
+            let tracking = git
+                .ahead
+                .zip(git.behind)
+                .filter(|(ahead, behind)| *ahead != 0 || *behind != 0)
+                .map_or_else(String::new, |(ahead, behind)| {
+                    format!(" ↑{ahead} ↓{behind}")
+                });
+            let (additions, deletions) = if git.additions == 0 && git.deletions == 0 {
+                (String::new(), String::new())
             } else {
-                lines.push(Line::from(Span::styled(marker, accent(theme))));
-            }
-            ListItem::new(lines).style(if selected {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut state = ListState::default().with_offset(agent_list_start(app, agents_area));
-    frame.render_stateful_widget(List::new(cards), agents_area, &mut state);
+                (
+                    format!(" +{}", git.additions),
+                    format!(" -{}", git.deletions),
+                )
+            };
+            let branch_width = content_width
+                .saturating_sub(2)
+                .saturating_sub(additions.chars().count())
+                .saturating_sub(deletions.chars().count())
+                .saturating_sub(tracking.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(marker, accent(theme)),
+                Span::raw(" "),
+                Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
+                Span::styled(additions, success(theme)),
+                Span::styled(deletions, Style::default().fg(theme.error)),
+                Span::styled(tracking, theme.muted()),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(marker, accent(theme))));
+        }
+        rows.append(&mut lines);
+    }
+    if !app.archived().is_empty() {
+        rows.push(Line::from(Span::styled(
+            " Archived",
+            theme.muted().add_modifier(Modifier::BOLD),
+        )));
+        rows.extend(
+            app.archived()
+                .iter()
+                .enumerate()
+                .map(|(index, conversation)| {
+                    let number = format!("  {} · ", app.agents().len() + index + 1);
+                    let title = end_truncate(
+                        &conversation.title,
+                        usize::from(agents_area.width).saturating_sub(number.chars().count()),
+                    );
+                    Line::from(vec![
+                        Span::styled(number, theme.muted()),
+                        Span::styled(title, text(theme)),
+                    ])
+                }),
+        );
+    }
+    let scroll = u16::try_from(sidebar_row_start(app, agents_area)).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(rows).scroll((scroll, 0)), agents_area);
 
     if let Some(notice) = app.notice() {
         let y = agents_area.bottom();
@@ -975,8 +1010,9 @@ mod tests {
 
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
     use svarm_agent::protocol::{
-        AgentActivity, AgentSnapshot, AttachmentSummary, ConnectionId, GitContext, SessionId,
-        SessionRevision, SessionSummary, SvarmSessionSnapshot, TerminalSequence,
+        AgentActivity, AgentSnapshot, ArchivedConversation, AttachmentSummary, ConnectionId,
+        GitContext, SessionId, SessionRevision, SessionSummary, SvarmSessionSnapshot,
+        TerminalSequence,
     };
     use svarm_agent::terminal_model::{TerminalPosition, TerminalSize};
 
@@ -1234,6 +1270,7 @@ mod tests {
             terminal_sequence: TerminalSequence(0),
             read_error: None,
             conversation_title: None,
+            conversation_id: None,
             activity: AgentActivity::Unknown,
             recognition: None,
             git: None,
@@ -1245,6 +1282,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 agents: vec![agent],
+                archived: Vec::new(),
             },
             crate::theme::ThemeName::Monochrome,
             None,
@@ -1286,6 +1324,7 @@ mod tests {
             terminal_sequence: TerminalSequence(0),
             read_error: None,
             conversation_title: (id != 1).then(|| format!("Conversation {id}")),
+            conversation_id: None,
             activity: AgentActivity::Idle,
             recognition: None,
             git: (id == 2).then_some(GitContext {
@@ -1306,6 +1345,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 agents: vec![exited, unseen],
+                archived: Vec::new(),
             },
             crate::theme::ThemeName::Monochrome,
             None,
@@ -1332,6 +1372,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 agents: vec![plain],
+                archived: Vec::new(),
             },
             crate::theme::ThemeName::Monochrome,
             None,
@@ -1354,6 +1395,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 agents: vec![clean],
+                archived: Vec::new(),
             },
             crate::theme::ThemeName::Monochrome,
             None,
@@ -1398,6 +1440,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn archived_conversations_render_as_title_only_below_active_cards() {
+        let active = AgentSnapshot {
+            id: svarm_agent::AgentId::new(1),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: "/tmp/active".into(),
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 0,
+            seen_generation: 0,
+            completed_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            conversation_title: Some("Active title".into()),
+            conversation_id: Some("active-id".into()),
+            activity: AgentActivity::Idle,
+            recognition: None,
+            git: None,
+        };
+        let summary = SessionSummary {
+            id: SessionId(10),
+            running_agents: 1,
+            total_agents: 1,
+            attachment: None,
+            last_user_activity_ms: 1,
+            revision: SessionRevision(1),
+        };
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary,
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active.clone()],
+                archived: vec![ArchivedConversation {
+                    conversation_id: "archived-id".into(),
+                    title: "Archived title".into(),
+                    kind: svarm_agent::AgentKind::Claude,
+                    launch_directory: "/tmp/hidden-archive-directory".into(),
+                }],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("Archived"));
+        assert!(rendered.contains("2 · Archived title"));
+        assert!(!rendered.contains("Claude Code"));
+        assert!(!rendered.contains("hidden-archive-directory"));
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 4), None);
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 5), Some(1));
     }
 
     #[test]
@@ -1449,6 +1545,7 @@ mod tests {
                 terminal_sequence: TerminalSequence(0),
                 read_error: None,
                 conversation_title: Some(format!("Conversation {id}")),
+                conversation_id: None,
                 activity: AgentActivity::Idle,
                 recognition: None,
                 git: None,
@@ -1468,6 +1565,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 agents,
+                archived: Vec::new(),
             },
             crate::theme::ThemeName::Monochrome,
             None,

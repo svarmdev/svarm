@@ -9,7 +9,7 @@ use crate::{
 
 pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -136,6 +136,14 @@ pub enum Request {
         kind: AgentKind,
         launch_directory: PathBuf,
     },
+    ArchiveAgent {
+        lease_token: LeaseToken,
+        agent_id: AgentId,
+    },
+    ResumeArchived {
+        lease_token: LeaseToken,
+        conversation_id: String,
+    },
     CloseAgent {
         lease_token: LeaseToken,
         agent_id: AgentId,
@@ -244,6 +252,22 @@ pub enum Event {
     AgentRemoved {
         revision: SessionRevision,
         agent_id: AgentId,
+    },
+    AgentArchived {
+        revision: SessionRevision,
+        agent_id: AgentId,
+        conversation: ArchivedConversation,
+    },
+    ArchivedResumed {
+        revision: SessionRevision,
+        conversation_id: String,
+        agent: Box<AgentSnapshot>,
+    },
+    ConversationSwitched {
+        revision: SessionRevision,
+        agent: Box<AgentSnapshot>,
+        archived: Option<ArchivedConversation>,
+        reactivated_id: Option<String>,
     },
     TerminalFull(TerminalFull),
     TerminalDiff(TerminalDiff),
@@ -378,9 +402,18 @@ pub struct AgentSnapshot {
     pub terminal_sequence: TerminalSequence,
     pub read_error: Option<String>,
     pub conversation_title: Option<String>,
+    pub conversation_id: Option<String>,
     pub activity: AgentActivity,
     pub recognition: Option<RecognitionEvidence>,
     pub git: Option<GitContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchivedConversation {
+    pub conversation_id: String,
+    pub title: String,
+    pub kind: AgentKind,
+    pub launch_directory: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -390,6 +423,7 @@ pub struct SvarmSessionSnapshot {
     pub rows: u16,
     pub cols: u16,
     pub agents: Vec<AgentSnapshot>,
+    pub archived: Vec<ArchivedConversation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -590,7 +624,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_eight_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_nine_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -609,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_eight_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_nine_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,

@@ -1,5 +1,5 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +24,9 @@ const NONINTERACTIVE_CHOICE_ERROR: &str =
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(&cli.command, Some(Command::ConversationHook)) {
+        return conversation_hook();
+    }
     let paths = RuntimePaths::discover()?;
     let internal_server = matches!(&cli.command, Some(Command::InternalServer));
     if !internal_server {
@@ -34,6 +37,7 @@ fn main() -> Result<()> {
     }
     let result = match cli.command {
         Some(Command::InternalServer) => server_start::run_server(),
+        Some(Command::ConversationHook) => unreachable!("hook returned before runtime discovery"),
         Some(Command::Server {
             command: ServerCommand::Run,
         }) => server_start::run_server(),
@@ -58,6 +62,12 @@ fn main() -> Result<()> {
         );
     }
     result
+}
+
+fn conversation_hook() -> Result<()> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    svarm_agent::send_claude_hook_session_id(&input)
 }
 
 fn launch(paths: &RuntimePaths, cli: Cli) -> Result<()> {

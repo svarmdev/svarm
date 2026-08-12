@@ -31,6 +31,8 @@ pub use terminal_process::{
     ProcessExit, Result, SessionStatus, TerminalNotifier, TerminalProcess, TerminalProcessSnapshot,
 };
 
+const CLAUDE_SIGNAL_ENV: &str = "SVARM_CONVERSATION_SOCKET";
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct AgentId(u64);
@@ -88,6 +90,23 @@ impl FromStr for AgentKind {
     }
 }
 
+pub fn claude_hook_session_id(input: &str) -> Option<String> {
+    let input = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    let id = input.get("session_id")?.as_str()?;
+    recognition::looks_like_uuid(id).then(|| id.to_ascii_lowercase())
+}
+
+pub fn send_claude_hook_session_id(input: &str) -> Result<()> {
+    let Some(id) = claude_hook_session_id(input) else {
+        return Ok(());
+    };
+    let Some(path) = std::env::var_os(CLAUDE_SIGNAL_ENV) else {
+        return Ok(());
+    };
+    std::os::unix::net::UnixDatagram::unbound()?.send_to(id.as_bytes(), path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +116,18 @@ mod tests {
         assert_eq!("codex".parse(), Ok(AgentKind::Codex));
         assert_eq!("claude-code".parse(), Ok(AgentKind::Claude));
         assert!("opencode".parse::<AgentKind>().is_err());
+    }
+
+    #[test]
+    fn claude_hook_accepts_only_a_valid_session_id() {
+        assert_eq!(
+            claude_hook_session_id(
+                r#"{"session_id":"019FF1D3-375E-7A72-A176-C47497827E49","source":"clear"}"#,
+            )
+            .as_deref(),
+            Some("019ff1d3-375e-7a72-a176-c47497827e49")
+        );
+        assert_eq!(claude_hook_session_id(r#"{"session_id":"bad"}"#), None);
+        assert_eq!(claude_hook_session_id("not json"), None);
     }
 }

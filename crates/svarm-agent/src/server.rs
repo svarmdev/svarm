@@ -20,11 +20,12 @@ use crate::{
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
     protocol::{
-        AgentActivity, AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event,
-        GitContext, KeyCode, KeyInput, LeaseToken, Message, ProtocolError, ProtocolRange,
-        RecognitionEvidence, Request, RequestId, Response, ServerCapabilities, ServerInstanceId,
-        ServerStatusSnapshot, SessionId, SessionSummary, StopSummary, SvarmSessionSnapshot,
-        TerminalDiff, TerminalFull, TerminalModes, TerminalSequence, TerminalViewport, Welcome,
+        AgentActivity, AgentSnapshot, ArchivedConversation, ConnectionId, ConnectionRole, Envelope,
+        ErrorCode, Event, GitContext, KeyCode, KeyInput, LeaseToken, Message, ProtocolError,
+        ProtocolRange, RecognitionEvidence, Request, RequestId, Response, ServerCapabilities,
+        ServerInstanceId, ServerStatusSnapshot, SessionId, SessionSummary, StopSummary,
+        SvarmSessionSnapshot, TerminalDiff, TerminalFull, TerminalModes, TerminalSequence,
+        TerminalViewport, Welcome,
     },
     pty_size,
     recognition::{self, ScreenRecognition},
@@ -308,6 +309,7 @@ struct SessionRuntime {
     input_drafts: HashMap<AgentId, InputDraft>,
     git_checked: HashMap<AgentId, Instant>,
     frame_bases: HashMap<AgentId, FrameBasis>,
+    archived: Vec<ArchivedConversation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,7 +385,7 @@ impl InputDraft {
     fn submit(&mut self) {
         let title = self.chars.iter().collect::<String>();
         let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !title.is_empty() {
+        if !title.is_empty() && !title.starts_with('/') {
             self.title = Some(title);
         }
         self.chars.clear();
@@ -425,6 +427,7 @@ impl SessionRuntime {
             input_drafts: HashMap::new(),
             git_checked: HashMap::new(),
             frame_bases: HashMap::new(),
+            archived: Vec::new(),
         }
     }
 
@@ -463,6 +466,96 @@ impl SessionRuntime {
         Ok(())
     }
 
+    fn archive(&mut self, id: AgentId, now_ms: u64) -> Result<ArchivedConversation, ProtocolError> {
+        let observed = self.previous.get(&id).ok_or_else(agent_not_found)?;
+        let conversation_id = observed.session.conversation_id.clone().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "conversation is not resumable yet",
+            )
+        })?;
+        let title = observed.conversation_title.clone().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unnamed conversations cannot be archived",
+            )
+        })?;
+        let conversation = ArchivedConversation {
+            conversation_id,
+            title,
+            kind: observed.session.kind,
+            launch_directory: observed.session.launch_directory.clone(),
+        };
+        self.close(id, now_ms).map_err(internal_error)?;
+        self.archived
+            .retain(|item| item.conversation_id != conversation.conversation_id);
+        self.archived.insert(0, conversation.clone());
+        self.state.metadata_changed();
+        Ok(conversation)
+    }
+
+    fn resume_archived(
+        &mut self,
+        conversation_id: &str,
+        now_ms: u64,
+        _config: &ServerConfig,
+    ) -> Result<SessionSnapshot, ProtocolError> {
+        let index = self
+            .archived
+            .iter()
+            .position(|item| item.conversation_id == conversation_id)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "archived conversation was not found",
+                )
+            })?;
+        let conversation = self.archived[index].clone();
+        #[cfg(test)]
+        let snapshot = if let Some((program, args)) = &_config.test_agent_command {
+            self.agents
+                .spawn_test_command_with_conversation(
+                    conversation.kind,
+                    &conversation.launch_directory,
+                    program,
+                    args,
+                    Some(conversation.conversation_id.clone()),
+                )
+                .map_err(internal_error)?
+        } else {
+            self.agents
+                .resume(
+                    conversation.kind,
+                    &conversation.launch_directory,
+                    &conversation.conversation_id,
+                )
+                .map_err(internal_error)?
+        };
+        #[cfg(not(test))]
+        let snapshot = self
+            .agents
+            .resume(
+                conversation.kind,
+                &conversation.launch_directory,
+                &conversation.conversation_id,
+            )
+            .map_err(internal_error)?;
+        self.state
+            .register_agent(snapshot.id, snapshot.output_generation, now_ms);
+        self.input_drafts.insert(
+            snapshot.id,
+            InputDraft {
+                title: Some(conversation.title),
+                ..InputDraft::default()
+            },
+        );
+        let observed = self.observe(snapshot.clone(), Instant::now(), true);
+        self.previous.insert(snapshot.id, observed);
+        self.archived.remove(index);
+        self.state.metadata_changed();
+        Ok(snapshot)
+    }
+
     fn send_input(&mut self, id: AgentId, bytes: &[u8], now_ms: u64) -> Result<(), ProtocolError> {
         let snapshot = self.agents.snapshot(id).ok_or_else(agent_not_found)?;
         if snapshot.status == SessionStatus::Exited {
@@ -497,6 +590,7 @@ impl SessionRuntime {
             rows,
             cols,
             agents,
+            archived: self.archived.clone(),
         }
     }
 
@@ -517,6 +611,7 @@ impl SessionRuntime {
                 .unwrap_or(crate::protocol::TerminalSequence(0)),
             read_error: snapshot.read_error,
             conversation_title: observed.and_then(|agent| agent.conversation_title.clone()),
+            conversation_id: snapshot.conversation_id,
             activity: observed.map_or(AgentActivity::Unknown, |agent| agent.activity),
             recognition: observed.and_then(|agent| agent.recognition.clone()),
             git: observed.and_then(|agent| agent.git.clone()),
@@ -751,12 +846,57 @@ impl SessionRuntime {
         let attached = self.state.attachment().is_some();
         let now = Instant::now();
         let mut changed = Vec::new();
+        let mut switched = Vec::new();
         let mut terminals = Vec::new();
         for result in self.agents.poll() {
             let Ok(snapshot) = result else {
                 continue;
             };
             let previous = self.previous.get(&snapshot.id).cloned();
+            let id_changed = previous.as_ref().is_some_and(|old| {
+                old.session.conversation_id.is_some()
+                    && snapshot.conversation_id.is_some()
+                    && old.session.conversation_id != snapshot.conversation_id
+            });
+            let mut archived = None;
+            let mut reactivated_id = None;
+            if id_changed {
+                let new_id = snapshot.conversation_id.as_deref().unwrap();
+                if let Some(index) = self
+                    .archived
+                    .iter()
+                    .position(|item| item.conversation_id == new_id)
+                {
+                    let reactivated = self.archived.remove(index);
+                    reactivated_id = Some(reactivated.conversation_id);
+                    self.input_drafts.insert(
+                        snapshot.id,
+                        InputDraft {
+                            title: Some(reactivated.title),
+                            ..InputDraft::default()
+                        },
+                    );
+                } else {
+                    self.input_drafts.insert(snapshot.id, InputDraft::default());
+                }
+                if let Some(old) = previous.as_ref()
+                    && let (Some(conversation_id), Some(title)) = (
+                        old.session.conversation_id.clone(),
+                        old.conversation_title.clone(),
+                    )
+                {
+                    let conversation = ArchivedConversation {
+                        conversation_id,
+                        title,
+                        kind: old.session.kind,
+                        launch_directory: old.session.launch_directory.clone(),
+                    };
+                    self.archived
+                        .retain(|item| item.conversation_id != conversation.conversation_id);
+                    self.archived.insert(0, conversation.clone());
+                    archived = Some(conversation);
+                }
+            }
             let screen_changed = previous.as_ref().is_none_or(|previous| {
                 previous.session.output_generation != snapshot.output_generation
             });
@@ -765,7 +905,9 @@ impl SessionRuntime {
                 .flatten();
             let observed =
                 self.observe_with_terminal(snapshot.clone(), now, false, terminal.as_ref());
-            if previous.as_ref() != Some(&observed) {
+            if id_changed {
+                switched.push((snapshot.clone(), archived, reactivated_id));
+            } else if previous.as_ref() != Some(&observed) {
                 changed.push(snapshot.clone());
             }
             self.previous.insert(snapshot.id, observed);
@@ -778,7 +920,7 @@ impl SessionRuntime {
                 terminals.push((snapshot.id, terminal));
             }
         }
-        if !changed.is_empty() {
+        if !changed.is_empty() || !switched.is_empty() {
             self.state.metadata_changed();
         }
         let revision = self.state.revision();
@@ -789,6 +931,18 @@ impl SessionRuntime {
                 agent: self.agent_snapshot(snapshot),
             })
             .collect::<Vec<_>>();
+        events.extend(
+            switched
+                .into_iter()
+                .map(
+                    |(snapshot, archived, reactivated_id)| Event::ConversationSwitched {
+                        revision,
+                        agent: Box::new(self.agent_snapshot(snapshot)),
+                        archived,
+                        reactivated_id,
+                    },
+                ),
+        );
         for (id, terminal) in terminals {
             if let Some(event) = self.terminal_event_with_snapshot(id, false, terminal) {
                 events.push(event);
@@ -1044,7 +1198,7 @@ impl Server {
                         .expect("attached session exists");
                     runtime.state.detach(&lease_token, now)?;
                     runtime.frame_bases.clear();
-                    runtime.agents.is_empty()
+                    runtime.agents.is_empty() && runtime.archived.is_empty()
                 };
                 if remove {
                     self.sessions.remove(&session_id);
@@ -1096,6 +1250,47 @@ impl Server {
                         agent_id,
                     },
                 ));
+                Ok(outcome)
+            }
+            Request::ArchiveAgent {
+                lease_token,
+                agent_id,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let conversation = runtime.archive(agent_id, now)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((
+                    id,
+                    Event::AgentArchived {
+                        revision: runtime.state.revision(),
+                        agent_id,
+                        conversation,
+                    },
+                ));
+                Ok(outcome)
+            }
+            Request::ResumeArchived {
+                lease_token,
+                conversation_id,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let now = self.now_ms();
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                let snapshot = runtime.resume_archived(&conversation_id, now, &self.config)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((
+                    id,
+                    Event::ArchivedResumed {
+                        revision: runtime.state.revision(),
+                        conversation_id,
+                        agent: Box::new(runtime.agent_snapshot(snapshot.clone())),
+                    },
+                ));
+                if let Some(event) = runtime.full_terminal(snapshot.id) {
+                    outcome.events.push((id, event));
+                }
                 Ok(outcome)
             }
             Request::StopAttachedSession { lease_token } => {
@@ -1544,7 +1739,7 @@ impl Server {
             && runtime.state.disconnect(id, now)
         {
             runtime.frame_bases.clear();
-            if runtime.agents.is_empty() {
+            if runtime.agents.is_empty() && runtime.archived.is_empty() {
                 remove_session = Some(session_id);
             }
         }
@@ -1967,6 +2162,25 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_keep_the_thread_unnamed_for_the_next_real_prompt() {
+        let mut draft = InputDraft::default();
+        for character in "/new".chars() {
+            draft.apply_key(&KeyInput {
+                code: KeyCode::Character(character),
+                modifiers: Default::default(),
+            });
+        }
+        draft.apply_key(&KeyInput {
+            code: KeyCode::Enter,
+            modifiers: Default::default(),
+        });
+        assert_eq!(draft.title(), None);
+
+        draft.apply_paste("Actual task\n");
+        assert_eq!(draft.title(), Some("Actual task"));
+    }
+
+    #[test]
     fn runtime_publishes_the_first_message_title_with_agent_updates() {
         let cwd = std::env::current_dir().unwrap();
         let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
@@ -1995,6 +2209,112 @@ mod tests {
                 if agent.conversation_title.as_deref() == Some("name this thread")
         )));
         runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn runtime_archives_and_resumes_only_compact_conversation_metadata() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 1"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+        assert_eq!(
+            runtime.archive(snapshot.id, 1).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let observed = runtime.previous.get_mut(&snapshot.id).unwrap();
+        observed.session.conversation_id = Some(id.into());
+        observed.conversation_title = Some("Keep this title".into());
+
+        let archived = runtime.archive(snapshot.id, 1).unwrap();
+        assert!(runtime.agents.is_empty());
+        assert_eq!(archived.conversation_id, id);
+        assert_eq!(runtime.snapshot().archived, vec![archived.clone()]);
+
+        let resumed = runtime.resume_archived(id, 2, &config).unwrap();
+        let snapshot = runtime.snapshot();
+        assert!(snapshot.archived.is_empty());
+        assert_eq!(snapshot.agents[0].id, resumed.id);
+        assert_eq!(snapshot.agents[0].conversation_id.as_deref(), Some(id));
+        assert_eq!(
+            snapshot.agents[0].conversation_title.as_deref(),
+            Some("Keep this title")
+        );
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn provider_conversation_switch_archives_the_previous_named_id() {
+        let directory = temp_dir();
+        let marker = directory.join("switch-now");
+        let old_id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let new_id = "129ff1d3-375e-7a72-a176-c47497827e49";
+        let script = format!(
+            "printf '\\033]2;Ready | {old_id}\\a'; while [ ! -f '{}' ]; do sleep 0.01; done; printf '\\033]2;Ready | {new_id}\\a'; sleep 1",
+            marker.display()
+        );
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &script]);
+        let agent = runtime
+            .spawn(AgentKind::Codex, &directory, 0, &config)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_id.as_deref() != Some(old_id)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_id.as_deref(),
+            Some(old_id)
+        );
+        runtime.record_paste(agent.id, "First task");
+        runtime.record_key(
+            agent.id,
+            &KeyInput {
+                code: KeyCode::Enter,
+                modifiers: Default::default(),
+            },
+        );
+        runtime.poll_events();
+
+        fs::write(&marker, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let switched = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches!(event, Event::ConversationSwitched { .. }))
+            {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "conversation did not switch");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(matches!(
+            switched,
+            Event::ConversationSwitched {
+                archived: Some(ArchivedConversation {
+                    conversation_id,
+                    title,
+                    ..
+                }),
+                ..
+            } if conversation_id == old_id && title == "First task"
+        ));
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_id.as_deref(),
+            Some(new_id)
+        );
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

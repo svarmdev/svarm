@@ -11,7 +11,8 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentId, AgentKind, AgentSession, Result, SessionSnapshot, SessionStatus, TerminalPalette,
-    session::OutputNotifier, terminal_model::TerminalSnapshot,
+    session::{ConversationTracking, OutputNotifier},
+    terminal_model::TerminalSnapshot,
 };
 
 pub struct AgentManager {
@@ -59,15 +60,47 @@ impl AgentManager {
 
     pub fn spawn(&mut self, kind: AgentKind, launch_directory: &Path) -> Result<SessionSnapshot> {
         let id = self.allocate_id()?;
-        let command = super::session::agent_command(kind, launch_directory);
-        let session = AgentSession::spawn_command(
+        let conversation_id = (kind == AgentKind::Claude)
+            .then(super::session::new_uuid)
+            .transpose()?;
+        let mut command =
+            super::session::agent_command(kind, launch_directory, conversation_id.as_deref())?;
+        let tracking = ConversationTracking::new(kind, conversation_id)?;
+        tracking.configure(&mut command);
+        let session = AgentSession::spawn_command_with_conversation(
             id,
-            kind,
             launch_directory,
             self.pty_size,
             command,
             self.terminal_palette,
             Some(self.notifier()),
+            tracking,
+        )?;
+        let snapshot = session.snapshot();
+        self.sessions.insert(id, session);
+        self.order.push(id);
+        Ok(snapshot)
+    }
+
+    pub fn resume(
+        &mut self,
+        kind: AgentKind,
+        launch_directory: &Path,
+        conversation_id: &str,
+    ) -> Result<SessionSnapshot> {
+        let id = self.allocate_id()?;
+        let mut command =
+            super::session::resume_agent_command(kind, launch_directory, conversation_id)?;
+        let tracking = ConversationTracking::new(kind, Some(conversation_id.to_owned()))?;
+        tracking.configure(&mut command);
+        let session = AgentSession::spawn_command_with_conversation(
+            id,
+            launch_directory,
+            self.pty_size,
+            command,
+            self.terminal_palette,
+            Some(self.notifier()),
+            tracking,
         )?;
         let snapshot = session.snapshot();
         self.sessions.insert(id, session);
@@ -189,20 +222,32 @@ impl AgentManager {
         program: &str,
         args: &[String],
     ) -> Result<SessionSnapshot> {
+        self.spawn_test_command_with_conversation(kind, launch_directory, program, args, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test_command_with_conversation(
+        &mut self,
+        kind: AgentKind,
+        launch_directory: &Path,
+        program: &str,
+        args: &[String],
+        conversation_id: Option<String>,
+    ) -> Result<SessionSnapshot> {
         use portable_pty::CommandBuilder;
 
         let id = self.allocate_id()?;
         let mut command = CommandBuilder::new(program);
         command.args(args);
         command.cwd(launch_directory);
-        let session = AgentSession::spawn_command(
+        let session = AgentSession::spawn_command_with_conversation(
             id,
-            kind,
             launch_directory,
             self.pty_size,
             command,
             self.terminal_palette,
             Some(self.notifier()),
+            ConversationTracking::without_signal(kind, conversation_id),
         )?;
         let snapshot = session.snapshot();
         self.sessions.insert(id, session);

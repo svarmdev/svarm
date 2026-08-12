@@ -53,6 +53,8 @@ pub enum Command {
     },
     #[command(name = "__server", hide = true)]
     InternalServer,
+    #[command(name = "__conversation-hook", hide = true)]
+    ConversationHook,
 }
 
 #[derive(Debug, Subcommand)]

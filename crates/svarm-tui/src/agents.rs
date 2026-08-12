@@ -254,7 +254,9 @@ impl RemoteAgents {
                     }
                 }
                 Message::Event(event) => {
-                    if let Event::AgentRemoved { agent_id, .. } = &event {
+                    if let Event::AgentRemoved { agent_id, .. }
+                    | Event::AgentArchived { agent_id, .. } = &event
+                    {
                         self.terminals.remove(agent_id);
                         self.pending_resync.remove(agent_id);
                     }
@@ -380,6 +382,20 @@ impl RemoteAgents {
         self.send(Request::CloseAgent {
             lease_token: self.lease_token.clone(),
             agent_id,
+        })
+    }
+
+    pub fn archive(&mut self, agent_id: AgentId) -> Result<()> {
+        self.send(Request::ArchiveAgent {
+            lease_token: self.lease_token.clone(),
+            agent_id,
+        })
+    }
+
+    pub fn resume_archived(&mut self, conversation_id: String) -> Result<()> {
+        self.send(Request::ResumeArchived {
+            lease_token: self.lease_token.clone(),
+            conversation_id,
         })
     }
 

@@ -26,6 +26,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 /// Called whenever output, EOF, or a read error means the owner should inspect the process.
 pub type TerminalNotifier = Arc<dyn Fn() + Send + Sync>;
+pub(crate) type OutputObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 const NO_SCROLLBACK: usize = 0;
 
@@ -129,6 +130,7 @@ impl TerminalProcess {
             size,
             palette,
             notify,
+            None,
             NO_SCROLLBACK,
         )
     }
@@ -139,6 +141,7 @@ impl TerminalProcess {
         size: PtySize,
         palette: Option<TerminalPalette>,
         notify: Option<TerminalNotifier>,
+        output_observer: Option<OutputObserver>,
         scrollback_max_bytes: usize,
     ) -> Result<Self> {
         if !cwd.is_dir() {
@@ -179,6 +182,7 @@ impl TerminalProcess {
                 alternate_scroll: alternate_scroll.clone(),
                 output_closed: output_closed.clone(),
                 notify,
+                output_observer,
             },
         );
 
@@ -361,6 +365,7 @@ struct ReaderState {
     alternate_scroll: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
     notify: Option<TerminalNotifier>,
+    output_observer: Option<OutputObserver>,
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
@@ -373,6 +378,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                 Ok(0) => break,
                 Ok(count) => {
                     let output = &buffer[..count];
+                    if let Some(observer) = &state.output_observer {
+                        observer(output);
+                    }
                     let reply = |bytes: &[u8]| {
                         let mut writer = state
                             .writer
