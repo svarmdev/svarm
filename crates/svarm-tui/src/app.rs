@@ -22,6 +22,7 @@ pub(crate) enum Mode {
     NewAgent(NewAgentPage),
     ConfirmClose,
     ConfirmArchive,
+    ArchiveUnavailable,
     ConfirmResume,
     ConfirmQuit,
     Menu,
@@ -725,11 +726,11 @@ impl App {
 
     pub fn request_archive_selected(&mut self) -> bool {
         let Some(agent) = self.agents.get(self.selected) else {
+            self.mode = Mode::Terminal;
             return false;
         };
         if agent.conversation_title().is_none() || agent.conversation_id().is_none() {
-            self.set_notice("unnamed conversations cannot be archived");
-            self.mode = Mode::Terminal;
+            self.mode = Mode::ArchiveUnavailable;
             return false;
         }
         if agent.status() == SessionStatus::Running
@@ -1406,12 +1407,12 @@ mod tests {
     }
 
     #[test]
-    fn only_named_resumable_conversations_can_be_archived() {
+    fn unnamed_conversations_open_an_archive_unavailable_modal() {
         let mut unnamed = app();
         unnamed.add_agent(snapshot(1, 0));
         assert!(!unnamed.request_archive_selected());
-        assert_eq!(unnamed.mode(), Mode::Terminal);
-        assert!(unnamed.notice().unwrap().contains("unnamed"));
+        assert_eq!(unnamed.mode(), Mode::ArchiveUnavailable);
+        assert_eq!(unnamed.notice(), None);
 
         let mut active = remote_agent(1, 0, 0);
         active.conversation_title = Some("Archive work".into());

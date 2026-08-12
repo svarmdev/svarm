@@ -249,6 +249,10 @@ const RESUME_HINTS: &[ActionHint] = &[
         action: ClickAction::Cancel,
     },
 ];
+const ARCHIVE_UNAVAILABLE_HINTS: &[ActionHint] = &[ActionHint {
+    text: "[Enter/Esc] close",
+    action: ClickAction::Cancel,
+}];
 const BACK_HINTS: &[ActionHint] = &[ActionHint {
     text: "[Esc] back",
     action: ClickAction::Cancel,
@@ -339,6 +343,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
             " Archive conversation? ",
             "Stop this active agent and archive its conversation?",
         ),
+        Mode::ArchiveUnavailable => render_archive_unavailable(frame, theme),
         Mode::ConfirmResume => render_resume_confirmation(frame, app, theme),
         Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme),
         Mode::Keybinds => render_keybinds(frame, theme),
@@ -663,6 +668,12 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             let inner = dialog_inner(ModalSize::Standard, area);
             (row == inner.y + 3 && contains(inner, column, row))
                 .then(|| hint_at(CONFIRM_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::ArchiveUnavailable => {
+            let inner = dialog_inner(ModalSize::Compact, area);
+            (row == inner.y + 3 && contains(inner, column, row))
+                .then(|| hint_at(ARCHIVE_UNAVAILABLE_HINTS, inner.x, column))
                 .flatten()
         }
         Mode::ConfirmResume => {
@@ -1330,6 +1341,24 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
     );
 }
 
+fn render_archive_unavailable(frame: &mut Frame<'_>, theme: Theme) {
+    render_dialog(
+        frame,
+        theme,
+        " Archive unavailable ",
+        ModalSize::Compact,
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Only named conversations can be archived.",
+                warning(theme),
+            )),
+            Line::from(""),
+            hint_line(ARCHIVE_UNAVAILABLE_HINTS, theme),
+        ],
+    );
+}
+
 fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let session = app
         .session_id()
@@ -1843,6 +1872,15 @@ mod tests {
             app.set_mode(mode);
             assert_hint_clicks(&app, area, standard.x, standard.y + 3, CONFIRM_HINTS);
         }
+        app.set_mode(Mode::ArchiveUnavailable);
+        assert_hint_clicks(
+            &app,
+            area,
+            compact.x,
+            compact.y + 3,
+            ARCHIVE_UNAVAILABLE_HINTS,
+        );
+        assert!(render_app_text(&app).contains("Only named conversations can be archived."));
         app.set_mode(Mode::ConfirmResume);
         assert_hint_clicks(&app, area, standard.x, standard.y + 3, RESUME_HINTS);
         app.set_mode(Mode::ConfirmQuit);

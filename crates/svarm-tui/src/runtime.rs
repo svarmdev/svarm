@@ -371,6 +371,10 @@ fn handle_key(
             KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirmation(),
             _ => {}
         },
+        Mode::ArchiveUnavailable => match key.code {
+            KeyCode::Enter | KeyCode::Esc => app.set_mode(Mode::Terminal),
+            _ => {}
+        },
         Mode::ConfirmResume => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.cycle_pending_archive(1),
             KeyCode::Char('k') | KeyCode::Up => app.cycle_pending_archive(-1),
@@ -472,7 +476,6 @@ fn handle_management_command(
         }
         ManagementCommand::ResumeArchived => {
             if !app.request_resume_archived(0) {
-                app.set_notice("no archived conversations");
                 app.set_mode(Mode::Terminal);
             }
         }
@@ -499,7 +502,6 @@ fn handle_management_command(
         }
         ManagementCommand::Cancel => app.set_mode(Mode::Terminal),
         ManagementCommand::Unknown | ManagementCommand::CloseAgent => {
-            app.set_notice("unknown Svarm command; Ctrl+B m opens menu");
             app.set_mode(Mode::Terminal);
         }
     }
@@ -640,6 +642,7 @@ fn apply_click_action(
                 }
                 Mode::NewAgent(NewAgentPage::NativeBrowser) => app.close_native_browser(),
                 Mode::ConfirmArchive | Mode::ConfirmResume => app.cancel_confirmation(),
+                Mode::ArchiveUnavailable => app.set_mode(Mode::Terminal),
                 Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
                 Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
                 _ => {}
