@@ -404,11 +404,18 @@ fn render_sidebar(
                 let tracking = git
                     .ahead
                     .zip(git.behind)
+                    .filter(|(ahead, behind)| *ahead != 0 || *behind != 0)
                     .map_or_else(String::new, |(ahead, behind)| {
                         format!(" ↑{ahead} ↓{behind}")
                     });
-                let additions = format!(" +{}", git.additions);
-                let deletions = format!(" -{}", git.deletions);
+                let (additions, deletions) = if git.additions == 0 && git.deletions == 0 {
+                    (String::new(), String::new())
+                } else {
+                    (
+                        format!(" +{}", git.additions),
+                        format!(" -{}", git.deletions),
+                    )
+                };
                 let branch_width = content_width
                     .saturating_sub(2)
                     .saturating_sub(additions.chars().count())
@@ -1297,7 +1304,7 @@ mod tests {
         let unseen = agent(2, SessionStatus::Running, 2, 1);
         let app = App::hydrate(
             SvarmSessionSnapshot {
-                summary,
+                summary: summary.clone(),
                 selected_agent_id: Some(unseen.id),
                 rows: 24,
                 cols: 80,
@@ -1315,6 +1322,28 @@ mod tests {
         assert!(rendered.contains("Codex · plain-directory"));
         assert!(rendered.contains("Codex · project-eight"));
         assert!(rendered.contains("featur… +557 -300 ↑2 ↓4"), "{rendered}");
+
+        let mut clean = agent(2, SessionStatus::Running, 2, 1);
+        let git = clean.git.as_mut().unwrap();
+        git.additions = 0;
+        git.deletions = 0;
+        git.ahead = Some(0);
+        git.behind = Some(0);
+        let clean_app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary,
+                selected_agent_id: Some(clean.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![clean],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+        let clean_rendered = render_app_text(&clean_app);
+        assert!(clean_rendered.contains("feature/sidebar"));
+        assert!(!clean_rendered.contains("+0 -0"));
+        assert!(!clean_rendered.contains("↑0 ↓0"));
 
         let theme = crate::theme::ThemeName::CatppuccinMocha.theme(true);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
