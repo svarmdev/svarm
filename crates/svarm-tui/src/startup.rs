@@ -15,6 +15,7 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub fn choose_session(sessions: Vec<SessionSummary>, allow_new: bool) -> Result<StartupChoice> {
     let mut chooser = SessionChooser::new(sessions, allow_new);
     let mut terminal = TerminalSession::open()?;
+    let mut pointer = None;
     loop {
         terminal.terminal().draw(|frame| {
             ui::render_session_chooser(
@@ -22,6 +23,7 @@ pub fn choose_session(sessions: Vec<SessionSummary>, allow_new: bool) -> Result<
                 &chooser,
                 unix_time_ms(),
                 ThemeName::Dark.theme(colors_enabled()),
+                pointer,
             )
         })?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
@@ -44,9 +46,11 @@ pub fn choose_session(sessions: Vec<SessionSummary>, allow_new: bool) -> Result<
                 KeyCode::Esc => return Ok(chooser.cancel()),
                 _ => {}
             },
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
+            Event::Mouse(mouse) => {
+                pointer = Some((mouse.column, mouse.row));
+                if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    continue;
+                }
                 let area = terminal.terminal().size()?.into();
                 match ui::session_chooser_click(&chooser, area, mouse.column, mouse.row) {
                     Some(ui::SessionChooserClick::Choose(index)) => {

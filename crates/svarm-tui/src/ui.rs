@@ -56,6 +56,7 @@ pub(crate) struct UiModel<'a> {
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
     pub colors_enabled: bool,
+    pub pointer: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,8 +307,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         return;
     }
 
+    let hovered = model
+        .pointer
+        .and_then(|(column, row)| hover_action(app, area, column, row));
+
     if app.sidebar_visible() {
-        render_sidebar(frame, app, area, theme, model.colors_enabled);
+        render_sidebar(frame, app, area, theme, model.colors_enabled, hovered);
     }
     render_terminal(
         frame,
@@ -321,34 +326,42 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     if !app.sidebar_visible()
         && let Some(button) = menu_button_area(area, false)
     {
-        frame.render_widget(
-            Paragraph::new(" ≡ Menu  ^B m").style(theme.surface()),
-            button,
+        let style = chrome_style(
+            theme,
+            hovered == Some(ClickAction::Management(ManagementCommand::OpenMenu)),
+            false,
+            theme.surface(),
         );
+        frame.render_widget(Paragraph::new(" ≡ Menu  ^B m").style(style), button);
     }
 
     match app.mode() {
-        Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme),
-        Mode::NewAgent(NewAgentPage::Workspaces) => render_workspace_choices(frame, app, theme),
-        Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme),
-        Mode::NewAgent(NewAgentPage::NativeBrowser) => render_native_browser(frame, app, theme),
+        Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme, hovered),
+        Mode::NewAgent(NewAgentPage::Workspaces) => {
+            render_workspace_choices(frame, app, theme, hovered)
+        }
+        Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme, hovered),
+        Mode::NewAgent(NewAgentPage::NativeBrowser) => {
+            render_native_browser(frame, app, theme, hovered)
+        }
         Mode::NewAgent(NewAgentPage::EmbeddedBrowser) | Mode::ToolPrefix => {
-            render_embedded_browser(frame, model.embedded, theme)
+            render_embedded_browser(frame, model.embedded, theme, hovered)
         }
         Mode::ConfirmClose => {
-            render_confirmation(frame, theme, "Close agent?", "Close this agent?")
+            render_confirmation(frame, theme, "Close agent?", "Close this agent?", hovered)
         }
         Mode::ConfirmArchive => render_confirmation(
             frame,
             theme,
             " Archive conversation? ",
             "Stop this active agent and archive its conversation?",
+            hovered,
         ),
-        Mode::ArchiveUnavailable => render_archive_unavailable(frame, theme),
-        Mode::ConfirmResume => render_resume_confirmation(frame, app, theme),
-        Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme),
-        Mode::Keybinds => render_keybinds(frame, theme),
-        Mode::Settings => render_settings(frame, app, theme),
+        Mode::ArchiveUnavailable => render_archive_unavailable(frame, theme, hovered),
+        Mode::ConfirmResume => render_resume_confirmation(frame, app, theme, hovered),
+        Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme, hovered),
+        Mode::Keybinds => render_keybinds(frame, theme, hovered),
+        Mode::Settings => render_settings(frame, app, theme, hovered),
         _ => {}
     }
 }
@@ -358,6 +371,7 @@ pub(crate) fn render_session_chooser(
     chooser: &SessionChooser,
     now_ms: u64,
     theme: Theme,
+    pointer: Option<(u16, u16)>,
 ) {
     let area = frame.area();
     frame.render_widget(Block::new().style(theme.page()), area);
@@ -389,6 +403,8 @@ pub(crate) fn render_session_chooser(
         inner.width,
         inner.height.saturating_sub(footer_height),
     );
+    let hovered =
+        pointer.and_then(|(column, row)| session_chooser_click(chooser, area, column, row));
     let visible_rows = usize::from(list_area.height);
     let start = chooser.viewport_start(visible_rows);
     let end = (start + visible_rows).min(chooser.row_count());
@@ -408,22 +424,32 @@ pub(crate) fn render_session_chooser(
         let marker = Span::styled(if selected { "▌ " } else { "  " }, accent(theme));
         let mut spans = vec![marker];
         spans.extend(line.spans);
-        ListItem::new(Line::from(spans)).style(if selected {
-            theme.selected()
-        } else {
-            text(theme)
-        })
+        ListItem::new(Line::from(spans)).style(chrome_style(
+            theme,
+            hovered == Some(SessionChooserClick::Choose(index)),
+            selected,
+            text(theme),
+        ))
     });
     frame.render_widget(List::new(rows), list_area);
 
-    let footer = SESSION_HINTS
+    let mut spans = Vec::new();
+    for hint in SESSION_HINTS
         .iter()
         .filter(|hint| !hint.needs_new || chooser.allow_new())
-        .map(|hint| hint.text)
-        .collect::<Vec<_>>()
-        .join("  ");
+    {
+        if !spans.is_empty() {
+            spans.push(Span::styled("  ", theme.muted()));
+        }
+        let style = if hovered == Some(hint.action) {
+            theme.selected()
+        } else {
+            theme.muted()
+        };
+        spans.push(Span::styled(hint.text, style));
+    }
     frame.render_widget(
-        Paragraph::new(footer).style(theme.muted()),
+        Paragraph::new(Line::from(spans)),
         Rect::new(
             inner.x + 1,
             inner.bottom().saturating_sub(1),
@@ -738,6 +764,31 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
     }
 }
 
+pub(crate) fn hover_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
+    match click_action(app, area, column, row)? {
+        ClickAction::Cancel if app.mode() == Mode::Menu => None,
+        ClickAction::SidebarItem(_) => None,
+        ClickAction::Management(ManagementCommand::ChooseAgent) => {
+            new_agent_button_area(area, app.sidebar_visible())
+                .filter(|button| contains(*button, column, row))
+                .map(|_| ClickAction::Management(ManagementCommand::ChooseAgent))
+        }
+        action => Some(action),
+    }
+}
+
+fn chrome_style(theme: Theme, hovered: bool, selected: bool, base: Style) -> Style {
+    if selected || hovered {
+        theme.selected()
+    } else {
+        base
+    }
+}
+
+fn hover_style(theme: Theme, hovered: bool, base: Style) -> Style {
+    if hovered { theme.selected() } else { base }
+}
+
 pub(crate) fn session_chooser_click(
     chooser: &SessionChooser,
     area: Rect,
@@ -850,6 +901,7 @@ fn render_sidebar(
     area: Rect,
     theme: Theme,
     colors_enabled: bool,
+    hovered: Option<ClickAction>,
 ) {
     let sidebar = sidebar_area(area);
     let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
@@ -878,6 +930,11 @@ fn render_sidebar(
             agent.conversation_title().unwrap_or("Unnamed conversation"),
             usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
         );
+        let selected_style = if selected {
+            text(theme).add_modifier(Modifier::BOLD)
+        } else {
+            text(theme)
+        };
         // Where the agent is now, preferring the checkout root over a directory inside it, and
         // falling back to where it was launched only while the live directory is unknown.
         let directory = agent
@@ -893,11 +950,6 @@ fn render_sidebar(
             LINKED_WORKTREE
         } else {
             ""
-        };
-        let selected_style = if selected {
-            text(theme).add_modifier(Modifier::BOLD)
-        } else {
-            text(theme)
         };
         let mut lines = vec![
             Line::from(vec![
@@ -990,7 +1042,12 @@ fn render_sidebar(
         );
     }
 
-    let new_button_style = text(theme);
+    let new_button_style = chrome_style(
+        theme,
+        hovered == Some(ClickAction::Management(ManagementCommand::ChooseAgent)),
+        false,
+        text(theme),
+    );
     frame.render_widget(
         Paragraph::new(trailing_shortcut(
             Span::styled(
@@ -1005,14 +1062,10 @@ fn render_sidebar(
     );
 
     if app.mode() == Mode::Menu {
-        render_menu(frame, app, menu_popup_area(button), theme);
+        render_menu(frame, menu_popup_area(button), theme, hovered);
     }
 
-    let button_style = if app.mode() == Mode::Menu {
-        theme.selected()
-    } else {
-        text(theme)
-    };
+    let button_style = hover_style(theme, hovered == Some(ClickAction::ToggleMenu), text(theme));
     frame.render_widget(
         Paragraph::new(trailing_shortcut(
             Span::styled(" ≡ Menu", button_style.add_modifier(Modifier::BOLD)),
@@ -1051,7 +1104,7 @@ fn status_color(color: Color, colors_enabled: bool) -> Style {
     Style::default().fg(if colors_enabled { color } else { Color::Reset })
 }
 
-fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_menu(frame: &mut Frame<'_>, area: Rect, theme: Theme, hovered: Option<ClickAction>) {
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" Menu ")
@@ -1060,19 +1113,13 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = MenuItem::ALL.into_iter().enumerate().map(|(index, item)| {
-        let marker = if item == app.menu_selected() {
-            " ▌ "
-        } else {
-            "   "
-        };
-        let style = if item == app.menu_selected() {
-            theme.selected()
-        } else {
-            text(theme)
-        };
+        let style = hover_style(
+            theme,
+            hovered == Some(ClickAction::MenuItem(item)),
+            text(theme),
+        );
         ListItem::new(Line::from(vec![
-            Span::styled(marker, accent(theme)),
-            Span::styled(format!("[{}] ", index + 1), accent(theme)),
+            Span::styled(format!(" [{}] ", index + 1), accent(theme)),
             Span::styled(item.label(), style),
         ]))
         .style(style)
@@ -1114,7 +1161,12 @@ fn render_terminal(
     frame.render_widget(pane, area);
 }
 
-fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_new_agent_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let Some(state) = app.new_agent() else {
         return;
     };
@@ -1131,14 +1183,16 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Span::styled(format!("{label:<12}"), text(theme)),
             Span::styled(
                 end_truncate(&value, 42),
-                if selected {
-                    theme.selected()
-                } else {
-                    theme.muted()
-                },
+                chrome_style(
+                    theme,
+                    hovered == Some(ClickAction::NewAgentField(field)),
+                    selected,
+                    theme.muted(),
+                ),
             ),
         ])
     };
+    let start_selected = state.draft.selected_field == NewAgentField::Start;
     render_dialog(
         frame,
         theme,
@@ -1149,30 +1203,33 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             row(NewAgentField::Workspace, "Workspace", workspace),
             row(NewAgentField::Agent, "Agent", agent.into()),
             Line::from(vec![
-                Span::styled(
-                    if state.draft.selected_field == NewAgentField::Start {
-                        " > "
-                    } else {
-                        "   "
-                    },
-                    accent(theme),
-                ),
+                Span::styled(if start_selected { " > " } else { "   " }, accent(theme)),
                 Span::styled(
                     if complete {
                         "Start agent"
                     } else {
                         "Start agent (disabled)"
                     },
-                    if complete { text(theme) } else { theme.muted() },
+                    hover_style(
+                        theme,
+                        !start_selected
+                            && hovered == Some(ClickAction::NewAgentField(NewAgentField::Start)),
+                        if complete { text(theme) } else { theme.muted() },
+                    ),
                 ),
             ]),
             Line::from(""),
-            hint_line(FORM_HINTS, theme),
+            hint_line(FORM_HINTS, theme, hovered),
         ],
     );
 }
 
-fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_workspace_choices(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let Some(state) = app.new_agent() else {
         return;
     };
@@ -1182,7 +1239,12 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     if state.workspaces.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No saved workspaces. Press b to browse.",
-            theme.muted(),
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::BrowseWorkspaces),
+                false,
+                theme.muted(),
+            ),
         )));
     } else {
         lines.extend(
@@ -1202,16 +1264,15 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                         14,
                     );
                     let missing = if choice.available { "" } else { "  missing" };
+                    let selected = index == state.selected_workspace;
+                    let style = hover_style(
+                        theme,
+                        !selected && hovered == Some(ClickAction::Workspace(index)),
+                        text(theme),
+                    );
                     Line::from(vec![
-                        Span::styled(
-                            if index == state.selected_workspace {
-                                " > "
-                            } else {
-                                "   "
-                            },
-                            accent(theme),
-                        ),
-                        Span::styled(format!("{name:<14}"), text(theme)),
+                        Span::styled(if selected { " > " } else { "   " }, accent(theme)),
+                        Span::styled(format!("{name:<14}"), style),
                         Span::styled(
                             end_truncate(&choice.path.display().to_string(), 32),
                             theme.muted(),
@@ -1221,7 +1282,7 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 }),
         );
     }
-    lines.extend([Line::from(""), hint_line(WORKSPACE_HINTS, theme)]);
+    lines.extend([Line::from(""), hint_line(WORKSPACE_HINTS, theme, hovered)]);
     render_dialog(
         frame,
         theme,
@@ -1231,29 +1292,40 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     );
 }
 
-fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_agent_choices(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let Some(state) = app.new_agent() else {
         return;
     };
     let mut lines = vec![Line::from("")];
     lines.extend(AgentKind::ALL.iter().enumerate().map(|(index, kind)| {
+        let selected = index == state.selected_agent;
         Line::from(vec![
+            Span::styled(if selected { " > " } else { "   " }, accent(theme)),
             Span::styled(
-                if index == state.selected_agent {
-                    " > "
-                } else {
-                    "   "
-                },
-                accent(theme),
+                kind.label(),
+                hover_style(
+                    theme,
+                    !selected && hovered == Some(ClickAction::AgentKind(index)),
+                    text(theme),
+                ),
             ),
-            Span::styled(kind.label(), text(theme)),
         ])
     }));
-    lines.extend([Line::from(""), hint_line(AGENT_HINTS, theme)]);
+    lines.extend([Line::from(""), hint_line(AGENT_HINTS, theme, hovered)]);
     render_dialog(frame, theme, " Choose agent ", ModalSize::Compact, lines);
 }
 
-fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_native_browser(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let Some(browser) = app.native_browser() else {
         return;
     };
@@ -1272,16 +1344,17 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         .skip(start)
         .take(visible)
         .map(|(index, label)| {
+            let selected = index == browser.selected;
             Line::from(vec![
+                Span::styled(if selected { " > " } else { "   " }, accent(theme)),
                 Span::styled(
-                    if index == browser.selected {
-                        " > "
-                    } else {
-                        "   "
-                    },
-                    accent(theme),
+                    end_truncate(&label, content_width),
+                    hover_style(
+                        theme,
+                        !selected && hovered == Some(ClickAction::NativeBrowserItem(index)),
+                        text(theme),
+                    ),
                 ),
-                Span::styled(end_truncate(&label, content_width), text(theme)),
             ])
         });
     let mut lines = vec![
@@ -1305,7 +1378,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(hint_line(BROWSER_HINTS, theme));
+    lines.push(hint_line(BROWSER_HINTS, theme, hovered));
     render_dialog(frame, theme, " Select workspace ", ModalSize::Large, lines);
 }
 
@@ -1313,6 +1386,7 @@ fn render_embedded_browser(
     frame: &mut Frame<'_>,
     snapshot: Option<&TerminalProcessSnapshot>,
     theme: Theme,
+    hovered: Option<ClickAction>,
 ) {
     let area = embedded_modal_area(frame.area());
     frame.render_widget(Clear, area);
@@ -1332,7 +1406,7 @@ fn render_embedded_browser(
         frame.render_widget(terminal, content);
     }
     frame.render_widget(
-        Paragraph::new(hint_line(EMBEDDED_HINTS, theme)).style(theme.muted()),
+        Paragraph::new(hint_line(EMBEDDED_HINTS, theme, hovered)),
         Rect::new(
             area.x.saturating_add(1),
             area.bottom().saturating_sub(2),
@@ -1356,7 +1430,13 @@ pub(crate) fn embedded_terminal_area(area: Rect) -> Rect {
     )
 }
 
-fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt: &str) {
+fn render_confirmation(
+    frame: &mut Frame<'_>,
+    theme: Theme,
+    title: &str,
+    prompt: &str,
+    hovered: Option<ClickAction>,
+) {
     render_dialog(
         frame,
         theme,
@@ -1366,12 +1446,12 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
             Line::from(""),
-            hint_line(CONFIRM_HINTS, theme),
+            hint_line(CONFIRM_HINTS, theme, hovered),
         ],
     );
 }
 
-fn render_archive_unavailable(frame: &mut Frame<'_>, theme: Theme) {
+fn render_archive_unavailable(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAction>) {
     render_dialog(
         frame,
         theme,
@@ -1384,12 +1464,17 @@ fn render_archive_unavailable(frame: &mut Frame<'_>, theme: Theme) {
                 warning(theme),
             )),
             Line::from(""),
-            hint_line(ARCHIVE_UNAVAILABLE_HINTS, theme),
+            hint_line(ARCHIVE_UNAVAILABLE_HINTS, theme, hovered),
         ],
     );
 }
 
-fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_stop_confirmation(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let session = app
         .session_id()
         .map_or_else(|| "local".into(), |id| id.0.to_string());
@@ -1411,12 +1496,17 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             )),
             Line::from("  This terminates every agent in the session."),
             Line::from(""),
-            hint_line(STOP_HINTS, theme),
+            hint_line(STOP_HINTS, theme, hovered),
         ],
     );
 }
 
-fn render_resume_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_resume_confirmation(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
     let title = app
         .pending_resume_title()
         .unwrap_or("Archived conversation");
@@ -1432,23 +1522,29 @@ fn render_resume_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 warning(theme),
             )),
             Line::from(""),
-            hint_line(RESUME_HINTS, theme),
+            hint_line(RESUME_HINTS, theme, hovered),
         ],
     );
 }
 
-fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
+fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAction>) {
     let mut lines = vec![Line::from("")];
-    lines.extend(
-        MANAGEMENT_KEYBINDINGS
-            .iter()
-            .map(|binding| Line::from(format!("  {:<27} {}", binding.keys, binding.action))),
-    );
-    lines.extend([Line::from(""), hint_line(BACK_HINTS, theme)]);
+    lines.extend(MANAGEMENT_KEYBINDINGS.iter().map(|binding| {
+        Line::from(Span::styled(
+            format!("  {:<27} {}", binding.keys, binding.action),
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::Management(binding.command)),
+                false,
+                text(theme),
+            ),
+        ))
+    }));
+    lines.extend([Line::from(""), hint_line(BACK_HINTS, theme, hovered)]);
     render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
 }
 
-fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme, hovered: Option<ClickAction>) {
     render_dialog(
         frame,
         theme,
@@ -1458,26 +1554,47 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Theme", text(theme).add_modifier(Modifier::BOLD)),
-                Span::styled("              ‹  ", theme.muted()),
+                Span::styled(
+                    "              ‹  ",
+                    chrome_style(
+                        theme,
+                        hovered == Some(ClickAction::ThemePrevious),
+                        false,
+                        theme.muted(),
+                    ),
+                ),
                 Span::styled(
                     app.theme().label(),
                     accent(theme).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  ›", theme.muted()),
+                Span::styled(
+                    "  ›",
+                    chrome_style(
+                        theme,
+                        hovered == Some(ClickAction::ThemeNext),
+                        false,
+                        theme.muted(),
+                    ),
+                ),
             ]),
             Line::from(""),
-            hint_line(SETTINGS_HINTS, theme),
+            hint_line(SETTINGS_HINTS, theme, hovered),
         ],
     );
 }
 
-fn hint_line(hints: &[ActionHint], theme: Theme) -> Line<'static> {
+fn hint_line(hints: &[ActionHint], theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", theme.muted())];
     for (index, hint) in hints.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled("  ", theme.muted()));
         }
-        spans.push(Span::styled(hint.text, theme.muted()));
+        let style = if hovered == Some(hint.action) {
+            theme.selected()
+        } else {
+            theme.muted()
+        };
+        spans.push(Span::styled(hint.text, style));
     }
     Line::from(spans)
 }
@@ -1611,6 +1728,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        pointer: None,
                     },
                 );
             })
@@ -1677,6 +1795,7 @@ mod tests {
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
+                            pointer: None,
                         },
                     );
                 })
@@ -1717,6 +1836,7 @@ mod tests {
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
+                            pointer: None,
                         },
                     );
                 })
@@ -1752,6 +1872,7 @@ mod tests {
                     &chooser,
                     2_001,
                     crate::theme::ThemeName::Monochrome.theme(false),
+                    None,
                 )
             })
             .unwrap();
@@ -1961,6 +2082,99 @@ mod tests {
         app.set_mode(Mode::Terminal);
         app.toggle_sidebar();
         assert!(render_app_text(&app).contains("≡ Menu  ^B m"));
+    }
+
+    #[test]
+    fn hover_targets_buttons_and_ignores_dismiss_regions() {
+        let area = Rect::new(0, 0, 80, 24);
+        let compact = dialog_inner(ModalSize::Compact, area);
+        let standard = dialog_inner(ModalSize::Standard, area);
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+
+        let new_button = new_agent_button_area(area, true).unwrap();
+        let menu_button = menu_button_area(area, true).unwrap();
+        assert_eq!(
+            hover_action(&app, area, new_button.x, new_button.y),
+            Some(ClickAction::Management(ManagementCommand::ChooseAgent))
+        );
+        assert_eq!(
+            hover_action(&app, area, menu_button.x, menu_button.y),
+            Some(ClickAction::ToggleMenu)
+        );
+        assert_eq!(
+            hover_action(&app, area, SIDEBAR_WIDTH + 1, 0),
+            None,
+            "empty terminal click-to-create is not a hoverable button"
+        );
+
+        app.set_mode(Mode::Menu);
+        let popup = menu_popup_area(menu_button);
+        assert_eq!(
+            hover_action(&app, area, popup.x + 1, popup.y + 1),
+            Some(ClickAction::MenuItem(MenuItem::Detach))
+        );
+        assert_eq!(
+            hover_action(&app, area, popup.right() + 4, popup.y),
+            None,
+            "clicking outside the menu dismisses it but is not a button"
+        );
+
+        app.set_mode(Mode::Settings);
+        assert_eq!(
+            hover_action(&app, area, standard.x + 21, standard.y + 1),
+            Some(ClickAction::ThemePrevious)
+        );
+        assert_eq!(hover_action(&app, area, compact.x + 2, compact.y + 5), None);
+        assert_eq!(
+            hover_action(&app, area, standard.x + 2, standard.y + 3),
+            Some(ClickAction::ThemePrevious)
+        );
+    }
+
+    #[test]
+    fn hovered_buttons_use_the_selected_style() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        let menu = menu_button_area(area, true).unwrap();
+        let new_button = new_agent_button_area(area, true).unwrap();
+
+        let hovered = draw_app(&app, Some((menu.x + 1, menu.y)));
+        assert!(
+            hovered.backend().buffer()[(menu.x + 1, menu.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !hovered.backend().buffer()[(new_button.x + 1, new_button.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        let idle = draw_app(&app, None);
+        assert!(
+            !idle.backend().buffer()[(menu.x + 1, menu.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        app.set_mode(Mode::Settings);
+        let standard = dialog_inner(ModalSize::Standard, area);
+        let hint = draw_app(&app, Some((standard.x + 2, standard.y + 3)));
+        assert!(
+            hint.backend().buffer()[(standard.x + 2, standard.y + 3)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -2242,6 +2456,7 @@ mod tests {
                         embedded: None,
                         theme,
                         colors_enabled: true,
+                        pointer: None,
                     },
                 )
             })
@@ -2439,6 +2654,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        pointer: None,
                     },
                 )
             })
@@ -2510,6 +2726,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        pointer: None,
                     },
                 )
             })
@@ -2553,6 +2770,7 @@ mod tests {
                         embedded: Some(&snapshot),
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        pointer: None,
                     },
                 )
             })
@@ -2573,6 +2791,27 @@ mod tests {
         assert!(rendered.contains("force close"));
     }
 
+    fn draw_app(app: &App, pointer: Option<(u16, u16)>) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app,
+                        screen: None,
+                        scrolled: false,
+                        embedded: None,
+                        theme: app.theme().theme(false),
+                        colors_enabled: false,
+                        pointer,
+                    },
+                )
+            })
+            .unwrap();
+        terminal
+    }
+
     fn render_app_text(app: &App) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2587,6 +2826,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        pointer: None,
                     },
                 )
             })

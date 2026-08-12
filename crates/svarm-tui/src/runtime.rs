@@ -99,6 +99,7 @@ pub fn run(
     let mut terminal = TerminalSession::open()?;
     terminal.spawn_input(move |event| events_tx.send(ClientEvent::Host(event)).is_ok());
     let mut dirty = true;
+    let mut pointer = None;
     let mut connection_failure = None;
     while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         if dirty {
@@ -114,6 +115,7 @@ pub fn run(
                 embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
+                pointer,
             };
             let cursor_style = embedded.as_ref().map_or_else(
                 || {
@@ -147,8 +149,14 @@ pub fn run(
                         browser: &mut browser,
                         host_area,
                     };
-                    dirty |=
-                        handle_host_event(&mut app, &mut agents, resources, &mut terminal, host)?;
+                    dirty |= handle_host_event(
+                        &mut app,
+                        &mut agents,
+                        resources,
+                        &mut terminal,
+                        host,
+                        &mut pointer,
+                    )?;
                 }
                 ClientEvent::DirectoryLoaded(result) => {
                     dirty |=
@@ -190,6 +198,7 @@ fn handle_host_event(
     mut resources: InteractionResources<'_>,
     terminal: &mut TerminalSession,
     event: HostEvent,
+    pointer: &mut Option<(u16, u16)>,
 ) -> Result<bool> {
     let mut dirty = false;
     match event {
@@ -222,6 +231,10 @@ fn handle_host_event(
         }
         HostEvent::Mouse(mouse) => {
             let area = terminal.terminal().size()?.into();
+            let previous =
+                pointer.and_then(|(column, row)| ui::hover_action(app, area, column, row));
+            *pointer = Some((mouse.column, mouse.row));
+            dirty |= previous != ui::hover_action(app, area, mouse.column, mouse.row);
             let (resize, redraw) = handle_mouse(app, agents, &mut resources, mouse, area)?;
             dirty |= redraw;
             if resize {

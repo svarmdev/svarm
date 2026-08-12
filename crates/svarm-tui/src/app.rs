@@ -785,6 +785,7 @@ impl App {
         self.sidebar_visible
     }
 
+    #[cfg(test)]
     pub const fn menu_selected(&self) -> MenuItem {
         self.menu_selected
     }
