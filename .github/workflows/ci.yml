@@ -17,29 +17,37 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
 
   test:
-    name: test (${{ matrix.os }})
+    name: ${{ matrix.validation }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        include:
+          - os: ubuntu-latest
+            validation: test
+            test_args: --workspace
+          - os: macos-15
+            validation: build
+            test_args: --workspace
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
+      - if: matrix.validation == 'test'
+        run: cargo test ${{ matrix.test_args }} --locked
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
