@@ -11,6 +11,7 @@ use crate::{
     app::{AgentDisplayStatus, App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
     input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
+    selection::VisibleSelection,
     theme::Theme,
 };
 use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
@@ -53,6 +54,8 @@ pub(crate) struct UiModel<'a> {
     pub app: &'a App,
     pub screen: Option<&'a TerminalSnapshot>,
     pub scrolled: bool,
+    pub selection: Option<VisibleSelection>,
+    pub toast: Option<&'a str>,
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
     pub colors_enabled: bool,
@@ -314,15 +317,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     if app.sidebar_visible() {
         render_sidebar(frame, app, area, theme, model.colors_enabled, hovered);
     }
-    render_terminal(
-        frame,
-        model.screen,
-        app.agents().is_empty(),
-        model.scrolled,
-        app.mode(),
-        terminal_area(area, app.sidebar_visible()),
-        theme,
-    );
+    render_terminal(frame, model, terminal_area(area, app.sidebar_visible()));
     if !app.sidebar_visible()
         && let Some(button) = menu_button_area(area, false)
     {
@@ -364,6 +359,31 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::Settings => render_settings(frame, app, theme, hovered),
         _ => {}
     }
+    if let Some(toast) = model.toast {
+        render_toast(frame, toast, theme);
+    }
+}
+
+fn render_toast(frame: &mut Frame<'_>, message: &str, theme: Theme) {
+    let area = frame.area();
+    let content = format!(" {message} ");
+    let width = u16::try_from(content.chars().count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.width);
+    let toast = Rect::new(
+        area.right().saturating_sub(width),
+        area.y,
+        width,
+        3.min(area.height),
+    );
+    frame.render_widget(Clear, toast);
+    frame.render_widget(
+        Paragraph::new(content)
+            .block(Block::bordered())
+            .style(theme.selected()),
+        toast,
+    );
 }
 
 pub(crate) fn render_session_chooser(
@@ -1147,33 +1167,26 @@ fn render_menu(frame: &mut Frame<'_>, area: Rect, theme: Theme, hovered: Option<
     frame.render_widget(List::new(rows), inner);
 }
 
-fn render_terminal(
-    frame: &mut Frame<'_>,
-    screen: Option<&TerminalSnapshot>,
-    no_agents: bool,
-    scrolled: bool,
-    mode: Mode,
-    area: Rect,
-    theme: Theme,
-) {
-    let Some(screen) = screen else {
+fn render_terminal(frame: &mut Frame<'_>, model: UiModel<'_>, area: Rect) {
+    let Some(screen) = model.screen else {
         frame.render_widget(
-            Paragraph::new(if no_agents {
+            Paragraph::new(if model.app.agents().is_empty() {
                 "No agents open. Press Ctrl+B, then n to start one."
             } else {
                 "Agent terminal unavailable."
             })
             .centered()
-            .style(theme.muted()),
+            .style(model.theme.muted()),
             area,
         );
         return;
     };
     // The cursor is the host terminal's own, placed below, so that it keeps the shape, color and
     // blink the user configured. Painting one into the buffer can only produce a static block.
-    let pane = TerminalScreen::new(screen);
-    if mode == Mode::Terminal
-        && !scrolled
+    let pane = TerminalScreen::new(screen).with_selection(model.selection, model.theme.selected());
+    if model.app.mode() == Mode::Terminal
+        && !model.scrolled
+        && model.selection.is_none()
         && let Some(position) = pane.cursor_position(area)
     {
         frame.set_cursor_position(position);
@@ -1745,6 +1758,8 @@ mod tests {
                         app: &app,
                         screen: None,
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
@@ -1812,6 +1827,8 @@ mod tests {
                             app: &app,
                             screen: None,
                             scrolled: false,
+                            selection: None,
+                            toast: None,
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
@@ -1853,6 +1870,8 @@ mod tests {
                             app: &app,
                             screen: None,
                             scrolled: false,
+                            selection: None,
+                            toast: None,
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
@@ -2559,6 +2578,8 @@ mod tests {
                         app: &app,
                         screen: None,
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme,
                         colors_enabled: true,
@@ -2757,6 +2778,8 @@ mod tests {
                         app: &app,
                         screen: Some(&screen),
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -2781,18 +2804,30 @@ mod tests {
     #[test]
     fn scrollback_does_not_overlay_a_position_label() {
         let screen = terminal_snapshot(24, 80, "terminal output");
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         terminal
             .draw(|frame| {
                 render_terminal(
                     frame,
-                    Some(&screen),
-                    false,
-                    true,
-                    Mode::Terminal,
+                    UiModel {
+                        app: &app,
+                        screen: Some(&screen),
+                        scrolled: true,
+                        selection: None,
+                        toast: None,
+                        embedded: None,
+                        theme: app.theme().theme(true),
+                        colors_enabled: true,
+                        pointer: None,
+                    },
                     frame.area(),
-                    crate::theme::ThemeName::Dark.theme(true),
                 );
             })
             .unwrap();
@@ -2829,6 +2864,8 @@ mod tests {
                         app: &app,
                         screen: Some(&screen),
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -2873,6 +2910,8 @@ mod tests {
                         app: &app,
                         screen: None,
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: Some(&snapshot),
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -2907,6 +2946,8 @@ mod tests {
                         app,
                         screen: None,
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
@@ -2916,6 +2957,46 @@ mod tests {
             })
             .unwrap();
         terminal
+    }
+
+    #[test]
+    fn copied_toast_renders_in_the_top_right_corner_at_80x24() {
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    UiModel {
+                        app: &app,
+                        screen: None,
+                        scrolled: false,
+                        selection: None,
+                        toast: Some("Copied 17 characters to clipboard"),
+                        embedded: None,
+                        theme: app.theme().theme(false),
+                        colors_enabled: false,
+                        pointer: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        let top = terminal.backend().buffer().content()[0..80]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(top.ends_with("┐"));
+        let second = terminal.backend().buffer().content()[80..160]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(second.contains("Copied 17 characters to clipboard"));
     }
 
     fn render_app_text(app: &App) -> String {
@@ -2929,6 +3010,8 @@ mod tests {
                         app,
                         screen: None,
                         scrolled: false,
+                        selection: None,
+                        toast: None,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,

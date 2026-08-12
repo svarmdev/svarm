@@ -3,6 +3,7 @@ mod app;
 mod input;
 mod runtime;
 mod screen;
+mod selection;
 mod settings;
 mod startup;
 mod terminal;

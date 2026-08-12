@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Interactive terminal interface for Svarm"
 
 [dependencies]
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["osc52"] }
 libc = "0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1.0", features = ["derive"] }
