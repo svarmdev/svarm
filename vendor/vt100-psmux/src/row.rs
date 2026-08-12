@@ -14,6 +14,11 @@ impl Row {
         }
     }
 
+    pub(crate) fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.cells.capacity().saturating_mul(std::mem::size_of::<crate::Cell>()))
+    }
+
     fn cols(&self) -> u16 {
         self.cells
             .len()

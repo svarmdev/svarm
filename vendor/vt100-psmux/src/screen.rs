@@ -189,7 +189,20 @@ impl Screen {
         size: crate::grid::Size,
         scrollback_len: usize,
     ) -> Self {
-        let mut grid = crate::grid::Grid::new(size, scrollback_len);
+        Self::new_with_grid(size, crate::grid::Grid::new(size, scrollback_len))
+    }
+
+    pub(crate) fn new_with_scrollback_bytes(
+        size: crate::grid::Size,
+        scrollback_max_bytes: usize,
+    ) -> Self {
+        Self::new_with_grid(
+            size,
+            crate::grid::Grid::new_with_scrollback_bytes(size, scrollback_max_bytes),
+        )
+    }
+
+    fn new_with_grid(size: crate::grid::Size, mut grid: crate::grid::Grid) -> Self {
         grid.allocate_rows();
         Self {
             grid,
@@ -253,6 +266,12 @@ impl Screen {
     #[must_use]
     pub fn scrollback_filled(&self) -> usize {
         self.grid.scrollback_filled()
+    }
+
+    /// Returns the logical bytes allocated by active main-grid and scrollback rows.
+    #[must_use]
+    pub fn scrollback_storage_bytes(&self) -> usize {
+        self.grid.storage_bytes()
     }
 
     /// Updates the maximum scrollback buffer size for the main grid.  Rows
@@ -1343,7 +1362,11 @@ impl Screen {
 
     // ESC c
     pub(crate) fn ris(&mut self) {
-        *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+        *self = if let Some(max_bytes) = self.grid.scrollback_max_bytes() {
+            Self::new_with_scrollback_bytes(self.grid.size(), max_bytes)
+        } else {
+            Self::new(self.grid.size(), self.grid.scrollback_len())
+        };
     }
 
     // csi codes

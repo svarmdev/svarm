@@ -36,17 +36,43 @@ pub(crate) struct Vt100Backend {
     parser: Parser<BellCallbacks>,
 }
 
+#[cfg(test)]
 pub(crate) fn create(size: TerminalSize, scrollback: usize) -> Box<dyn TerminalBackend> {
     Box::new(Vt100Backend::new(size, scrollback))
 }
 
+pub(crate) fn create_with_scrollback_bytes(
+    size: TerminalSize,
+    scrollback_max_bytes: usize,
+) -> Box<dyn TerminalBackend> {
+    Box::new(Vt100Backend::new_with_scrollback_bytes(
+        size,
+        scrollback_max_bytes,
+    ))
+}
+
 impl Vt100Backend {
+    #[cfg(test)]
     pub(crate) fn new(size: TerminalSize, scrollback: usize) -> Self {
         Self {
             parser: Parser::new_with_callbacks(
                 size.rows.max(1),
                 size.cols.max(1),
                 scrollback,
+                BellCallbacks::default(),
+            ),
+        }
+    }
+
+    pub(crate) fn new_with_scrollback_bytes(
+        size: TerminalSize,
+        scrollback_max_bytes: usize,
+    ) -> Self {
+        Self {
+            parser: Parser::new_with_callbacks_and_scrollback_bytes(
+                size.rows.max(1),
+                size.cols.max(1),
+                scrollback_max_bytes,
                 BellCallbacks::default(),
             ),
         }
@@ -285,5 +311,49 @@ mod tests {
                 base64_payload: b"Zm9v".to_vec(),
             })
         );
+    }
+
+    fn fill_history(backend: &mut Vt100Backend, lines: usize) {
+        for _ in 0..lines {
+            backend.process(b"x\r\n");
+        }
+    }
+
+    #[test]
+    fn byte_budget_retains_more_narrow_rows() {
+        let mut narrow = Vt100Backend::new_with_scrollback_bytes(TerminalSize::new(2, 20), 100_000);
+        let mut wide = Vt100Backend::new_with_scrollback_bytes(TerminalSize::new(2, 80), 100_000);
+        fill_history(&mut narrow, 1_000);
+        fill_history(&mut wide, 1_000);
+
+        assert!(
+            narrow.parser.screen().scrollback_filled() > wide.parser.screen().scrollback_filled()
+        );
+        assert!(narrow.parser.screen().scrollback_storage_bytes() <= 100_000);
+        assert!(wide.parser.screen().scrollback_storage_bytes() <= 100_000);
+    }
+
+    #[test]
+    fn active_rows_survive_a_smaller_budget() {
+        let mut backend = Vt100Backend::new_with_scrollback_bytes(TerminalSize::new(2, 80), 1);
+        fill_history(&mut backend, 20);
+
+        assert_eq!(backend.parser.screen().size(), (2, 80));
+        assert_eq!(backend.parser.screen().scrollback_filled(), 0);
+        assert!(backend.parser.screen().scrollback_storage_bytes() > 1);
+    }
+
+    #[test]
+    fn resize_charges_mixed_width_history() {
+        let mut backend = Vt100Backend::new_with_scrollback_bytes(TerminalSize::new(2, 20), 20_000);
+        fill_history(&mut backend, 10);
+        backend.parser.screen_mut().set_scrollback(usize::MAX);
+        backend.resize(TerminalSize::new(2, 80));
+        fill_history(&mut backend, 1);
+
+        let screen = backend.parser.screen();
+        assert!(screen.scrollback_storage_bytes() <= 20_000);
+        assert!(screen.scrollback() <= screen.scrollback_filled());
+        assert!(screen.scrollback_filled() > 1);
     }
 }

@@ -14,7 +14,7 @@ use crate::{
 /// Called when an agent's terminal changes so its owner can wake immediately.
 pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
 
-const SCROLLBACK_ROWS: usize = 10_000;
+const SCROLLBACK_BYTES: usize = 25_000_000;
 
 pub struct AgentSession {
     id: AgentId,
@@ -60,13 +60,13 @@ impl AgentSession {
             id,
             kind,
             launch_directory: cwd.to_owned(),
-            terminal: TerminalProcess::spawn_command_with_scrollback(
+            terminal: TerminalProcess::spawn_command_with_scrollback_bytes(
                 command,
                 cwd,
                 size,
                 palette,
                 notify,
-                SCROLLBACK_ROWS,
+                SCROLLBACK_BYTES,
             )?,
         })
     }

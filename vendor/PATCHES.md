@@ -20,3 +20,19 @@ Source: the `vt100-psmux` 0.16.9 crate published on crates.io.
 
 When upgrading the crate, remove this patch if upstream has equivalent behavior. Otherwise,
 reapply it and run the regression test before updating this version entry.
+
+### Bound scrollback by logical allocation size
+
+- Files: `vt100-psmux/src/{grid,parser,perform,row,screen}.rs`
+- Change: add a byte-budgeted parser constructor. The main grid charges the allocated capacity of
+  its active and historical rows, keeps the active screen even when it exceeds the budget, and
+  evicts the oldest history rows until the configured budget is met.
+- Reason: a row limit makes memory consumption grow with pane width. Svarm runs multiple agent
+  terminals, so a per-terminal byte budget provides predictable memory use while allowing the
+  backend representation to determine the retained row count.
+- Regression tests: `terminal_backend::tests::byte_budget_retains_more_narrow_rows`,
+  `terminal_backend::tests::active_rows_survive_a_smaller_budget`, and
+  `terminal_backend::tests::resize_charges_mixed_width_history`.
+
+When upgrading the crate, remove this patch if upstream offers an equivalent byte budget that
+includes active rows. Otherwise, reapply it and run the regression tests above.

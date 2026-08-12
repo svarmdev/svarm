@@ -123,16 +123,23 @@ impl TerminalProcess {
         palette: Option<TerminalPalette>,
         notify: Option<TerminalNotifier>,
     ) -> Result<Self> {
-        Self::spawn_command_with_scrollback(command, cwd, size, palette, notify, NO_SCROLLBACK)
+        Self::spawn_command_with_scrollback_bytes(
+            command,
+            cwd,
+            size,
+            palette,
+            notify,
+            NO_SCROLLBACK,
+        )
     }
 
-    pub(crate) fn spawn_command_with_scrollback(
+    pub(crate) fn spawn_command_with_scrollback_bytes(
         command: CommandBuilder,
         cwd: &Path,
         size: PtySize,
         palette: Option<TerminalPalette>,
         notify: Option<TerminalNotifier>,
-        scrollback_rows: usize,
+        scrollback_max_bytes: usize,
     ) -> Result<Self> {
         if !cwd.is_dir() {
             return Err(format!(
@@ -148,9 +155,9 @@ impl TerminalProcess {
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 
-        let backend = Arc::new(Mutex::new(terminal_backend::create(
+        let backend = Arc::new(Mutex::new(terminal_backend::create_with_scrollback_bytes(
             TerminalSize::new(size.rows, size.cols),
-            scrollback_rows,
+            scrollback_max_bytes,
         )));
         let generation = Arc::new(AtomicU64::new(0));
         let read_error = Arc::new(Mutex::new(None));

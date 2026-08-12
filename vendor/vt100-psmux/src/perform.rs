@@ -28,6 +28,21 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
             callbacks,
         }
     }
+
+    pub fn new_with_callbacks_and_scrollback_bytes(
+        rows: u16,
+        cols: u16,
+        scrollback_max_bytes: usize,
+        callbacks: CB,
+    ) -> Self {
+        Self {
+            screen: crate::screen::Screen::new_with_scrollback_bytes(
+                crate::grid::Size { rows, cols },
+                scrollback_max_bytes,
+            ),
+            callbacks,
+        }
+    }
 }
 
 impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {

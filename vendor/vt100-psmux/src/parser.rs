@@ -43,6 +43,27 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
         }
     }
 
+
+    /// Creates a new terminal parser whose active screen and scrollback share
+    /// the given logical allocation budget. The active screen is never
+    /// evicted; the oldest history rows are discarded when necessary.
+    pub fn new_with_callbacks_and_scrollback_bytes(
+        rows: u16,
+        cols: u16,
+        scrollback_max_bytes: usize,
+        callbacks: CB,
+    ) -> Self {
+        Self {
+            parser: vte::Parser::new(),
+            screen: crate::perform::WrappedScreen::new_with_callbacks_and_scrollback_bytes(
+                rows,
+                cols,
+                scrollback_max_bytes,
+                callbacks,
+            ),
+        }
+    }
+
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
     pub fn process(&mut self, bytes: &[u8]) {

@@ -12,6 +12,8 @@ pub struct Grid {
     saved_origin_mode: bool,
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
+    scrollback_max_bytes: Option<usize>,
+    scrollback_bytes: usize,
     scrollback_offset: usize,
 }
 
@@ -28,8 +30,16 @@ impl Grid {
             saved_origin_mode: false,
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
+            scrollback_max_bytes: None,
+            scrollback_bytes: 0,
             scrollback_offset: 0,
         }
+    }
+
+    pub fn new_with_scrollback_bytes(size: Size, scrollback_max_bytes: usize) -> Self {
+        let mut grid = Self::new(size, usize::MAX);
+        grid.scrollback_max_bytes = Some(scrollback_max_bytes);
+        grid
     }
 
     pub fn allocate_rows(&mut self) {
@@ -79,6 +89,7 @@ impl Grid {
             row.resize(size.cols, crate::Cell::new());
         }
         self.rows.resize(usize::from(size.rows), self.new_row());
+        self.trim_scrollback();
 
         if self.scroll_bottom >= size.rows {
             self.scroll_bottom = size.rows - 1;
@@ -191,6 +202,10 @@ impl Grid {
         self.scrollback_len
     }
 
+    pub fn scrollback_max_bytes(&self) -> Option<usize> {
+        self.scrollback_max_bytes
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback_offset
     }
@@ -209,12 +224,7 @@ impl Grid {
     /// smaller than the current fill, the oldest rows are trimmed away.
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.scrollback_len = new_len;
-        while self.scrollback.len() > self.scrollback_len {
-            self.scrollback.pop_front();
-        }
-        if self.scrollback_offset > self.scrollback.len() {
-            self.scrollback_offset = self.scrollback.len();
-        }
+        self.trim_scrollback();
     }
 
     /// Append a row to the back of scrollback, evicting the oldest if
@@ -225,10 +235,9 @@ impl Grid {
         if self.scrollback_len == 0 {
             return;
         }
+        self.scrollback_bytes = self.scrollback_bytes.saturating_add(row.storage_bytes());
         self.scrollback.push_back(row);
-        while self.scrollback.len() > self.scrollback_len {
-            self.scrollback.pop_front();
-        }
+        self.trim_scrollback();
         if self.scrollback_offset > 0 {
             self.scrollback_offset =
                 self.scrollback.len().min(self.scrollback_offset + 1);
@@ -490,6 +499,7 @@ impl Grid {
 
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
+        self.scrollback_bytes = 0;
         self.scrollback_offset = 0;
     }
 
@@ -607,15 +617,8 @@ impl Grid {
             // A row-1-anchored region is how inline TUIs move completed output above a fixed
             // composer. Those rows have left the visible transcript just as surely as a
             // full-screen scroll, so retain them in host scrollback.
-            if self.scrollback_len > 0 && self.scroll_top == 0 {
-                self.scrollback.push_back(removed);
-                while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
-                }
-                if self.scrollback_offset > 0 {
-                    self.scrollback_offset =
-                        self.scrollback.len().min(self.scrollback_offset + 1);
-                }
+            if self.scroll_top == 0 {
+                self.push_row_to_scrollback(removed);
             }
         }
     }
@@ -770,6 +773,27 @@ impl Grid {
         if self.pos.col > self.size.cols - 1 {
             self.pos.col = self.size.cols - 1;
         }
+    }
+
+    pub fn storage_bytes(&self) -> usize {
+        self.rows.iter().fold(0usize, |bytes, row| {
+            bytes.saturating_add(row.storage_bytes())
+        })
+        .saturating_add(self.scrollback_bytes)
+    }
+
+    fn trim_scrollback(&mut self) {
+        while self.scrollback.len() > self.scrollback_len
+            || self
+                .scrollback_max_bytes
+                .is_some_and(|limit| self.storage_bytes() > limit)
+        {
+            let Some(row) = self.scrollback.pop_front() else {
+                break;
+            };
+            self.scrollback_bytes = self.scrollback_bytes.saturating_sub(row.storage_bytes());
+        }
+        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
     }
 }
 
