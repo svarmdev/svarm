@@ -35,7 +35,7 @@ jobs:
           - os: ubuntu-latest
             test_args: --workspace
           - os: macos-15
-            test_args: --workspace --lib
+            test_args: -p svarm-tui --lib
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
