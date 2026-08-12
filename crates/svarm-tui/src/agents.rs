@@ -14,15 +14,14 @@ use svarm_agent::{
     framing::{read_frame, write_frame},
     protocol::{
         ConnectionRole, Envelope, Event, FrameDisposition, Hello, HostTerminalCapabilities,
-        KeyInput, LeaseToken, Message, MouseInput, PROTOCOL_VERSION, ProtocolRange, Request,
-        RequestId, Response, SessionId, StopSummary, SvarmSessionSnapshot, TerminalFrameTracker,
-        TerminalSequence,
+        KeyInput, LeaseToken, Message, MouseInput, MouseProtocol, PROTOCOL_VERSION, ProtocolRange,
+        Request, RequestId, Response, SessionId, StopSummary, SvarmSessionSnapshot,
+        TerminalFrameTracker, TerminalModes, TerminalSequence, TerminalViewport,
     },
 };
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
-/// Mirrors the server's screen, which carries the visible grid only; see the matching constant in
-/// `svarm-agent`'s session module.
+/// Live frames carry only the visible grid. Historical viewports arrive separately on demand.
 const SCROLLBACK_ROWS: usize = 0;
 
 #[derive(Clone, Debug)]
@@ -65,6 +64,21 @@ struct CachedTerminal {
     parser: Parser,
     tracker: TerminalFrameTracker,
     cursor_style: CursorStyle,
+    modes: TerminalModes,
+    scrollback: Option<ScrollbackView>,
+    scrollback_request: Option<usize>,
+}
+
+struct ScrollbackView {
+    parser: Parser,
+    offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WheelRouting {
+    ChildMouse,
+    AlternateScreen,
+    Scrollback,
 }
 
 pub(crate) struct RemoteAgents {
@@ -236,6 +250,10 @@ impl RemoteAgents {
                         updates.push(RemoteUpdate::TerminalChanged);
                     }
                 }
+                Message::Event(Event::TerminalViewport(viewport)) => {
+                    self.apply_viewport(viewport);
+                    updates.push(RemoteUpdate::TerminalChanged);
+                }
                 Message::Event(event) => {
                     if let Event::AgentRemoved { agent_id, .. } = &event {
                         self.terminals.remove(agent_id);
@@ -265,9 +283,68 @@ impl RemoteAgents {
     }
 
     pub fn screen(&self, id: AgentId) -> Option<&Screen> {
+        self.terminals.get(&id).map(|terminal| {
+            terminal
+                .scrollback
+                .as_ref()
+                .map_or_else(|| terminal.parser.screen(), |view| view.parser.screen())
+        })
+    }
+
+    pub fn is_scrolled(&self, id: AgentId) -> bool {
         self.terminals
             .get(&id)
-            .map(|terminal| terminal.parser.screen())
+            .is_some_and(|terminal| terminal.scrollback.is_some())
+    }
+
+    pub fn wheel_routing(&self, id: AgentId) -> WheelRouting {
+        let Some(terminal) = self.terminals.get(&id) else {
+            return WheelRouting::ChildMouse;
+        };
+        if terminal.modes.mouse_protocol != MouseProtocol::None {
+            WheelRouting::ChildMouse
+        } else if terminal.parser.screen().alternate_screen()
+            && terminal.modes.mouse_alternate_scroll
+        {
+            WheelRouting::AlternateScreen
+        } else {
+            WheelRouting::Scrollback
+        }
+    }
+
+    pub fn scroll(&mut self, agent_id: AgentId, rows: isize) -> Result<()> {
+        let Some(terminal) = self.terminals.get(&agent_id) else {
+            return Ok(());
+        };
+        let current = terminal
+            .scrollback_request
+            .or_else(|| terminal.scrollback.as_ref().map(|view| view.offset))
+            .unwrap_or(0);
+        let requested = if rows >= 0 {
+            current.saturating_add(rows as usize)
+        } else {
+            current.saturating_sub(rows.unsigned_abs())
+        };
+        if requested == 0 {
+            self.show_live(agent_id);
+            return Ok(());
+        }
+        if let Some(terminal) = self.terminals.get_mut(&agent_id) {
+            terminal.scrollback_request = Some(requested);
+        }
+        self.send(Request::TerminalViewport {
+            lease_token: self.lease_token.clone(),
+            agent_id,
+            scrollback: requested,
+        })
+    }
+
+    pub fn show_live(&mut self, agent_id: AgentId) -> bool {
+        let Some(terminal) = self.terminals.get_mut(&agent_id) else {
+            return false;
+        };
+        terminal.scrollback_request = None;
+        terminal.scrollback.take().is_some()
     }
 
     pub fn spawn(
@@ -329,6 +406,10 @@ impl RemoteAgents {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        for terminal in self.terminals.values_mut() {
+            terminal.scrollback = None;
+            terminal.scrollback_request = None;
+        }
         self.send(Request::ResizeSession {
             lease_token: self.lease_token.clone(),
             rows,
@@ -387,12 +468,18 @@ impl RemoteAgents {
                 parser: Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS),
                 tracker: TerminalFrameTracker::default(),
                 cursor_style: CursorStyle::default(),
+                modes: TerminalModes::default(),
+                scrollback: None,
+                scrollback_request: None,
             });
         let disposition = terminal.tracker.accept_full(frame.sequence);
         if disposition == FrameDisposition::Apply {
             terminal.parser = Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS);
             terminal.parser.process(&frame.formatted_screen);
             terminal.cursor_style = frame.cursor_style;
+            terminal.modes = frame.modes;
+            terminal.scrollback = None;
+            terminal.scrollback_request = None;
             self.pending_resync.remove(&frame.agent_id);
         }
         disposition
@@ -411,8 +498,30 @@ impl RemoteAgents {
         if disposition == FrameDisposition::Apply {
             terminal.parser.process(&frame.formatted_changes);
             terminal.cursor_style = frame.cursor_style;
+            terminal.modes = frame.modes;
         }
         disposition
+    }
+
+    fn apply_viewport(&mut self, viewport: TerminalViewport) {
+        let Some(terminal) = self.terminals.get_mut(&viewport.agent_id) else {
+            return;
+        };
+        if terminal.scrollback_request != Some(viewport.requested_scrollback) {
+            return;
+        }
+        if viewport.scrollback == 0 {
+            terminal.scrollback = None;
+            terminal.scrollback_request = None;
+            return;
+        }
+        let mut parser = Parser::new(viewport.rows, viewport.cols, 0);
+        parser.process(&viewport.formatted_screen);
+        terminal.scrollback = Some(ScrollbackView {
+            parser,
+            offset: viewport.scrollback,
+        });
+        terminal.scrollback_request = Some(viewport.scrollback);
     }
 
     fn after_frame(
@@ -511,5 +620,157 @@ impl RemoteAgents {
 impl Drop for RemoteAgents {
     fn drop(&mut self) {
         let _ = self.writer.shutdown(Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_viewport_is_separate_from_the_live_parser() {
+        let (writer, _peer) = UnixStream::pair().unwrap();
+        let id = AgentId::new(1);
+        let mut live = Parser::new(2, 12, 0);
+        live.process(b"live");
+        let mut agents = RemoteAgents {
+            writer,
+            next_request_id: 1,
+            session_id: SessionId(1),
+            lease_token: LeaseToken("test".into()),
+            terminals: HashMap::from([(
+                id,
+                CachedTerminal {
+                    parser: live,
+                    tracker: TerminalFrameTracker::default(),
+                    cursor_style: CursorStyle::default(),
+                    modes: TerminalModes::default(),
+                    scrollback: None,
+                    scrollback_request: Some(4),
+                },
+            )]),
+            pending_resync: HashSet::new(),
+        };
+
+        agents.apply_viewport(TerminalViewport {
+            agent_id: id,
+            rows: 2,
+            cols: 12,
+            requested_scrollback: 4,
+            scrollback: 4,
+            formatted_screen: b"older".to_vec(),
+        });
+
+        assert!(agents.screen(id).unwrap().contents().contains("older"));
+        assert!(agents.is_scrolled(id));
+        assert_eq!(agents.terminals[&id].scrollback.as_ref().unwrap().offset, 4);
+        assert!(agents.show_live(id));
+        assert!(agents.screen(id).unwrap().contents().contains("live"));
+    }
+
+    #[test]
+    fn wheel_routing_follows_the_live_child_terminal_modes() {
+        let (writer, _peer) = UnixStream::pair().unwrap();
+        let id = AgentId::new(1);
+        let terminal = |parser, modes| CachedTerminal {
+            parser,
+            tracker: TerminalFrameTracker::default(),
+            cursor_style: CursorStyle::default(),
+            modes,
+            scrollback: None,
+            scrollback_request: None,
+        };
+        let mut agents = RemoteAgents {
+            writer,
+            next_request_id: 1,
+            session_id: SessionId(1),
+            lease_token: LeaseToken("test".into()),
+            terminals: HashMap::new(),
+            pending_resync: HashSet::new(),
+        };
+
+        agents.terminals.insert(
+            id,
+            terminal(Parser::new(2, 12, 0), TerminalModes::default()),
+        );
+        assert_eq!(agents.wheel_routing(id), WheelRouting::Scrollback);
+
+        agents
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .parser
+            .process(b"\x1b[?1049h");
+        assert_eq!(agents.wheel_routing(id), WheelRouting::Scrollback);
+
+        agents
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .modes
+            .mouse_alternate_scroll = true;
+        assert_eq!(agents.wheel_routing(id), WheelRouting::AlternateScreen);
+
+        agents.terminals.get_mut(&id).unwrap().modes.mouse_protocol = MouseProtocol::PressRelease;
+        assert_eq!(agents.wheel_routing(id), WheelRouting::ChildMouse);
+    }
+
+    #[test]
+    fn rapid_scroll_requests_accumulate_from_the_pending_offset() {
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        let id = AgentId::new(1);
+        let mut agents = RemoteAgents {
+            writer,
+            next_request_id: 1,
+            session_id: SessionId(1),
+            lease_token: LeaseToken("test".into()),
+            terminals: HashMap::from([(
+                id,
+                CachedTerminal {
+                    parser: Parser::new(2, 12, 0),
+                    tracker: TerminalFrameTracker::default(),
+                    cursor_style: CursorStyle::default(),
+                    modes: TerminalModes::default(),
+                    scrollback: None,
+                    scrollback_request: None,
+                },
+            )]),
+            pending_resync: HashSet::new(),
+        };
+
+        agents.scroll(id, 3).unwrap();
+        agents.scroll(id, 3).unwrap();
+
+        let offsets = [(); 2].map(|()| {
+            let envelope: Envelope = read_frame(&mut peer).unwrap().unwrap();
+            let Message::Request(Request::TerminalViewport { scrollback, .. }) = envelope.message
+            else {
+                panic!("expected viewport request");
+            };
+            scrollback
+        });
+        assert_eq!(offsets, [3, 6]);
+
+        agents.apply_viewport(TerminalViewport {
+            agent_id: id,
+            rows: 2,
+            cols: 12,
+            requested_scrollback: 3,
+            scrollback: 3,
+            formatted_screen: b"stale".to_vec(),
+        });
+        assert!(agents.terminals[&id].scrollback.is_none());
+        assert_eq!(agents.terminals[&id].scrollback_request, Some(6));
+
+        agents.apply_viewport(TerminalViewport {
+            agent_id: id,
+            rows: 2,
+            cols: 12,
+            requested_scrollback: 6,
+            scrollback: 5,
+            formatted_screen: b"latest".to_vec(),
+        });
+        assert_eq!(agents.terminals[&id].scrollback.as_ref().unwrap().offset, 5);
+        assert_eq!(agents.terminals[&id].scrollback_request, Some(5));
     }
 }

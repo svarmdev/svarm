@@ -41,6 +41,7 @@ Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, relea
 | --- | --- |
 | `j`, `k`, or arrows | Select the next or previous agent |
 | `1`–`9` | Select an agent directly |
+| `PageUp`, `PageDown` | Scroll the selected agent's terminal history |
 | `n` | Open the workspace/agent/start form |
 | `b` | Toggle the sidebar |
 | `m` | Open the sidebar menu |
@@ -55,9 +56,13 @@ Settings entries work with the mouse or with arrows and Enter. Settings currentl
 contains the available theme palettes; the selected theme is saved in
 `$XDG_CONFIG_HOME/svarm/settings.json` (or `~/.config/svarm/settings.json`).
 
-Pasting respects the focused application's bracketed-paste mode. Mouse events requested
-by the focused application, `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through
-normally.
+Pasting respects the focused application's bracketed-paste mode. The mouse wheel scrolls an
+overflowing sidebar. Over an agent, wheel events follow native terminal rules: applications that
+requested the mouse receive them, alternate-screen applications that enable alternate scrolling
+receive cursor input, and normal terminal output uses Svarm's bounded history. Use
+`Ctrl+B, PageUp` to enter history explicitly.
+Typing or pasting returns to the live screen. Clicks are forwarded only when the application has
+requested mouse input. `Ctrl+C`, `Ctrl+Z`, and other terminal controls pass through normally.
 
 The new-agent form defaults to the last successfully launched workspace and agent.
 Workspace history is kept in most-recently-used order. From the workspace list,
@@ -77,7 +82,7 @@ Detach, session stop, and server stop are intentionally different:
 - `svarm server stop` reports affected session and agent counts, confirms, then stops every session and the server.
 - `svarm server status` reports reachability, PID, versions, socket, uptime, and client/session counts.
 
-Closing a terminal window, losing SSH, or crashing only the client has the same server-side effect as detach. Reattachment reconstructs the bounded visible terminal state and current input modes; it does not replay an unbounded output history.
+Closing a terminal window, losing SSH, or crashing only the client has the same server-side effect as detach. Reattachment reconstructs the live terminal and its bounded 10,000-row in-memory history; history is never unbounded or written to disk.
 
 This is live-process persistence, not durable checkpointing. Agents do not survive a server crash, explicit server termination, operating-system termination, reboot, or machine failure. Terminal screens and agent output are never persisted to disk. If the operating system keeps the server alive through sleep/wake, sessions remain available.
 

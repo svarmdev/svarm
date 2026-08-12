@@ -14,6 +14,8 @@ use crate::{
 /// Called when an agent's terminal changes so its owner can wake immediately.
 pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
 
+const SCROLLBACK_ROWS: usize = 10_000;
+
 pub struct AgentSession {
     id: AgentId,
     kind: AgentKind,
@@ -58,12 +60,19 @@ impl AgentSession {
             id,
             kind,
             launch_directory: cwd.to_owned(),
-            terminal: TerminalProcess::spawn_command(command, cwd, size, palette, notify)?,
+            terminal: TerminalProcess::spawn_command_with_scrollback(
+                command,
+                cwd,
+                size,
+                palette,
+                notify,
+                SCROLLBACK_ROWS,
+            )?,
         })
     }
 
-    pub fn keyboard_disambiguates(&self) -> bool {
-        self.terminal.keyboard_disambiguates()
+    pub fn terminal_modes(&self) -> crate::protocol::TerminalModes {
+        self.terminal.terminal_modes()
     }
 
     pub fn cursor_style(&self) -> CursorStyle {
@@ -72,6 +81,10 @@ impl AgentSession {
 
     pub fn with_screen<T>(&self, read: impl FnOnce(&vt100::Screen) -> T) -> T {
         self.terminal.with_screen(read)
+    }
+
+    pub fn formatted_viewport(&self, requested: usize) -> (u16, u16, usize, Vec<u8>) {
+        self.terminal.formatted_viewport(requested)
     }
 
     pub fn set_terminal_palette(&self, palette: Option<TerminalPalette>) {

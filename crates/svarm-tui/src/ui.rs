@@ -51,6 +51,7 @@ impl ModalSize {
 pub(crate) struct UiModel<'a> {
     pub app: &'a App,
     pub screen: Option<&'a Screen>,
+    pub scrolled: bool,
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
     pub colors_enabled: bool,
@@ -81,6 +82,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     render_terminal(
         frame,
         model.screen,
+        model.scrolled,
         app.mode(),
         terminal_area(area, app.sidebar_visible()),
         theme,
@@ -319,7 +321,14 @@ fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
 
 fn agent_list_start(app: &App, area: Rect) -> usize {
     let visible = usize::from((area.height / AGENT_CARD_HEIGHT).max(1));
-    app.selected_index().saturating_sub(visible - 1)
+    let max = app.agents().len().saturating_sub(visible);
+    app.sidebar_scroll()
+        .unwrap_or_else(|| app.selected_index().saturating_sub(visible - 1))
+        .min(max)
+}
+
+pub fn agent_list_page_size(app: &App, area: Rect) -> usize {
+    usize::from(agent_list_area(app, sidebar_area(area)).height / AGENT_CARD_HEIGHT).max(1)
 }
 
 fn render_sidebar(
@@ -397,9 +406,7 @@ fn render_sidebar(
             })
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default()
-        .with_offset(agent_list_start(app, agents_area))
-        .with_selected(Some(app.selected_index()));
+    let mut state = ListState::default().with_offset(agent_list_start(app, agents_area));
     frame.render_stateful_widget(List::new(cards), agents_area, &mut state);
 
     if let Some(notice) = app.notice() {
@@ -516,6 +523,7 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn render_terminal(
     frame: &mut Frame<'_>,
     screen: Option<&Screen>,
+    scrolled: bool,
     mode: Mode,
     area: Rect,
     theme: Theme,
@@ -533,6 +541,7 @@ fn render_terminal(
     // blink the user configured. Painting one into the buffer can only produce a static block.
     let pane = TerminalScreen::new(screen);
     if mode == Mode::Terminal
+        && !scrolled
         && let Some(position) = pane.cursor_position(area)
     {
         frame.set_cursor_position(position);
@@ -1000,6 +1009,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: None,
+                        scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
@@ -1061,6 +1071,7 @@ mod tests {
                         UiModel {
                             app: &app,
                             screen: None,
+                            scrolled: false,
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
@@ -1100,6 +1111,7 @@ mod tests {
                         UiModel {
                             app: &app,
                             screen: None,
+                            scrolled: false,
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
@@ -1281,6 +1293,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: None,
+                        scrolled: false,
                         embedded: None,
                         theme,
                         colors_enabled: true,
@@ -1362,7 +1375,7 @@ mod tests {
                 git: None,
             })
             .collect::<Vec<_>>();
-        let app = App::hydrate(
+        let mut app = App::hydrate(
             SvarmSessionSnapshot {
                 summary: SessionSummary {
                     id: SessionId(9),
@@ -1392,6 +1405,12 @@ mod tests {
         assert_eq!(agent_item_at(&app, area, 2, 19), Some(7));
         assert_eq!(agent_item_at(&app, area, 2, 22), None);
         assert_eq!(agent_item_at(&app, area, 40, 19), None);
+
+        app.scroll_sidebar(-1, agent_list_page_size(&app, area));
+        assert_eq!(agent_item_at(&app, area, 2, 1), Some(0));
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("1 · Conversation 1"));
+        assert!(!rendered.contains("8 · Conversation 8"));
     }
 
     #[test]
@@ -1414,6 +1433,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: Some(parser.screen()),
+                        scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -1432,6 +1452,36 @@ mod tests {
             !cursor_cell.modifier.contains(Modifier::REVERSED) && cursor_cell.symbol() != "█",
             "the pane must not paint a cursor over the terminal's own"
         );
+    }
+
+    #[test]
+    fn scrollback_does_not_overlay_a_position_label() {
+        let mut parser = svarm_agent::vt100::Parser::new(24, 80, 0);
+        parser.process(b"terminal output");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_terminal(
+                    frame,
+                    Some(parser.screen()),
+                    true,
+                    Mode::Terminal,
+                    frame.area(),
+                    crate::theme::ThemeName::Dark.theme(true),
+                );
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("terminal output"));
+        assert!(!rendered.contains("scroll 12/40"));
     }
 
     #[test]
@@ -1454,6 +1504,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: Some(parser.screen()),
+                        scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -1497,6 +1548,7 @@ mod tests {
                     UiModel {
                         app: &app,
                         screen: None,
+                        scrolled: false,
                         embedded: Some(&snapshot),
                         theme: app.theme().theme(true),
                         colors_enabled: true,
@@ -1530,6 +1582,7 @@ mod tests {
                     UiModel {
                         app,
                         screen: None,
+                        scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,

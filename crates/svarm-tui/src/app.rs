@@ -390,6 +390,7 @@ impl AgentState {
 pub(crate) struct App {
     agents: Vec<AgentState>,
     selected: usize,
+    sidebar_scroll: Option<usize>,
     mode: Mode,
     sidebar_visible: bool,
     menu_selected: MenuItem,
@@ -411,6 +412,7 @@ impl App {
         Self {
             agents: Vec::new(),
             selected: 0,
+            sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
@@ -439,6 +441,7 @@ impl App {
                 .map(AgentState::from_remote)
                 .collect(),
             selected,
+            sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
@@ -454,12 +457,14 @@ impl App {
     pub fn add_agent(&mut self, snapshot: SessionSnapshot) {
         self.agents.push(AgentState::new(&snapshot));
         self.selected = self.agents.len() - 1;
+        self.sidebar_scroll = None;
         self.mode = Mode::Terminal;
     }
 
     pub fn add_remote_agent(&mut self, snapshot: AgentSnapshot) {
         self.agents.push(AgentState::from_remote(&snapshot));
         self.selected = self.agents.len() - 1;
+        self.sidebar_scroll = None;
         self.mode = Mode::Terminal;
     }
 
@@ -498,12 +503,14 @@ impl App {
         };
         self.agents.remove(index);
         self.selected = self.selected.min(self.agents.len().saturating_sub(1));
+        self.sidebar_scroll = None;
         self.mode = Mode::Terminal;
     }
 
     pub fn select_next(&mut self) {
         if !self.agents.is_empty() {
             self.selected = (self.selected + 1) % self.agents.len();
+            self.sidebar_scroll = None;
         }
     }
 
@@ -513,13 +520,29 @@ impl App {
                 .selected
                 .checked_sub(1)
                 .unwrap_or(self.agents.len() - 1);
+            self.sidebar_scroll = None;
         }
     }
 
     pub fn select(&mut self, index: usize) {
         if index < self.agents.len() {
             self.selected = index;
+            self.sidebar_scroll = None;
         }
+    }
+
+    pub fn scroll_sidebar(&mut self, rows: isize, visible: usize) {
+        let max = self.agents.len().saturating_sub(visible.max(1));
+        let current = self.sidebar_scroll.unwrap_or_else(|| {
+            self.selected
+                .saturating_sub(visible.saturating_sub(1))
+                .min(max)
+        });
+        self.sidebar_scroll = Some(if rows >= 0 {
+            current.saturating_add(rows as usize).min(max)
+        } else {
+            current.saturating_sub(rows.unsigned_abs())
+        });
     }
 
     pub fn mark_selected_seen(&mut self) -> Option<(AgentId, u64)> {
@@ -594,6 +617,10 @@ impl App {
 
     pub const fn selected_index(&self) -> usize {
         self.selected
+    }
+
+    pub const fn sidebar_scroll(&self) -> Option<usize> {
+        self.sidebar_scroll
     }
 
     pub const fn mode(&self) -> Mode {
@@ -963,6 +990,22 @@ mod tests {
         app.remove_agent(AgentId::new(1));
         assert_eq!(app.selected_agent_id(), None);
         assert_eq!(app.selected_index(), 0);
+    }
+
+    #[test]
+    fn sidebar_scroll_is_bounded_and_selection_restores_follow_mode() {
+        let mut app = app();
+        for id in 1..=8 {
+            app.add_agent(snapshot(id, 0));
+        }
+
+        app.scroll_sidebar(-1, 7);
+        assert_eq!(app.sidebar_scroll(), Some(0));
+        app.scroll_sidebar(99, 7);
+        assert_eq!(app.sidebar_scroll(), Some(1));
+
+        app.select_previous();
+        assert_eq!(app.sidebar_scroll(), None);
     }
 
     #[test]

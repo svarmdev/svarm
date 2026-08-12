@@ -27,9 +27,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 /// Called whenever output, EOF, or a read error means the owner should inspect the process.
 pub type TerminalNotifier = Arc<dyn Fn() + Send + Sync>;
 
-/// The visible screen is all Svarm renders. Retaining undisplayable scrollback would make every
-/// prepared tool snapshot more expensive without adding a user-visible capability.
-const SCROLLBACK_ROWS: usize = 0;
+const NO_SCROLLBACK: usize = 0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +76,7 @@ pub struct TerminalProcess {
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
     keyboard: Arc<Mutex<KeyboardState>>,
+    alternate_scroll: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 }
 
@@ -125,6 +124,17 @@ impl TerminalProcess {
         palette: Option<TerminalPalette>,
         notify: Option<TerminalNotifier>,
     ) -> Result<Self> {
+        Self::spawn_command_with_scrollback(command, cwd, size, palette, notify, NO_SCROLLBACK)
+    }
+
+    pub(crate) fn spawn_command_with_scrollback(
+        command: CommandBuilder,
+        cwd: &Path,
+        size: PtySize,
+        palette: Option<TerminalPalette>,
+        notify: Option<TerminalNotifier>,
+        scrollback_rows: usize,
+    ) -> Result<Self> {
         if !cwd.is_dir() {
             return Err(format!(
                 "workspace does not exist or is not a directory: {}",
@@ -142,13 +152,14 @@ impl TerminalProcess {
         let parser = Arc::new(Mutex::new(Parser::new(
             size.rows.max(1),
             size.cols.max(1),
-            SCROLLBACK_ROWS,
+            scrollback_rows,
         )));
         let generation = Arc::new(AtomicU64::new(0));
         let read_error = Arc::new(Mutex::new(None));
         let terminal_palette = Arc::new(Mutex::new(palette));
         let cursor_style = Arc::new(Mutex::new(CursorStyle::default()));
         let keyboard = Arc::new(Mutex::new(KeyboardState::default()));
+        let alternate_scroll = Arc::new(AtomicBool::new(false));
         let output_closed = Arc::new(AtomicBool::new(false));
         spawn_reader(
             reader,
@@ -160,6 +171,7 @@ impl TerminalProcess {
                 read_error: read_error.clone(),
                 cursor_style: cursor_style.clone(),
                 keyboard: keyboard.clone(),
+                alternate_scroll: alternate_scroll.clone(),
                 output_closed: output_closed.clone(),
                 notify,
             },
@@ -177,6 +189,7 @@ impl TerminalProcess {
             read_error,
             cursor_style,
             keyboard,
+            alternate_scroll,
             output_closed,
         })
     }
@@ -255,11 +268,28 @@ impl TerminalProcess {
         read(self.parser().screen())
     }
 
+    pub(crate) fn formatted_viewport(&self, requested: usize) -> (u16, u16, usize, Vec<u8>) {
+        let mut parser = self.parser();
+        let screen = parser.screen_mut();
+        let original = screen.scrollback();
+        screen.set_scrollback(requested);
+        let scrollback = screen.scrollback();
+        let (rows, cols) = screen.size();
+        let formatted = screen.contents_formatted();
+        screen.set_scrollback(original);
+        (rows, cols, scrollback, formatted)
+    }
+
     pub(crate) fn keyboard_disambiguates(&self) -> bool {
         self.keyboard
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .disambiguates()
+    }
+
+    pub(crate) fn terminal_modes(&self) -> TerminalModes {
+        let parser = self.parser();
+        self.modes(parser.screen())
     }
 
     pub(crate) fn cursor_style(&self) -> CursorStyle {
@@ -300,6 +330,7 @@ impl TerminalProcess {
             application_cursor: screen.application_cursor(),
             application_keypad: screen.application_keypad(),
             bracketed_paste: screen.bracketed_paste(),
+            mouse_alternate_scroll: self.alternate_scroll.load(Ordering::Acquire),
             mouse_protocol: match screen.mouse_protocol_mode() {
                 MouseProtocolMode::None => MouseProtocol::None,
                 MouseProtocolMode::Press => MouseProtocol::Press,
@@ -335,6 +366,7 @@ struct ReaderState {
     read_error: Arc<Mutex<Option<String>>>,
     cursor_style: Arc<Mutex<CursorStyle>>,
     keyboard: Arc<Mutex<KeyboardState>>,
+    alternate_scroll: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
     notify: Option<TerminalNotifier>,
 }
@@ -388,12 +420,24 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                                 drop(parser);
                                 reply(query.response(cursor).as_bytes());
                             }
+                            Recognized::KeyboardQuery => {
+                                let flags = state
+                                    .keyboard
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .flags();
+                                drop(parser);
+                                reply(format!("\x1b[?{flags}u").as_bytes());
+                            }
                             Recognized::Keyboard(change) => {
                                 state
                                     .keyboard
                                     .lock()
                                     .unwrap_or_else(|poison| poison.into_inner())
                                     .apply(change);
+                            }
+                            Recognized::AlternateScroll(enabled) => {
+                                state.alternate_scroll.store(enabled, Ordering::Release);
                             }
                         }
                     }
@@ -469,6 +513,50 @@ mod tests {
 
         let contents = process.with_screen(vt100::Screen::contents);
         assert!(contents.contains("[2;9R"), "screen was {contents:?}");
+    }
+
+    #[test]
+    fn answers_kitty_keyboard_queries_with_the_active_flags() {
+        let cwd = std::env::current_dir().unwrap();
+        let process = TerminalProcess::spawn_command(
+            command(
+                "stty raw -echo; printf '\\033[>7u\\033[?u'; dd bs=1 count=5 2>/dev/null | od -An -tx1; sleep 1",
+                &cwd,
+            ),
+            &cwd,
+            size(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process.with_screen(|screen| screen.contents().contains("1b 5b 3f 37 75"))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let screen = process.with_screen(vt100::Screen::contents);
+        assert!(
+            screen.contains("1b 5b 3f 37 75"),
+            "keyboard query reply was not returned: {screen:?}"
+        );
+        assert!(process.terminal_modes().keyboard_disambiguate);
+    }
+
+    #[test]
+    fn top_anchored_scroll_regions_feed_host_history() {
+        let mut parser = Parser::new(5, 10, 100);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+
+        // Inline TUIs keep their composer below this region and move completed transcript rows
+        // out through its top edge.
+        parser.process(b"\x1b[1;3r\x1b[3;1H\x1b[S");
+        parser.screen_mut().set_scrollback(usize::MAX);
+
+        assert_eq!(parser.screen().scrollback(), 1);
+        assert!(parser.screen().contents().starts_with("one"));
     }
 
     #[test]
@@ -564,5 +652,32 @@ mod tests {
         while process.poll().unwrap() == SessionStatus::Running && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn reports_alternate_scroll_mode() {
+        let cwd = std::env::current_dir().unwrap();
+        let size = PtySize {
+            rows: 4,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let process = TerminalProcess::spawn_command(
+            command("printf '\\033[?1049h\\033[?1007h'; sleep 1", &cwd),
+            &cwd,
+            size,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process.with_screen(|screen| !screen.alternate_screen()) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(process.snapshot().modes.mouse_alternate_scroll);
     }
 }

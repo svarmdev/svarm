@@ -267,6 +267,7 @@ mod tests {
         application_cursor: false,
         application_keypad: false,
         bracketed_paste: false,
+        mouse_alternate_scroll: false,
         mouse_protocol: MouseProtocol::None,
         mouse_encoding: MouseEncoding::Default,
     };

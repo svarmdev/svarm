@@ -17,3 +17,6 @@ clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 svarm-agent = { path = "crates/svarm-agent" }
 svarm-tui = { path = "crates/svarm-tui" }
+
+[patch.crates-io]
+vt100-psmux = { path = "vendor/vt100-psmux" }

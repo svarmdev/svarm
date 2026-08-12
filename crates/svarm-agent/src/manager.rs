@@ -98,14 +98,22 @@ impl AgentManager {
             .map(|session| session.with_screen(read))
     }
 
+    pub fn formatted_viewport(
+        &self,
+        id: AgentId,
+        requested: usize,
+    ) -> Option<(u16, u16, usize, Vec<u8>)> {
+        self.sessions
+            .get(&id)
+            .map(|session| session.formatted_viewport(requested))
+    }
+
     pub fn cursor_style(&self, id: AgentId) -> Option<crate::CursorStyle> {
         self.sessions.get(&id).map(AgentSession::cursor_style)
     }
 
-    pub fn keyboard_disambiguates(&self, id: AgentId) -> bool {
-        self.sessions
-            .get(&id)
-            .is_some_and(AgentSession::keyboard_disambiguates)
+    pub fn terminal_modes(&self, id: AgentId) -> Option<crate::protocol::TerminalModes> {
+        self.sessions.get(&id).map(AgentSession::terminal_modes)
     }
 
     pub fn snapshot(&self, id: AgentId) -> Option<SessionSnapshot> {

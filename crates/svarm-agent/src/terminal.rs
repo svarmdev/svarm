@@ -123,7 +123,9 @@ pub(crate) enum KeyboardProtocol {
 pub(crate) enum Recognized {
     CursorStyle(CursorStyle),
     Query(DeviceQuery),
+    KeyboardQuery,
     Keyboard(KeyboardProtocol),
+    AlternateScroll(bool),
 }
 
 /// Tracks the keyboard mode an agent has asked for, including the stack the protocol maintains.
@@ -164,6 +166,10 @@ impl KeyboardState {
 
     pub const fn disambiguates(&self) -> bool {
         self.flags & Self::DISAMBIGUATE != 0
+    }
+
+    pub const fn flags(&self) -> u8 {
+        self.flags
     }
 }
 
@@ -300,6 +306,17 @@ impl ControlDetector {
                 }
                 (
                     Scan::Csi {
+                        prefix: Some(b'?'),
+                        first: 0,
+                        second: None,
+                    },
+                    b'u',
+                ) => {
+                    report(Recognized::KeyboardQuery);
+                    Scan::Idle
+                }
+                (
+                    Scan::Csi {
                         prefix: Some(prefix),
                         first,
                         second,
@@ -319,6 +336,17 @@ impl ControlDetector {
                     if let Some(change) = change {
                         report(Recognized::Keyboard(change));
                     }
+                    Scan::Idle
+                }
+                (
+                    Scan::Csi {
+                        prefix: Some(b'?'),
+                        first: 1007,
+                        second: None,
+                    },
+                    enabled @ (b'h' | b'l'),
+                ) => {
+                    report(Recognized::AlternateScroll(*enabled == b'h'));
                     Scan::Idle
                 }
                 _ => Scan::Idle,
@@ -584,6 +612,28 @@ mod tests {
             [(6, Recognized::Query(DeviceQuery::CursorPosition))]
         );
         assert_eq!(&output[..6], b"ab\x1b[6n");
+    }
+
+    #[test]
+    fn alternate_scroll_mode_is_recognized_across_reads() {
+        let mut detector = ControlDetector::default();
+
+        assert!(detector.process(b"\x1b[?100").is_empty());
+        assert_eq!(
+            detector.process(b"7h\x1b[?1007l"),
+            [
+                (2, Recognized::AlternateScroll(true)),
+                (10, Recognized::AlternateScroll(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_query_is_recognized_across_reads() {
+        let mut detector = ControlDetector::default();
+
+        assert!(detector.process(b"\x1b[?").is_empty());
+        assert_eq!(detector.process(b"u"), [(1, Recognized::KeyboardQuery)]);
     }
 
     #[test]

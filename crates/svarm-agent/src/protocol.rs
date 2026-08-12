@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, AgentKind, CursorStyle, ProcessExit, SessionStatus, TerminalPalette};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -158,6 +158,11 @@ pub enum Request {
         agent_id: AgentId,
         event: MouseInput,
     },
+    TerminalViewport {
+        lease_token: LeaseToken,
+        agent_id: AgentId,
+        scrollback: usize,
+    },
     ResizeSession {
         lease_token: LeaseToken,
         rows: u16,
@@ -237,6 +242,7 @@ pub enum Event {
     },
     TerminalFull(TerminalFull),
     TerminalDiff(TerminalDiff),
+    TerminalViewport(TerminalViewport),
     SessionNotice(SessionNotice),
     LeaseRevoked {
         reason: String,
@@ -382,6 +388,9 @@ pub struct TerminalModes {
     pub application_cursor: bool,
     pub application_keypad: bool,
     pub bracketed_paste: bool,
+    /// The child requested xterm alternate-scroll mode (DEC private mode 1007).
+    #[serde(default)]
+    pub mouse_alternate_scroll: bool,
     /// The agent enabled the kitty keyboard protocol's "disambiguate escape codes" mode, so keys
     /// the legacy encoding cannot express are reported as `CSI ... u` instead.
     pub keyboard_disambiguate: bool,
@@ -434,6 +443,17 @@ pub struct TerminalDiff {
     pub formatted_changes: Vec<u8>,
     pub modes: TerminalModes,
     pub cursor_style: CursorStyle,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalViewport {
+    pub agent_id: AgentId,
+    pub rows: u16,
+    pub cols: u16,
+    pub requested_scrollback: usize,
+    pub scrollback: usize,
+    #[serde(with = "crate::base64")]
+    pub formatted_screen: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -607,7 +627,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_four_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_five_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -626,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_four_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_five_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,

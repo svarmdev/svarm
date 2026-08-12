@@ -11,6 +11,8 @@ pub(crate) enum ManagementCommand {
     LiteralPrefix,
     NextAgent,
     PreviousAgent,
+    ScrollTerminalUp,
+    ScrollTerminalDown,
     ChooseAgent,
     CloseAgent,
     Detach,
@@ -36,6 +38,10 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
     Keybinding {
         keys: "Ctrl+B, 1..9",
         action: "select agent",
+    },
+    Keybinding {
+        keys: "Ctrl+B, PageUp/PageDown",
+        action: "scroll agent history",
     },
     Keybinding {
         keys: "Ctrl+B, n",
@@ -78,6 +84,8 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         }
         HostKeyCode::Char('j') | HostKeyCode::Down => ManagementCommand::NextAgent,
         HostKeyCode::Char('k') | HostKeyCode::Up => ManagementCommand::PreviousAgent,
+        HostKeyCode::PageUp => ManagementCommand::ScrollTerminalUp,
+        HostKeyCode::PageDown => ManagementCommand::ScrollTerminalDown,
         HostKeyCode::Char('n') => ManagementCommand::ChooseAgent,
         HostKeyCode::Char('x') => ManagementCommand::CloseAgent,
         HostKeyCode::Char('d') => ManagementCommand::Detach,
@@ -178,6 +186,10 @@ mod tests {
         assert_eq!(
             management_command(key(HostKeyCode::Char('q'), KeyModifiers::NONE)),
             ManagementCommand::ConfirmQuit
+        );
+        assert_eq!(
+            management_command(key(HostKeyCode::PageUp, KeyModifiers::NONE)),
+            ManagementCommand::ScrollTerminalUp
         );
         assert!(
             MANAGEMENT_KEYBINDINGS

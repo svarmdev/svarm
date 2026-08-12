@@ -8,11 +8,15 @@ use ratatui::layout::Rect;
 use svarm_agent::{
     AgentKind, Result, SessionStatus, TerminalPalette, TerminalProcessSnapshot,
     input::{encode_key, encode_mouse, encode_paste},
-    protocol::Event as ServerEvent,
+    protocol::{
+        Event as ServerEvent, InputModifiers, KeyCode as AgentKeyCode, KeyInput as AgentKeyInput,
+    },
 };
 
 use crate::{
-    agents::{ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate},
+    agents::{
+        ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate, WheelRouting,
+    },
     app::{
         App, BrowserAction, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage,
         WorkspaceChoice,
@@ -106,6 +110,7 @@ pub fn run(
             let model = UiModel {
                 app: &app,
                 screen: selected.and_then(|id| agents.screen(id)),
+                scrolled: selected.is_some_and(|id| agents.is_scrolled(id)),
                 embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
@@ -197,6 +202,7 @@ fn handle_host_event(
         }
         HostEvent::Paste(text) if app.mode() == Mode::Terminal => {
             if let Some(id) = app.selected_agent_id() {
+                dirty |= agents.show_live(id);
                 agents.paste(id, text)?;
             }
         }
@@ -261,7 +267,9 @@ fn apply_remote_update(
             ServerEvent::SvarmSessionSnapshot(_) | ServerEvent::SvarmSessionChanged(_) => {
                 dirty = true;
             }
-            ServerEvent::TerminalFull(_) | ServerEvent::TerminalDiff(_) => {
+            ServerEvent::TerminalFull(_)
+            | ServerEvent::TerminalDiff(_)
+            | ServerEvent::TerminalViewport(_) => {
                 unreachable!("terminal frames are applied by adapter")
             }
         },
@@ -289,7 +297,9 @@ fn handle_key(
     match app.mode() {
         Mode::Terminal if is_management_prefix(key) => app.set_mode(Mode::Prefix),
         Mode::Terminal => {
-            redraw = false;
+            redraw = app
+                .selected_agent_id()
+                .is_some_and(|id| agents.show_live(id));
             if let Some(event) = key_input(key)
                 && let Some(id) = app.selected_agent_id()
             {
@@ -301,6 +311,7 @@ fn handle_key(
                 app,
                 agents,
                 resources.settings,
+                resources.host_area,
                 management_command(key),
             );
         }
@@ -376,12 +387,14 @@ fn handle_management_command(
     app: &mut App,
     agents: &mut RemoteAgents,
     settings: &Settings,
+    area: Rect,
     command: ManagementCommand,
 ) -> Result<(bool, bool)> {
     let mut resize = false;
     match command {
         ManagementCommand::LiteralPrefix => {
             if let Some(id) = app.selected_agent_id() {
+                agents.show_live(id);
                 agents.literal(id, vec![0x02])?;
             }
             app.set_mode(Mode::Terminal);
@@ -394,6 +407,19 @@ fn handle_management_command(
         ManagementCommand::PreviousAgent => {
             app.select_previous();
             sync_selection(app, agents)?;
+            app.set_mode(Mode::Terminal);
+        }
+        ManagementCommand::ScrollTerminalUp | ManagementCommand::ScrollTerminalDown => {
+            if let Some(id) = app.selected_agent_id() {
+                let page = isize::try_from(ui::terminal_area(area, app.sidebar_visible()).height)
+                    .unwrap_or(isize::MAX);
+                let rows = if command == ManagementCommand::ScrollTerminalUp {
+                    page
+                } else {
+                    -page
+                };
+                agents.scroll(id, rows)?;
+            }
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::ChooseAgent => app.open_new_agent(
@@ -440,6 +466,10 @@ fn handle_mouse(
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<bool> {
+    if app.mode() == Mode::Terminal && handle_sidebar_wheel(app, mouse, area) {
+        return Ok(true);
+    }
+
     if matches!(
         app.mode(),
         Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
@@ -449,7 +479,7 @@ fn handle_mouse(
             && ui::new_agent_button_area(area, app.sidebar_visible())
                 .is_some_and(|button| contains(button, mouse.column, mouse.row))
         {
-            handle_management_command(app, agents, settings, ManagementCommand::ChooseAgent)?;
+            handle_management_command(app, agents, settings, area, ManagementCommand::ChooseAgent)?;
             return Ok(true);
         }
 
@@ -491,13 +521,31 @@ fn handle_mouse(
     let Some(id) = app.selected_agent_id() else {
         return Ok(false);
     };
+    if let Some(steps) = wheel_steps(mouse.kind) {
+        match agents.wheel_routing(id) {
+            WheelRouting::ChildMouse => {}
+            WheelRouting::AlternateScreen => {
+                agents.show_live(id);
+                agents.key(id, alternate_scroll_input(steps))?;
+                return Ok(true);
+            }
+            WheelRouting::Scrollback => {
+                agents.scroll(id, -steps * 3)?;
+                return Ok(true);
+            }
+        }
+    }
+    if agents.wheel_routing(id) != WheelRouting::ChildMouse {
+        return Ok(false);
+    }
+    let redraw = agents.show_live(id);
     let translated = MouseEvent {
         column: mouse.column - child_area.x,
         row: mouse.row - child_area.y,
         ..mouse
     };
     agents.mouse(id, mouse_input(translated))?;
-    Ok(false)
+    Ok(redraw)
 }
 
 fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
@@ -869,6 +917,36 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
+const fn wheel_steps(kind: MouseEventKind) -> Option<isize> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(-1),
+        MouseEventKind::ScrollDown => Some(1),
+        _ => None,
+    }
+}
+
+fn alternate_scroll_input(steps: isize) -> AgentKeyInput {
+    AgentKeyInput {
+        code: if steps < 0 {
+            AgentKeyCode::Up
+        } else {
+            AgentKeyCode::Down
+        },
+        modifiers: InputModifiers::default(),
+    }
+}
+
+fn handle_sidebar_wheel(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
+    let Some(steps) = wheel_steps(mouse.kind) else {
+        return false;
+    };
+    if !app.sidebar_visible() || !contains(ui::sidebar_area(area), mouse.column, mouse.row) {
+        return false;
+    }
+    app.scroll_sidebar(steps, ui::agent_list_page_size(app, area));
+    true
+}
+
 fn connection_failure_message(reason: &str, session_id: u64) -> String {
     let reason = reason.replace(['\r', '\n'], " ");
     let mut characters = reason.chars();
@@ -883,7 +961,10 @@ fn connection_failure_message(reason: &str, session_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyModifiers;
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+    use svarm_agent::{AgentId, AgentKind, SessionSnapshot};
 
     use super::*;
 
@@ -901,6 +982,44 @@ mod tests {
             KeyCode::Char('b'),
             KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn touchpad_and_wheel_events_map_to_sidebar_and_alternate_screen_scrolling() {
+        assert_eq!(wheel_steps(MouseEventKind::ScrollUp), Some(-1));
+        assert_eq!(wheel_steps(MouseEventKind::ScrollDown), Some(1));
+        assert_eq!(wheel_steps(MouseEventKind::Moved), None);
+        assert_eq!(alternate_scroll_input(-1).code, AgentKeyCode::Up);
+        assert_eq!(alternate_scroll_input(1).code, AgentKeyCode::Down);
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        for id in 1..=8 {
+            app.add_agent(SessionSnapshot {
+                id: AgentId::new(id),
+                kind: AgentKind::Codex,
+                launch_directory: PathBuf::from("/tmp/workspace"),
+                status: SessionStatus::Running,
+                output_generation: 0,
+                read_error: None,
+                exit: None,
+            });
+        }
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(handle_sidebar_wheel(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 1,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        ));
+        assert_eq!(app.sidebar_scroll(), Some(1));
     }
 
     #[test]

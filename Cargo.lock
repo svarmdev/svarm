@@ -1096,8 +1096,6 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "vt100-psmux"
 version = "0.16.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dbd1ea857a76ce70fff74561aa007fb39932df4c719d1edab2ff750f4590db4"
 dependencies = [
  "itoa",
  "unicode-width",

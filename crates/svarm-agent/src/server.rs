@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use vt100::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+use vt100::Parser;
+#[cfg(test)]
+use vt100::Screen;
 
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
@@ -23,11 +25,10 @@ use crate::{
     ipc::unix::UnixListenerGuard,
     protocol::{
         AgentActivity, AgentSnapshot, ConnectionId, ConnectionRole, Envelope, ErrorCode, Event,
-        GitContext, KeyCode, KeyInput, LeaseToken, Message, MouseEncoding, MouseProtocol,
-        ProtocolError, ProtocolRange, RecognitionEvidence, Request, RequestId, Response,
-        ServerCapabilities, ServerInstanceId, ServerStatusSnapshot, SessionId, SessionSummary,
-        StopSummary, SvarmSessionSnapshot, TerminalDiff, TerminalFull, TerminalModes,
-        TerminalSequence, Welcome,
+        GitContext, KeyCode, KeyInput, LeaseToken, Message, ProtocolError, ProtocolRange,
+        RecognitionEvidence, Request, RequestId, Response, ServerCapabilities, ServerInstanceId,
+        ServerStatusSnapshot, SessionId, SessionSummary, StopSummary, SvarmSessionSnapshot,
+        TerminalDiff, TerminalFull, TerminalModes, TerminalSequence, TerminalViewport, Welcome,
     },
     pty_size,
     recognition::{self, ScreenRecognition},
@@ -394,7 +395,7 @@ impl InputDraft {
 struct FrameBasis {
     sequence: TerminalSequence,
     acknowledged: Option<TerminalSequence>,
-    screen: Screen,
+    parser: Parser,
 }
 
 enum FramePayload {
@@ -594,11 +595,7 @@ impl SessionRuntime {
     /// The modes the agent's input has to be encoded against. Read in place: this runs on every
     /// keystroke, and copying the screen for it would put the copy in the input path.
     fn input_modes(&self, id: AgentId) -> Option<TerminalModes> {
-        let disambiguate = self.agents.keyboard_disambiguates(id);
-        self.agents.with_screen(id, |screen| TerminalModes {
-            keyboard_disambiguate: disambiguate,
-            ..terminal_modes(screen)
-        })
+        self.agents.terminal_modes(id)
     }
 
     fn record_key(&mut self, id: AgentId, input: &KeyInput) {
@@ -615,23 +612,36 @@ impl SessionRuntime {
 
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
         let snapshot = self.agents.snapshot(id)?;
-        let previous = self.frame_bases.get(&id).filter(|_| !force_full);
-        // Serialize against the basis and take the next basis in a single visit to the live
-        // screen, so emitting a frame costs one copy rather than a snapshot plus a basis copy.
-        let (payload, screen) = self.agents.with_screen(id, |screen| {
-            let previous = previous.filter(|basis| basis.screen.size() == screen.size());
+        let modes = self.agents.terminal_modes(id)?;
+        let old_basis = self.frame_bases.remove(&id);
+        let previous = old_basis.as_ref().filter(|_| !force_full);
+        // The basis parser deliberately has no scrollback. Updating it with the bytes already
+        // headed to the client avoids cloning the authoritative terminal's retained history on
+        // every frame.
+        let (payload, rows, cols) = self.agents.with_screen(id, |screen| {
+            let previous = previous.filter(|basis| basis.parser.screen().size() == screen.size());
             let payload = match previous {
                 Some(basis) => FramePayload::Diff {
                     base_sequence: basis.sequence,
-                    bytes: screen.state_diff(&basis.screen),
+                    bytes: screen.state_diff(basis.parser.screen()),
                 },
                 None => FramePayload::Full(screen.state_formatted()),
             };
-            (payload, screen.clone())
+            let (rows, cols) = screen.size();
+            (payload, rows, cols)
         })?;
 
-        let (rows, cols) = screen.size();
-        let modes = terminal_modes(&screen);
+        let acknowledged = old_basis.as_ref().and_then(|basis| basis.acknowledged);
+        let mut basis_parser = match (&payload, old_basis) {
+            (FramePayload::Diff { .. }, Some(basis)) => basis.parser,
+            _ => Parser::new(rows, cols, 0),
+        };
+        match &payload {
+            FramePayload::Full(bytes) | FramePayload::Diff { bytes, .. } => {
+                basis_parser.process(bytes)
+            }
+        }
+
         let cursor_style = self.agents.cursor_style(id).unwrap_or_default();
         let sequence = self.state.next_terminal_sequence(id).ok()?;
         let event = match payload {
@@ -660,19 +670,28 @@ impl SessionRuntime {
                 cursor_style,
             }),
         };
-        let acknowledged = self
-            .frame_bases
-            .get(&id)
-            .and_then(|basis| basis.acknowledged);
         self.frame_bases.insert(
             id,
             FrameBasis {
                 sequence,
                 acknowledged,
-                screen,
+                parser: basis_parser,
             },
         );
         Some(event)
+    }
+
+    fn terminal_viewport(&self, id: AgentId, requested: usize) -> Option<Event> {
+        let (rows, cols, scrollback, formatted_screen) =
+            self.agents.formatted_viewport(id, requested)?;
+        Some(Event::TerminalViewport(TerminalViewport {
+            agent_id: id,
+            rows,
+            cols,
+            requested_scrollback: requested,
+            scrollback,
+            formatted_screen,
+        }))
     }
 
     fn full_terminal(&mut self, id: AgentId) -> Option<Event> {
@@ -1257,6 +1276,19 @@ impl Server {
                 runtime.send_input(agent_id, &bytes, now)?;
                 Ok(Outcome::new(Response::Ok))
             }
+            Request::TerminalViewport {
+                lease_token,
+                agent_id,
+                scrollback,
+            } => {
+                let session_id = self.attached_session(id, &lease_token)?;
+                let event = self.sessions[&session_id]
+                    .terminal_viewport(agent_id, scrollback)
+                    .ok_or_else(agent_not_found)?;
+                let mut outcome = Outcome::new(Response::Ok);
+                outcome.events.push((id, event));
+                Ok(outcome)
+            }
         }
     }
 
@@ -1680,27 +1712,6 @@ fn start_connection(
     })
 }
 
-fn terminal_modes(screen: &Screen) -> TerminalModes {
-    TerminalModes {
-        keyboard_disambiguate: false,
-        application_cursor: screen.application_cursor(),
-        application_keypad: screen.application_keypad(),
-        bracketed_paste: screen.bracketed_paste(),
-        mouse_protocol: match screen.mouse_protocol_mode() {
-            MouseProtocolMode::None => MouseProtocol::None,
-            MouseProtocolMode::Press => MouseProtocol::Press,
-            MouseProtocolMode::PressRelease => MouseProtocol::PressRelease,
-            MouseProtocolMode::ButtonMotion => MouseProtocol::ButtonMotion,
-            MouseProtocolMode::AnyMotion => MouseProtocol::AnyMotion,
-        },
-        mouse_encoding: match screen.mouse_protocol_encoding() {
-            MouseProtocolEncoding::Default => MouseEncoding::Default,
-            MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
-            MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
-        },
-    }
-}
-
 fn terminal_frame(envelope: &Envelope) -> Option<(AgentId, bool)> {
     match &envelope.message {
         Message::Event(Event::TerminalFull(frame)) => Some((frame.agent_id, true)),
@@ -1963,6 +1974,52 @@ mod tests {
             Event::AgentChanged { agent, .. }
                 if agent.conversation_title.as_deref() == Some("name this thread")
         )));
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn scrollback_is_retained_without_entering_the_continuous_frame_basis() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 5, 30, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test").with_test_agent_command(
+            "sh",
+            &[
+                "-c",
+                "i=1; while [ $i -le 20 ]; do printf 'line-%02d\\r\\n' \"$i\"; i=$((i+1)); done; sleep 1",
+            ],
+        );
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime
+            .agents
+            .with_screen(snapshot.id, |screen| screen.scrollback_filled())
+            .unwrap_or(0)
+            == 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        runtime.terminal_event(snapshot.id, true).unwrap();
+        assert_eq!(
+            runtime.frame_bases[&snapshot.id]
+                .parser
+                .screen()
+                .scrollback_len(),
+            0
+        );
+        let Event::TerminalViewport(viewport) =
+            runtime.terminal_viewport(snapshot.id, usize::MAX).unwrap()
+        else {
+            panic!("expected terminal viewport");
+        };
+        assert!(viewport.scrollback > 0);
+        let mut parser = Parser::new(viewport.rows, viewport.cols, 0);
+        parser.process(&viewport.formatted_screen);
+        assert!(parser.screen().contents().contains("line-01"));
+
         runtime.agents.stop_all();
     }
 
