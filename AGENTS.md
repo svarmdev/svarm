@@ -45,6 +45,7 @@ Always center and clamp modals to the terminal. Every centered modal must pass o
 - Preserve native agent terminal behavior. Normal input, control keys, paste mode, mouse protocol, color queries, and resize events must continue to flow according to the child terminal's advertised modes.
 - Keep the UI usable at 80x24, without color, and entirely from the keyboard. Pair status colors with text or symbols so color is never the only signal.
 - Add the smallest test that proves each non-trivial behavior. Pure state transitions and detectors should use unit tests; PTY behavior should use focused integration-style tests with bounded waits.
+- Document every behavioral change to vendored code in `vendor/PATCHES.md`, including its source version, purpose, and regression coverage.
 - Before handing off a code change, run:
 
   ```sh
