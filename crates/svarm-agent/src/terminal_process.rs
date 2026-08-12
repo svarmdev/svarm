@@ -226,6 +226,16 @@ impl TerminalProcess {
         Ok(())
     }
 
+    /// The process whose directory describes what the terminal is working on: the foreground
+    /// process group leader when the platform reports one, otherwise the spawned child.
+    pub(crate) fn foreground_process(&self) -> Option<i32> {
+        self.master.process_group_leader().or_else(|| {
+            self.child
+                .process_id()
+                .and_then(|id| i32::try_from(id).ok())
+        })
+    }
+
     pub fn set_terminal_palette(&self, palette: Option<TerminalPalette>) {
         *self
             .terminal_palette

@@ -174,6 +174,12 @@ impl AgentSession {
         })
     }
 
+    /// Where the agent is working right now, which is not the directory it was launched in once
+    /// it moves itself into another checkout. `None` when the live directory cannot be observed.
+    pub(crate) fn working_directory(&self) -> Option<PathBuf> {
+        crate::cwd::of_process(self.terminal.foreground_process()?)
+    }
+
     pub fn terminal_modes(&self) -> crate::protocol::TerminalModes {
         self.terminal.terminal_modes()
     }
@@ -334,6 +340,45 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn working_directory_follows_the_agent_out_of_its_launch_directory() {
+        use std::time::{Duration, Instant};
+
+        let launch = std::env::temp_dir();
+        let moved = launch.join(format!("svarm-session-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&moved).unwrap();
+
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", &format!("cd '{}' && exec cat", moved.display())]);
+        command.cwd(&launch);
+        let mut session = AgentSession::spawn_command_with_conversation(
+            AgentId::new(1),
+            &launch,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            command,
+            None,
+            None,
+            ConversationTracking::without_signal(AgentKind::Codex, None),
+        )
+        .unwrap();
+
+        let expected = moved.canonicalize().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && session.working_directory() != Some(expected.clone()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.working_directory(), Some(expected));
+
+        session.stop().unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+    }
 
     #[test]
     fn native_agent_owns_its_terminal_colors() {

@@ -250,6 +250,7 @@ pub(crate) struct AgentState {
     id: AgentId,
     kind: AgentKind,
     launch_directory: PathBuf,
+    working_directory: Option<PathBuf>,
     status: SessionStatus,
     exit: Option<ProcessExit>,
     output_generation: u64,
@@ -279,6 +280,7 @@ impl AgentState {
             id: snapshot.id,
             kind: snapshot.kind,
             launch_directory: snapshot.launch_directory.clone(),
+            working_directory: None,
             status: snapshot.status,
             exit: snapshot.exit.clone(),
             output_generation: snapshot.output_generation,
@@ -297,6 +299,7 @@ impl AgentState {
             id: snapshot.id,
             kind: snapshot.kind,
             launch_directory: snapshot.launch_directory.clone(),
+            working_directory: snapshot.working_directory.clone(),
             status: snapshot.status,
             exit: snapshot.exit.clone(),
             output_generation: snapshot.output_generation,
@@ -329,12 +332,14 @@ impl AgentState {
             || self.output_generation != snapshot.output_generation
             || self.completed_generation != snapshot.completed_generation
             || self.launch_directory != snapshot.launch_directory
+            || self.working_directory != snapshot.working_directory
             || self.conversation_title != snapshot.conversation_title
             || self.conversation_id != snapshot.conversation_id
             || self.activity != snapshot.activity
             || self.recognition != snapshot.recognition
             || self.git != snapshot.git;
         self.launch_directory = snapshot.launch_directory.clone();
+        self.working_directory = snapshot.working_directory.clone();
         self.status = snapshot.status;
         self.exit = snapshot.exit.clone();
         self.output_generation = snapshot.output_generation;
@@ -366,6 +371,10 @@ impl AgentState {
 
     pub fn launch_directory(&self) -> &Path {
         &self.launch_directory
+    }
+
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.working_directory.as_deref()
     }
 
     pub const fn status(&self) -> SessionStatus {
@@ -1574,6 +1583,7 @@ mod tests {
             id: AgentId::new(id),
             kind: AgentKind::Codex,
             launch_directory: "/tmp".into(),
+            working_directory: None,
             status: SessionStatus::Running,
             exit: None,
             output_generation,

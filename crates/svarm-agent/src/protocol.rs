@@ -243,11 +243,11 @@ pub enum Event {
     SvarmSessionChanged(SessionSummary),
     AgentAdded {
         revision: SessionRevision,
-        agent: AgentSnapshot,
+        agent: Box<AgentSnapshot>,
     },
     AgentChanged {
         revision: SessionRevision,
-        agent: AgentSnapshot,
+        agent: Box<AgentSnapshot>,
     },
     AgentRemoved {
         revision: SessionRevision,
@@ -383,6 +383,8 @@ pub enum AgentActivity {
 pub struct GitContext {
     pub branch: String,
     pub worktree: PathBuf,
+    /// Whether `worktree` is a linked worktree rather than the repository's main checkout.
+    pub linked: bool,
     pub additions: u64,
     pub deletions: u64,
     pub ahead: Option<u64>,
@@ -394,6 +396,8 @@ pub struct AgentSnapshot {
     pub id: AgentId,
     pub kind: AgentKind,
     pub launch_directory: PathBuf,
+    /// Where the agent is working now, when it can be observed and differs from where it started.
+    pub working_directory: Option<PathBuf>,
     pub status: SessionStatus,
     pub exit: Option<ProcessExit>,
     pub output_generation: u64,

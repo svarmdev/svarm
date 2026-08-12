@@ -23,6 +23,8 @@ const STANDARD_MODAL_WIDTH: u16 = 72;
 const STANDARD_MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = 28;
 const AGENT_CARD_HEIGHT: u16 = 3;
+/// Marks a directory that is a linked git worktree rather than the repository's main checkout.
+const LINKED_WORKTREE: &str = "⑂";
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 const MENU_WIDTH: u16 = 46;
 
@@ -861,14 +863,22 @@ fn render_sidebar(
             agent.conversation_title().unwrap_or("Unnamed conversation"),
             usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
         );
+        // Where the agent is now, preferring the checkout root over a directory inside it, and
+        // falling back to where it was launched only while the live directory is unknown.
         let directory = agent
             .git()
             .map(|git| git.worktree.as_path())
+            .or_else(|| agent.working_directory())
             .unwrap_or_else(|| agent.launch_directory());
         let directory = directory
             .file_name()
             .unwrap_or(directory.as_os_str())
             .to_string_lossy();
+        let worktree_marker = if agent.git().is_some_and(|git| git.linked) {
+            LINKED_WORKTREE
+        } else {
+            ""
+        };
         let selected_style = if selected {
             text(theme).add_modifier(Modifier::BOLD)
         } else {
@@ -886,10 +896,13 @@ fn render_sidebar(
                 Span::raw(" "),
                 Span::styled(agent.kind().label(), text(theme)),
                 Span::styled(" · ", theme.muted()),
+                Span::styled(worktree_marker, theme.muted()),
                 Span::styled(
                     end_truncate(
                         &directory,
-                        content_width.saturating_sub(agent.kind().label().chars().count() + 5),
+                        content_width
+                            .saturating_sub(agent.kind().label().chars().count() + 5)
+                            .saturating_sub(worktree_marker.chars().count()),
                     ),
                     text(theme),
                 ),
@@ -1989,6 +2002,7 @@ mod tests {
             id: svarm_agent::AgentId::new(1),
             kind: svarm_agent::AgentKind::Codex,
             launch_directory: PathBuf::from("/tmp/project-seven"),
+            working_directory: None,
             status: SessionStatus::Running,
             exit: None,
             output_generation: 0,
@@ -2039,6 +2053,7 @@ mod tests {
             } else {
                 "/tmp/project-eight"
             }),
+            working_directory: None,
             status,
             exit: (status == SessionStatus::Exited).then_some(svarm_agent::ProcessExit {
                 code: 1,
@@ -2057,6 +2072,7 @@ mod tests {
             git: (id == 2).then_some(GitContext {
                 branch: "feature/sidebar".into(),
                 worktree: "/tmp/project-eight".into(),
+                linked: false,
                 additions: 557,
                 deletions: 300,
                 ahead: Some(2),
@@ -2117,7 +2133,7 @@ mod tests {
         git.behind = Some(0);
         let clean_app = App::hydrate(
             SvarmSessionSnapshot {
-                summary,
+                summary: summary.clone(),
                 selected_agent_id: Some(clean.id),
                 rows: 24,
                 cols: 80,
@@ -2131,6 +2147,55 @@ mod tests {
         assert!(clean_rendered.contains("feature/sidebar"));
         assert!(!clean_rendered.contains("+0 -0"));
         assert!(!clean_rendered.contains("↑0 ↓0"));
+
+        // An agent that moved into a linked worktree reports where it is, marked as linked, not
+        // the directory it was launched in.
+        let mut moved = agent(2, SessionStatus::Running, 2, 1);
+        moved.launch_directory = PathBuf::from("/tmp/project-eight");
+        moved.working_directory = Some(PathBuf::from("/tmp/worktrees/review-fix"));
+        let git = moved.git.as_mut().unwrap();
+        git.worktree = "/tmp/worktrees/review-fix".into();
+        git.branch = "fixup".into();
+        git.linked = true;
+        let moved_rendered = render_app_text(&App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary.clone(),
+                selected_agent_id: Some(moved.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![moved],
+                archived: Vec::new(),
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        ));
+        assert!(
+            moved_rendered.contains("Codex · ⑂review-fix"),
+            "{moved_rendered}"
+        );
+        assert!(moved_rendered.contains("fixup +557 -300 ↑2 ↓4"));
+        assert!(!moved_rendered.contains("project-eight"));
+
+        // Without git the live directory still describes the agent better than its launch one.
+        let mut wandered = agent(2, SessionStatus::Running, 2, 1);
+        wandered.working_directory = Some(PathBuf::from("/tmp/scratch-notes"));
+        wandered.git = None;
+        let wandered_rendered = render_app_text(&App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary.clone(),
+                selected_agent_id: Some(wandered.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![wandered],
+                archived: Vec::new(),
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        ));
+        assert!(
+            wandered_rendered.contains("Codex · scratch-notes"),
+            "{wandered_rendered}"
+        );
 
         let theme = crate::theme::ThemeName::CatppuccinMocha.theme(true);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2175,6 +2240,7 @@ mod tests {
             id: svarm_agent::AgentId::new(1),
             kind: svarm_agent::AgentKind::Codex,
             launch_directory: "/tmp/active".into(),
+            working_directory: None,
             status: SessionStatus::Running,
             exit: None,
             output_generation: 0,
@@ -2264,6 +2330,7 @@ mod tests {
                 id: svarm_agent::AgentId::new(id),
                 kind: svarm_agent::AgentKind::Claude,
                 launch_directory: PathBuf::from(format!("/tmp/project-{id}")),
+                working_directory: None,
                 status: SessionStatus::Running,
                 exit: None,
                 output_generation: 1,

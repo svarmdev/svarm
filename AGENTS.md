@@ -21,6 +21,7 @@ A small terminal multiplexer for coding agents
 ## Repository map
 
 - `crates/svarm-agent` owns coding-agent commands, child processes, PTYs, terminal parsing, and terminal-protocol recognition.
+- `crates/svarm-agent/src/cwd.rs` reads a live process's working directory, so an agent that moves into another checkout is observed where it actually is and `git.rs` probes there.
 - `crates/svarm-tui/src/app.rs` is the pure application model.
 - `crates/svarm-tui/src/agents.rs`, `settings.rs`, and `terminal.rs` own live resources and platform effects.
 - `crates/svarm-tui/src/runtime.rs` coordinates adapters and applies their observations to the model.

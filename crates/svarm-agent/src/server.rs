@@ -320,6 +320,7 @@ struct ObservedAgent {
     last_affirmative_activity: Option<AgentActivity>,
     completed_generation: u64,
     recognition: Option<RecognitionEvidence>,
+    working_directory: Option<PathBuf>,
     git: Option<GitContext>,
 }
 
@@ -600,6 +601,7 @@ impl SessionRuntime {
             id: snapshot.id,
             kind: snapshot.kind,
             launch_directory: snapshot.launch_directory,
+            working_directory: observed.and_then(|agent| agent.working_directory.clone()),
             status: snapshot.status,
             exit: snapshot.exit,
             output_generation: snapshot.output_generation,
@@ -696,11 +698,22 @@ impl SessionRuntime {
                 .git_checked
                 .get(&session.id)
                 .is_none_or(|checked| now.duration_since(*checked) >= GIT_REFRESH_INTERVAL);
-        let git = if refresh_git {
+        // An agent that enters another checkout leaves its launch directory behind, so the git
+        // context has to be read where the agent actually is.
+        let (working_directory, git) = if refresh_git {
             self.git_checked.insert(session.id, now);
-            git::context(&session.launch_directory)
+            let working_directory = self.agents.working_directory(session.id);
+            let git = git::context(
+                working_directory
+                    .as_deref()
+                    .unwrap_or(&session.launch_directory),
+            );
+            (working_directory, git)
         } else {
-            previous.as_ref().and_then(|agent| agent.git.clone())
+            match previous.as_ref() {
+                Some(agent) => (agent.working_directory.clone(), agent.git.clone()),
+                None => (None, None),
+            }
         };
 
         ObservedAgent {
@@ -710,6 +723,7 @@ impl SessionRuntime {
             last_affirmative_activity,
             completed_generation,
             recognition,
+            working_directory,
             git,
         }
     }
@@ -928,7 +942,7 @@ impl SessionRuntime {
             .into_iter()
             .map(|snapshot| Event::AgentChanged {
                 revision,
-                agent: self.agent_snapshot(snapshot),
+                agent: Box::new(self.agent_snapshot(snapshot)),
             })
             .collect::<Vec<_>>();
         events.extend(
@@ -1223,7 +1237,7 @@ impl Server {
                     id,
                     Event::AgentAdded {
                         revision: runtime.state.revision(),
-                        agent: runtime.agent_snapshot(snapshot.clone()),
+                        agent: Box::new(runtime.agent_snapshot(snapshot.clone())),
                     },
                 ));
                 if let Some(event) = runtime.full_terminal(snapshot.id) {
@@ -2458,6 +2472,76 @@ mod tests {
                     if agent.git.as_ref().is_some_and(|git| git.branch == "feature/sidebar")
             )
         }));
+
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_reports_the_worktree_the_agent_moved_into() {
+        let directory = temp_dir();
+        let linked = directory.join("linked");
+        run_git(&directory, &["init", "-q", "-b", "main"]);
+        run_git(
+            &directory,
+            &[
+                "-c",
+                "user.name=Svarm Test",
+                "-c",
+                "user.email=svarm@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        run_git(
+            &directory,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-branch",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        // The agent launches in the main checkout and then enters the linked worktree itself,
+        // exactly as a coding agent that switches worktrees does.
+        let enter = format!("cd '{}' && exec sleep 60", linked.display());
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &enter]);
+        let spawned = runtime
+            .spawn(AgentKind::Codex, &directory, 0, &config)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed = loop {
+            runtime.git_checked.insert(
+                spawned.id,
+                Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_millis(1),
+            );
+            let _ = runtime.poll_events();
+            let agent = runtime.snapshot().agents.remove(0);
+            if agent.git.as_ref().is_some_and(|git| git.linked) || Instant::now() >= deadline {
+                break agent;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let git = observed.git.expect("git context");
+        assert_eq!(git.branch, "linked-branch");
+        assert_eq!(git.worktree, linked.canonicalize().unwrap());
+        assert!(git.linked);
+        assert_eq!(
+            observed.working_directory,
+            Some(linked.canonicalize().unwrap())
+        );
 
         runtime.agents.stop_all();
         fs::remove_dir_all(directory).unwrap();
