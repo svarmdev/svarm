@@ -1,4 +1,9 @@
-use std::{path::Path, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::mpsc::{Receiver, SyncSender, sync_channel},
+    thread,
+};
 
 use crate::protocol::GitContext;
 
@@ -34,6 +39,45 @@ pub(crate) fn context(path: &Path) -> Option<GitContext> {
         (context.ahead, context.behind) = parse_tracking(&output);
     }
     Some(context)
+}
+
+pub(crate) struct ContextResult {
+    pub directory: PathBuf,
+    pub context: Option<GitContext>,
+}
+
+/// Runs Git probes away from the server coordinator. One worker is enough: serial execution also
+/// prevents several agents from launching their Git subprocesses at the same instant.
+pub(crate) struct ContextWorker {
+    requests: SyncSender<PathBuf>,
+    results: Receiver<ContextResult>,
+}
+
+impl ContextWorker {
+    pub fn new() -> Self {
+        let (requests, request_rx) = sync_channel::<PathBuf>(1);
+        let (result_tx, results) = sync_channel(1);
+        thread::spawn(move || {
+            while let Ok(directory) = request_rx.recv() {
+                let context = context(&directory);
+                if result_tx
+                    .send(ContextResult { directory, context })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { requests, results }
+    }
+
+    pub fn request(&self, directory: PathBuf) -> bool {
+        self.requests.try_send(directory).is_ok()
+    }
+
+    pub fn try_result(&self) -> Option<ContextResult> {
+        self.results.try_recv().ok()
+    }
 }
 
 fn git_output(path: &Path, arguments: &[&str]) -> Option<Vec<u8>> {

@@ -38,7 +38,7 @@ pub struct InitialAgentRequest {
 
 pub(crate) enum RemoteUpdate {
     Event(Box<Event>),
-    TerminalChanged,
+    TerminalChanged(AgentId),
     Error(String),
     Disconnected(String),
 }
@@ -237,7 +237,9 @@ impl RemoteAgents {
                     let sequence = frame.sequence;
                     let disposition = self.apply_full(frame);
                     self.after_frame(id, sequence, disposition);
-                    updates.push(RemoteUpdate::TerminalChanged);
+                    if disposition == FrameDisposition::Apply {
+                        updates.push(RemoteUpdate::TerminalChanged(id));
+                    }
                 }
                 Message::Event(Event::TerminalDiff(frame)) => {
                     let id = frame.agent_id;
@@ -245,12 +247,13 @@ impl RemoteAgents {
                     let disposition = self.apply_diff(frame);
                     self.after_frame(id, sequence, disposition);
                     if disposition == FrameDisposition::Apply {
-                        updates.push(RemoteUpdate::TerminalChanged);
+                        updates.push(RemoteUpdate::TerminalChanged(id));
                     }
                 }
                 Message::Event(Event::TerminalViewport(viewport)) => {
+                    let id = viewport.agent_id;
                     if self.apply_viewport(viewport) {
-                        updates.push(RemoteUpdate::TerminalChanged);
+                        updates.push(RemoteUpdate::TerminalChanged(id));
                     }
                 }
                 Message::Event(event) => {

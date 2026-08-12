@@ -327,16 +327,17 @@ impl AgentState {
     }
 
     fn update_remote(&mut self, snapshot: &AgentSnapshot) -> bool {
+        // Output generations and diagnostic evidence are retained below, but they are not
+        // independently visible. The selected agent's terminal frame requests its redraw, while
+        // a background agent redraws only when its displayed metadata changes.
         let changed = self.status != snapshot.status
             || self.exit != snapshot.exit
-            || self.output_generation != snapshot.output_generation
             || self.completed_generation != snapshot.completed_generation
             || self.launch_directory != snapshot.launch_directory
             || self.working_directory != snapshot.working_directory
             || self.conversation_title != snapshot.conversation_title
             || self.conversation_id != snapshot.conversation_id
             || self.activity != snapshot.activity
-            || self.recognition != snapshot.recognition
             || self.git != snapshot.git;
         self.launch_directory = snapshot.launch_directory.clone();
         self.working_directory = snapshot.working_directory.clone();
@@ -1133,6 +1134,25 @@ mod tests {
         assert!(app.agents()[0].has_unseen_output());
         let _ = app.mark_selected_seen();
         assert!(!app.agents()[0].has_unseen_output());
+    }
+
+    #[test]
+    fn remote_output_churn_is_recorded_without_a_metadata_redraw() {
+        let mut app = app();
+        let mut first = remote_agent(1, 0, 0);
+        first.activity = AgentActivity::Working;
+        first.recognition = Some(RecognitionEvidence {
+            provider: AgentKind::Codex,
+            claim: AgentActivity::Working,
+            rule: "codex.active-turn".into(),
+            evidence: "Thinking".into(),
+        });
+        app.add_remote_agent(first.clone());
+
+        first.output_generation = 1;
+        first.recognition.as_mut().unwrap().evidence = "Working".into();
+        assert!(!app.update_remote_agent(first));
+        assert!(app.agents()[0].has_unseen_output());
     }
 
     #[test]
