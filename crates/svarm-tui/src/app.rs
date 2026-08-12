@@ -152,6 +152,12 @@ impl SessionChooser {
         }
     }
 
+    pub fn select(&mut self, index: usize) {
+        if index < self.row_count() {
+            self.selected = index;
+        }
+    }
+
     pub fn confirm(&self) -> Option<StartupChoice> {
         if let Some(session) = self.sessions.get(self.selected) {
             Some(StartupChoice::Session(session.id))
@@ -687,11 +693,34 @@ impl App {
             self.select(index);
             return true;
         }
-        if let Some(conversation) = self.archived.get(index - self.agents.len()) {
-            self.pending_resume = Some(conversation.conversation_id.clone());
-            self.mode = Mode::ConfirmResume;
-        }
+        self.request_resume_archived(index - self.agents.len());
         false
+    }
+
+    pub fn request_resume_archived(&mut self, index: usize) -> bool {
+        let Some(conversation) = self.archived.get(index) else {
+            return false;
+        };
+        self.pending_resume = Some(conversation.conversation_id.clone());
+        self.mode = Mode::ConfirmResume;
+        true
+    }
+
+    pub fn cycle_pending_archive(&mut self, delta: isize) {
+        if self.archived.is_empty() {
+            return;
+        }
+        let current = self
+            .pending_resume
+            .as_deref()
+            .and_then(|id| {
+                self.archived
+                    .iter()
+                    .position(|conversation| conversation.conversation_id == id)
+            })
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(self.archived.len() as isize) as usize;
+        self.pending_resume = Some(self.archived[next].conversation_id.clone());
     }
 
     pub fn request_archive_selected(&mut self) -> bool {
@@ -714,6 +743,14 @@ impl App {
 
     pub fn pending_resume(&self) -> Option<&str> {
         self.pending_resume.as_deref()
+    }
+
+    pub fn pending_resume_title(&self) -> Option<&str> {
+        let id = self.pending_resume()?;
+        self.archived
+            .iter()
+            .find(|conversation| conversation.conversation_id == id)
+            .map(|conversation| conversation.title.as_str())
     }
 
     pub fn cancel_confirmation(&mut self) {
@@ -831,6 +868,28 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    pub fn select_new_agent_field(&mut self, field: NewAgentField) {
+        if let Some(state) = &mut self.new_agent {
+            state.draft.selected_field = field;
+        }
+    }
+
+    pub fn select_workspace(&mut self, index: usize) {
+        if let Some(state) = &mut self.new_agent
+            && index < state.workspaces.len()
+        {
+            state.selected_workspace = index;
+        }
+    }
+
+    pub fn select_agent_kind(&mut self, index: usize) {
+        if let Some(state) = &mut self.new_agent
+            && index < AgentKind::ALL.len()
+        {
+            state.selected_agent = index;
         }
     }
 
@@ -1408,6 +1467,35 @@ mod tests {
         assert_eq!(app.mode(), Mode::ConfirmResume);
         assert_eq!(app.pending_resume(), Some("first"));
         assert_eq!(app.selected_agent_id(), Some(AgentId::new(1)));
+    }
+
+    #[test]
+    fn archived_conversations_can_be_reached_and_cycled_from_the_keyboard() {
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: None,
+                rows: 24,
+                cols: 80,
+                agents: Vec::new(),
+                archived: vec![
+                    archived("first", "First archived"),
+                    archived("second", "Second archived"),
+                ],
+            },
+            ThemeName::Dark,
+            None,
+        );
+
+        assert!(app.request_resume_archived(0));
+        assert_eq!(app.pending_resume(), Some("first"));
+        assert_eq!(app.pending_resume_title(), Some("First archived"));
+        app.cycle_pending_archive(1);
+        assert_eq!(app.pending_resume(), Some("second"));
+        app.cycle_pending_archive(1);
+        assert_eq!(app.pending_resume(), Some("first"));
+        app.cycle_pending_archive(-1);
+        assert_eq!(app.pending_resume(), Some("second"));
     }
 
     #[test]

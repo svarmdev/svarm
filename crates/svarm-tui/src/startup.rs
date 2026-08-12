@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use svarm_agent::{Result, protocol::SessionSummary};
 
 use crate::{
@@ -27,26 +27,50 @@ pub fn choose_session(sessions: Vec<SessionSummary>, allow_new: bool) -> Result<
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => chooser.select_next(),
-            KeyCode::Up | KeyCode::Char('k') => chooser.select_previous(),
-            KeyCode::Enter => {
-                if let Some(choice) = chooser.confirm() {
-                    return Ok(choice);
+        match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => chooser.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => chooser.select_previous(),
+                KeyCode::Enter => {
+                    if let Some(choice) = chooser.confirm() {
+                        return Ok(choice);
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if let Some(choice) = chooser.select_new() {
+                        return Ok(choice);
+                    }
+                }
+                KeyCode::Esc => return Ok(chooser.cancel()),
+                _ => {}
+            },
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                let area = terminal.terminal().size()?.into();
+                match ui::session_chooser_click(&chooser, area, mouse.column, mouse.row) {
+                    Some(ui::SessionChooserClick::Choose(index)) => {
+                        chooser.select(index);
+                        if let Some(choice) = chooser.confirm() {
+                            return Ok(choice);
+                        }
+                    }
+                    Some(ui::SessionChooserClick::Next) => chooser.select_next(),
+                    Some(ui::SessionChooserClick::Previous) => chooser.select_previous(),
+                    Some(ui::SessionChooserClick::Open) => {
+                        if let Some(choice) = chooser.confirm() {
+                            return Ok(choice);
+                        }
+                    }
+                    Some(ui::SessionChooserClick::Cancel) => return Ok(chooser.cancel()),
+                    Some(ui::SessionChooserClick::New) => {
+                        if let Some(choice) = chooser.select_new() {
+                            return Ok(choice);
+                        }
+                    }
+                    None => {}
                 }
             }
-            KeyCode::Char('n') => {
-                if let Some(choice) = chooser.select_new() {
-                    return Ok(choice);
-                }
-            }
-            KeyCode::Esc => return Ok(chooser.cancel()),
             _ => {}
         }
     }

@@ -9,7 +9,7 @@ use svarm_agent::terminal_model::TerminalSnapshot;
 
 use crate::{
     app::{AgentDisplayStatus, App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
-    input::MANAGEMENT_KEYBINDINGS,
+    input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
     theme::Theme,
 };
@@ -57,6 +57,231 @@ pub(crate) struct UiModel<'a> {
     pub colors_enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClickAction {
+    Management(ManagementCommand),
+    ToggleMenu,
+    SidebarItem(usize),
+    MenuItem(MenuItem),
+    Next,
+    Previous,
+    Confirm,
+    Cancel,
+    NewAgentField(NewAgentField),
+    Workspace(usize),
+    BrowseWorkspaces,
+    AgentKind(usize),
+    NativeBrowserItem(usize),
+    NativeBrowserParent,
+    ThemePrevious,
+    ThemeNext,
+    EmbeddedAccept,
+    EmbeddedCancel,
+    EmbeddedForceClose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionChooserClick {
+    Choose(usize),
+    Next,
+    Previous,
+    Open,
+    Cancel,
+    New,
+}
+
+#[derive(Clone, Copy)]
+struct ActionHint {
+    text: &'static str,
+    action: ClickAction,
+}
+
+#[derive(Clone, Copy)]
+struct SessionActionHint {
+    text: &'static str,
+    action: SessionChooserClick,
+    needs_new: bool,
+}
+
+const SESSION_HINTS: &[SessionActionHint] = &[
+    SessionActionHint {
+        text: "[Enter] open",
+        action: SessionChooserClick::Open,
+        needs_new: false,
+    },
+    SessionActionHint {
+        text: "[j] next",
+        action: SessionChooserClick::Next,
+        needs_new: false,
+    },
+    SessionActionHint {
+        text: "[k] previous",
+        action: SessionChooserClick::Previous,
+        needs_new: false,
+    },
+    SessionActionHint {
+        text: "[Esc] cancel",
+        action: SessionChooserClick::Cancel,
+        needs_new: false,
+    },
+    SessionActionHint {
+        text: "[n] new",
+        action: SessionChooserClick::New,
+        needs_new: true,
+    },
+];
+
+const FORM_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[Enter] open",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[Esc] cancel",
+        action: ClickAction::Cancel,
+    },
+];
+const WORKSPACE_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Enter] use",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[b] browse",
+        action: ClickAction::BrowseWorkspaces,
+    },
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
+const AGENT_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Enter] use",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
+const BROWSER_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Enter/l] open/use",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[h] parent",
+        action: ClickAction::NativeBrowserParent,
+    },
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[Esc] cancel",
+        action: ClickAction::Cancel,
+    },
+];
+const CONFIRM_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[y] Yes",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[Esc] Cancel",
+        action: ClickAction::Cancel,
+    },
+];
+const STOP_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[y] Stop session",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[Esc] Cancel",
+        action: ClickAction::Cancel,
+    },
+];
+const RESUME_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[y] Reactivate",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[Esc] Cancel",
+        action: ClickAction::Cancel,
+    },
+];
+const BACK_HINTS: &[ActionHint] = &[ActionHint {
+    text: "[Esc] back",
+    action: ClickAction::Cancel,
+}];
+const SETTINGS_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[←/h] previous",
+        action: ClickAction::ThemePrevious,
+    },
+    ActionHint {
+        text: "[→/l] next",
+        action: ClickAction::ThemeNext,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
+const EMBEDDED_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[q] use current directory",
+        action: ClickAction::EmbeddedAccept,
+    },
+    ActionHint {
+        text: "[Q] cancel",
+        action: ClickAction::EmbeddedCancel,
+    },
+    ActionHint {
+        text: "[Ctrl+B x] force close",
+        action: ClickAction::EmbeddedForceClose,
+    },
+];
+
 pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     let app = model.app;
     let theme = model.theme;
@@ -82,11 +307,20 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
     render_terminal(
         frame,
         model.screen,
+        app.agents().is_empty(),
         model.scrolled,
         app.mode(),
         terminal_area(area, app.sidebar_visible()),
         theme,
     );
+    if !app.sidebar_visible()
+        && let Some(button) = menu_button_area(area, false)
+    {
+        frame.render_widget(
+            Paragraph::new(" ≡ Menu  ^B m").style(theme.surface()),
+            button,
+        );
+    }
 
     match app.mode() {
         Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme),
@@ -105,12 +339,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
             " Archive conversation? ",
             "Stop this active agent and archive its conversation?",
         ),
-        Mode::ConfirmResume => render_confirmation(
-            frame,
-            theme,
-            " Reactivate conversation? ",
-            "Start this archived conversation again?",
-        ),
+        Mode::ConfirmResume => render_resume_confirmation(frame, app, theme),
         Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme),
         Mode::Keybinds => render_keybinds(frame, theme),
         Mode::Settings => render_settings(frame, app, theme),
@@ -181,10 +410,12 @@ pub(crate) fn render_session_chooser(
     });
     frame.render_widget(List::new(rows), list_area);
 
-    let mut footer = "[Enter] open  [j/k] select  [Esc] cancel".to_owned();
-    if chooser.allow_new() {
-        footer.push_str("  [n] new");
-    }
+    let footer = SESSION_HINTS
+        .iter()
+        .filter(|hint| !hint.needs_new || chooser.allow_new())
+        .map(|hint| hint.text)
+        .collect::<Vec<_>>()
+        .join("  ");
     frame.render_widget(
         Paragraph::new(footer).style(theme.muted()),
         Rect::new(
@@ -261,8 +492,16 @@ pub fn sidebar_area(area: Rect) -> Rect {
 }
 
 pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
-    if !sidebar_visible || area.height == 0 {
+    if area.height == 0 {
         return None;
+    }
+    if !sidebar_visible {
+        return Some(Rect::new(
+            area.x,
+            area.bottom().saturating_sub(1),
+            14.min(area.width),
+            1,
+        ));
     }
     let sidebar = sidebar_area(area);
     Some(Rect::new(
@@ -274,6 +513,9 @@ pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
 }
 
 pub fn new_agent_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
+    if !sidebar_visible {
+        return None;
+    }
     let menu = menu_button_area(area, sidebar_visible)?;
     (menu.y > area.y).then_some(Rect::new(menu.x, menu.y - 1, menu.width, 1))
 }
@@ -303,6 +545,234 @@ pub fn agent_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     }
     let archived_row = content_row.checked_sub(active_height + 1)?;
     (archived_row < app.archived().len()).then_some(app.agents().len() + archived_row)
+}
+
+pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return None;
+    }
+
+    if matches!(
+        app.mode(),
+        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
+    ) {
+        if app.mode() != Mode::Menu
+            && new_agent_button_area(area, app.sidebar_visible())
+                .is_some_and(|button| contains(button, column, row))
+        {
+            return Some(ClickAction::Management(ManagementCommand::ChooseAgent));
+        }
+        if menu_button_area(area, app.sidebar_visible())
+            .is_some_and(|button| contains(button, column, row))
+        {
+            return Some(if app.sidebar_visible() {
+                ClickAction::ToggleMenu
+            } else {
+                ClickAction::Management(ManagementCommand::OpenMenu)
+            });
+        }
+    }
+
+    match app.mode() {
+        Mode::Terminal => {
+            if let Some(index) = agent_item_at(app, area, column, row) {
+                return Some(ClickAction::SidebarItem(index));
+            }
+            if app.agents().is_empty()
+                && contains(terminal_area(area, app.sidebar_visible()), column, row)
+            {
+                return Some(ClickAction::Management(ManagementCommand::ChooseAgent));
+            }
+            None
+        }
+        Mode::Menu => menu_item_at(area, column, row).map(ClickAction::MenuItem),
+        Mode::NewAgent(NewAgentPage::Form) => {
+            let inner = dialog_inner(ModalSize::Compact, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            match row.checked_sub(inner.y)? {
+                1 => Some(ClickAction::NewAgentField(NewAgentField::Workspace)),
+                2 => Some(ClickAction::NewAgentField(NewAgentField::Agent)),
+                3 => Some(ClickAction::NewAgentField(NewAgentField::Start)),
+                5 => hint_at(FORM_HINTS, inner.x, column),
+                _ => None,
+            }
+        }
+        Mode::NewAgent(NewAgentPage::Workspaces) => {
+            let state = app.new_agent()?;
+            let inner = dialog_inner(ModalSize::Compact, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let visible = 7;
+            let start = state.selected_workspace.saturating_sub(visible - 1);
+            let count = state.workspaces.len().saturating_sub(start).min(visible);
+            let line = usize::from(row - inner.y);
+            if state.workspaces.is_empty() && line == 1 {
+                return Some(ClickAction::BrowseWorkspaces);
+            }
+            if (1..=count).contains(&line) {
+                return Some(ClickAction::Workspace(start + line - 1));
+            }
+            (line == count + 2)
+                .then(|| hint_at(WORKSPACE_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::NewAgent(NewAgentPage::Agents) => {
+            let inner = dialog_inner(ModalSize::Compact, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let count = AgentKind::ALL.len();
+            let line = usize::from(row - inner.y);
+            if (1..=count).contains(&line) {
+                return Some(ClickAction::AgentKind(line - 1));
+            }
+            (line == count + 2)
+                .then(|| hint_at(AGENT_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::NewAgent(NewAgentPage::NativeBrowser) => {
+            let browser = app.native_browser()?;
+            let modal = ModalSize::Large.area(area);
+            let inner = Block::bordered().inner(modal);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let visible = usize::from(modal.height.saturating_sub(6));
+            let total = browser.entries.len() + 1;
+            let start = browser.selected.saturating_sub(visible - 1);
+            let count = total.saturating_sub(start).min(visible);
+            let line = usize::from(row - inner.y);
+            if (2..2 + count).contains(&line) {
+                return Some(ClickAction::NativeBrowserItem(start + line - 2));
+            }
+            (line == count + 3)
+                .then(|| hint_at(BROWSER_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::NewAgent(NewAgentPage::EmbeddedBrowser) => {
+            let modal = embedded_modal_area(area);
+            let footer_y = modal.bottom().saturating_sub(2);
+            (row == footer_y)
+                .then(|| hint_at(EMBEDDED_HINTS, modal.x + 1, column))
+                .flatten()
+        }
+        Mode::ConfirmClose | Mode::ConfirmArchive => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            (row == inner.y + 3 && contains(inner, column, row))
+                .then(|| hint_at(CONFIRM_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::ConfirmResume => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            (row == inner.y + 3 && contains(inner, column, row))
+                .then(|| hint_at(RESUME_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::ConfirmQuit => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            (row == inner.y + 4 && contains(inner, column, row))
+                .then(|| hint_at(STOP_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::Keybinds => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let line = usize::from(row - inner.y);
+            if let Some(binding) = line
+                .checked_sub(1)
+                .and_then(|index| MANAGEMENT_KEYBINDINGS.get(index))
+            {
+                return Some(ClickAction::Management(binding.command));
+            }
+            (line == MANAGEMENT_KEYBINDINGS.len() + 2)
+                .then(|| hint_at(BACK_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::Settings => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let line = row - inner.y;
+            if line == 1 {
+                let previous = Rect::new(inner.x + 7, row, 17, 1);
+                if contains(previous, column, row) {
+                    return Some(ClickAction::ThemePrevious);
+                }
+                let next_x = inner.x + 24 + app.theme().label().chars().count() as u16;
+                if contains(Rect::new(next_x, row, 3, 1), column, row) {
+                    return Some(ClickAction::ThemeNext);
+                }
+            }
+            (line == 3)
+                .then(|| hint_at(SETTINGS_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::Prefix | Mode::ToolPrefix => None,
+    }
+}
+
+pub(crate) fn session_chooser_click(
+    chooser: &SessionChooser,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<SessionChooserClick> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return None;
+    }
+    let inner = Block::bordered().inner(area);
+    let list = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    if contains(list, column, row) {
+        let visible = usize::from(list.height);
+        let index = chooser.viewport_start(visible) + usize::from(row - list.y);
+        return (index < chooser.row_count()).then_some(SessionChooserClick::Choose(index));
+    }
+    if row != inner.bottom().saturating_sub(1) {
+        return None;
+    }
+    let mut x = inner.x + 1;
+    for hint in SESSION_HINTS {
+        if hint.needs_new && !chooser.allow_new() {
+            continue;
+        }
+        let width = hint.text.chars().count() as u16;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(hint.action);
+        }
+        x = x.saturating_add(width + 2);
+    }
+    None
+}
+
+const fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn dialog_inner(size: ModalSize, terminal: Rect) -> Rect {
+    Block::bordered().inner(size.area(terminal))
+}
+
+fn hint_at(hints: &[ActionHint], start_x: u16, column: u16) -> Option<ClickAction> {
+    let mut x = start_x + 2;
+    for hint in hints {
+        let width = hint.text.chars().count() as u16;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(hint.action);
+        }
+        x = x.saturating_add(width + 2);
+    }
+    None
 }
 
 fn menu_popup_area(button: Rect) -> Rect {
@@ -548,7 +1018,7 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = MenuItem::ALL.into_iter().map(|item| {
+    let rows = MenuItem::ALL.into_iter().enumerate().map(|(index, item)| {
         let marker = if item == app.menu_selected() {
             " ▌ "
         } else {
@@ -561,6 +1031,7 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         };
         ListItem::new(Line::from(vec![
             Span::styled(marker, accent(theme)),
+            Span::styled(format!("[{}] ", index + 1), accent(theme)),
             Span::styled(item.label(), style),
         ]))
         .style(style)
@@ -571,6 +1042,7 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 fn render_terminal(
     frame: &mut Frame<'_>,
     screen: Option<&TerminalSnapshot>,
+    no_agents: bool,
     scrolled: bool,
     mode: Mode,
     area: Rect,
@@ -578,9 +1050,13 @@ fn render_terminal(
 ) {
     let Some(screen) = screen else {
         frame.render_widget(
-            Paragraph::new("No agents open. Press Ctrl+B, then n to start one.")
-                .centered()
-                .style(theme.muted()),
+            Paragraph::new(if no_agents {
+                "No agents open. Press Ctrl+B, then n to start one."
+            } else {
+                "Agent terminal unavailable."
+            })
+            .centered()
+            .style(theme.muted()),
             area,
         );
         return;
@@ -650,10 +1126,7 @@ fn render_new_agent_form(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 ),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "  [j/k] move  [Enter/Space] select  [Esc] cancel",
-                theme.muted(),
-            )),
+            hint_line(FORM_HINTS, theme),
         ],
     );
 }
@@ -707,13 +1180,7 @@ fn render_workspace_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 }),
         );
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [Enter] use  [b] browse  [j/k] move  [Esc] back",
-            theme.muted(),
-        )),
-    ]);
+    lines.extend([Line::from(""), hint_line(WORKSPACE_HINTS, theme)]);
     render_dialog(
         frame,
         theme,
@@ -741,13 +1208,7 @@ fn render_agent_choices(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             Span::styled(kind.label(), text(theme)),
         ])
     }));
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [j/k] move  [Enter] use  [c/a] choose  [Esc] back",
-            theme.muted(),
-        )),
-    ]);
+    lines.extend([Line::from(""), hint_line(AGENT_HINTS, theme)]);
     render_dialog(frame, theme, " Choose agent ", ModalSize::Compact, lines);
 }
 
@@ -803,10 +1264,7 @@ fn render_native_browser(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        "  [Enter/l] open/use  [h] parent  [j/k] move  [Esc] cancel",
-        theme.muted(),
-    )));
+    lines.push(hint_line(BROWSER_HINTS, theme));
     render_dialog(frame, theme, " Select workspace ", ModalSize::Large, lines);
 }
 
@@ -833,8 +1291,7 @@ fn render_embedded_browser(
         frame.render_widget(terminal, content);
     }
     frame.render_widget(
-        Paragraph::new("[q] use current directory  [Q] cancel  [Ctrl+B x] force close")
-            .style(theme.muted()),
+        Paragraph::new(hint_line(EMBEDDED_HINTS, theme)).style(theme.muted()),
         Rect::new(
             area.x.saturating_add(1),
             area.bottom().saturating_sub(2),
@@ -868,7 +1325,7 @@ fn render_confirmation(frame: &mut Frame<'_>, theme: Theme, title: &str, prompt:
             Line::from(""),
             Line::from(Span::styled(format!("  {prompt}"), warning(theme))),
             Line::from(""),
-            Line::from("  [y] Yes    [Esc] Cancel"),
+            hint_line(CONFIRM_HINTS, theme),
         ],
     );
 }
@@ -895,7 +1352,28 @@ fn render_stop_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
             )),
             Line::from("  This terminates every agent in the session."),
             Line::from(""),
-            Line::from("  [y] Stop session    [Esc] Cancel"),
+            hint_line(STOP_HINTS, theme),
+        ],
+    );
+}
+
+fn render_resume_confirmation(frame: &mut Frame<'_>, app: &App, theme: Theme) {
+    let title = app
+        .pending_resume_title()
+        .unwrap_or("Archived conversation");
+    render_dialog(
+        frame,
+        theme,
+        " Reactivate conversation? ",
+        ModalSize::Standard,
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", end_truncate(title, 62)),
+                warning(theme),
+            )),
+            Line::from(""),
+            hint_line(RESUME_HINTS, theme),
         ],
     );
 }
@@ -907,16 +1385,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme) {
             .iter()
             .map(|binding| Line::from(format!("  {:<27} {}", binding.keys, binding.action))),
     );
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Otherwise, every key and supported mouse event goes",
-            theme.muted(),
-        )),
-        Line::from(Span::styled("  to the native agent TUI.", theme.muted())),
-        Line::from(""),
-        Line::from(Span::styled("  Esc closes", theme.muted())),
-    ]);
+    lines.extend([Line::from(""), hint_line(BACK_HINTS, theme)]);
     render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
 }
 
@@ -938,14 +1407,20 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme) {
                 Span::styled("  ›", theme.muted()),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Left/right changes and saves the theme.",
-                theme.muted(),
-            )),
-            Line::from(""),
-            Line::from(Span::styled("  Esc returns to menu", theme.muted())),
+            hint_line(SETTINGS_HINTS, theme),
         ],
     );
+}
+
+fn hint_line(hints: &[ActionHint], theme: Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled("  ", theme.muted())];
+    for (index, hint) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", theme.muted()));
+        }
+        spans.push(Span::styled(hint.text, theme.muted()));
+    }
+    Line::from(spans)
 }
 
 fn render_dialog(
@@ -1226,7 +1701,219 @@ mod tests {
         assert!(rendered.contains("Open Svarm session"));
         assert!(rendered.contains("42"));
         assert!(rendered.contains("attached"));
-        assert!(rendered.contains("[Enter] open  [j/k] select  [Esc] cancel  [n] new"));
+        assert!(rendered.contains("[Enter] open  [j] next  [k] previous  [Esc] cancel  [n] new"));
+    }
+
+    fn assert_hint_clicks(app: &App, area: Rect, x: u16, y: u16, hints: &[ActionHint]) {
+        let mut column = x + 2;
+        for hint in hints {
+            assert_eq!(
+                click_action(app, area, column, y),
+                Some(hint.action),
+                "{} should be clickable",
+                hint.text
+            );
+            column += hint.text.chars().count() as u16 + 2;
+        }
+    }
+
+    #[test]
+    fn every_svarm_action_surface_has_a_click_target() {
+        let area = Rect::new(0, 0, 80, 24);
+        let compact = dialog_inner(ModalSize::Compact, area);
+        let standard = dialog_inner(ModalSize::Standard, area);
+        let large = dialog_inner(ModalSize::Large, area);
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+
+        let new_button = new_agent_button_area(area, true).unwrap();
+        assert_eq!(
+            click_action(&app, area, new_button.x, new_button.y),
+            Some(ClickAction::Management(ManagementCommand::ChooseAgent))
+        );
+        let menu_button = menu_button_area(area, true).unwrap();
+        assert_eq!(
+            click_action(&app, area, menu_button.x, menu_button.y),
+            Some(ClickAction::ToggleMenu)
+        );
+        app.toggle_sidebar();
+        let collapsed_menu = menu_button_area(area, false).unwrap();
+        assert_eq!(
+            click_action(&app, area, collapsed_menu.x, collapsed_menu.y),
+            Some(ClickAction::Management(ManagementCommand::OpenMenu))
+        );
+        app.toggle_sidebar();
+        assert_eq!(
+            click_action(&app, area, SIDEBAR_WIDTH + 1, 0),
+            Some(ClickAction::Management(ManagementCommand::ChooseAgent))
+        );
+
+        app.set_mode(Mode::Menu);
+        let popup = menu_popup_area(menu_button);
+        for (index, item) in MenuItem::ALL.into_iter().enumerate() {
+            assert_eq!(
+                click_action(&app, area, popup.x + 1, popup.y + 1 + index as u16),
+                Some(ClickAction::MenuItem(item))
+            );
+        }
+
+        app.open_new_agent(None, None, Vec::new());
+        app.open_workspace_choices();
+        assert_eq!(
+            click_action(&app, area, compact.x, compact.y + 1),
+            Some(ClickAction::BrowseWorkspaces)
+        );
+
+        app.open_new_agent(
+            None,
+            None,
+            vec![crate::app::WorkspaceChoice {
+                path: PathBuf::from("/tmp/workspace"),
+                available: true,
+            }],
+        );
+        for (line, field) in [
+            (1, NewAgentField::Workspace),
+            (2, NewAgentField::Agent),
+            (3, NewAgentField::Start),
+        ] {
+            assert_eq!(
+                click_action(&app, area, compact.x, compact.y + line),
+                Some(ClickAction::NewAgentField(field))
+            );
+        }
+        assert_hint_clicks(&app, area, compact.x, compact.y + 5, FORM_HINTS);
+
+        app.open_workspace_choices();
+        assert_eq!(
+            click_action(&app, area, compact.x, compact.y + 1),
+            Some(ClickAction::Workspace(0))
+        );
+        assert_hint_clicks(&app, area, compact.x, compact.y + 3, WORKSPACE_HINTS);
+
+        app.open_agent_choices();
+        for index in 0..AgentKind::ALL.len() {
+            assert_eq!(
+                click_action(&app, area, compact.x, compact.y + 1 + index as u16),
+                Some(ClickAction::AgentKind(index))
+            );
+        }
+        assert_hint_clicks(
+            &app,
+            area,
+            compact.x,
+            compact.y + AgentKind::ALL.len() as u16 + 2,
+            AGENT_HINTS,
+        );
+
+        app.open_native_browser(PathBuf::from("/tmp"), 1);
+        app.apply_directory_load(
+            1,
+            PathBuf::from("/tmp"),
+            Ok(vec![crate::app::DirectoryChoice {
+                path: PathBuf::from("/tmp/child"),
+                label: "child".into(),
+            }]),
+        );
+        assert_eq!(
+            click_action(&app, area, large.x, large.y + 2),
+            Some(ClickAction::NativeBrowserItem(0))
+        );
+        assert_eq!(
+            click_action(&app, area, large.x, large.y + 3),
+            Some(ClickAction::NativeBrowserItem(1))
+        );
+        assert_hint_clicks(&app, area, large.x, large.y + 5, BROWSER_HINTS);
+
+        app.open_embedded_browser();
+        let embedded = embedded_modal_area(area);
+        assert_hint_clicks(
+            &app,
+            area,
+            embedded.x + 1,
+            embedded.bottom() - 2,
+            EMBEDDED_HINTS,
+        );
+
+        for mode in [Mode::ConfirmClose, Mode::ConfirmArchive] {
+            app.set_mode(mode);
+            assert_hint_clicks(&app, area, standard.x, standard.y + 3, CONFIRM_HINTS);
+        }
+        app.set_mode(Mode::ConfirmResume);
+        assert_hint_clicks(&app, area, standard.x, standard.y + 3, RESUME_HINTS);
+        app.set_mode(Mode::ConfirmQuit);
+        assert_hint_clicks(&app, area, standard.x, standard.y + 4, STOP_HINTS);
+
+        app.set_mode(Mode::Keybinds);
+        for (index, binding) in MANAGEMENT_KEYBINDINGS.iter().enumerate() {
+            assert_eq!(
+                click_action(&app, area, standard.x, standard.y + 1 + index as u16),
+                Some(ClickAction::Management(binding.command))
+            );
+        }
+        assert_hint_clicks(
+            &app,
+            area,
+            standard.x,
+            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16 + 2,
+            BACK_HINTS,
+        );
+
+        app.set_mode(Mode::Settings);
+        assert_hint_clicks(&app, area, standard.x, standard.y + 3, SETTINGS_HINTS);
+        assert_eq!(
+            click_action(&app, area, standard.x + 21, standard.y + 1),
+            Some(ClickAction::ThemePrevious)
+        );
+        let next_theme = standard.x + 24 + app.theme().label().chars().count() as u16;
+        assert_eq!(
+            click_action(&app, area, next_theme, standard.y + 1),
+            Some(ClickAction::ThemeNext)
+        );
+
+        app.set_mode(Mode::Terminal);
+        app.toggle_sidebar();
+        assert!(render_app_text(&app).contains("≡ Menu  ^B m"));
+    }
+
+    #[test]
+    fn every_session_chooser_hint_and_row_has_a_click_target() {
+        let chooser = SessionChooser::new(
+            vec![SessionSummary {
+                id: SessionId(42),
+                running_agents: 0,
+                total_agents: 0,
+                attachment: None,
+                last_user_activity_ms: 1,
+                revision: SessionRevision(1),
+            }],
+            true,
+        );
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = Block::bordered().inner(area);
+        assert_eq!(
+            session_chooser_click(&chooser, area, inner.x, inner.y),
+            Some(SessionChooserClick::Choose(0))
+        );
+        assert_eq!(
+            session_chooser_click(&chooser, area, inner.x, inner.y + 1),
+            Some(SessionChooserClick::Choose(1))
+        );
+
+        let mut column = inner.x + 1;
+        for hint in SESSION_HINTS {
+            assert_eq!(
+                session_chooser_click(&chooser, area, column, inner.bottom().saturating_sub(1),),
+                Some(hint.action),
+                "{} should be clickable",
+                hint.text
+            );
+            column += hint.text.chars().count() as u16 + 2;
+        }
     }
 
     #[test]
@@ -1246,6 +1933,8 @@ mod tests {
         let menu = render_app_text(&app);
         assert!(menu.contains("Detach — agents keep running"));
         assert!(menu.contains("Stop session — terminates all agents"));
+        assert!(menu.contains("[1] Detach"));
+        assert!(menu.contains("[4] Settings"));
     }
 
     #[test]
@@ -1640,6 +2329,7 @@ mod tests {
                 render_terminal(
                     frame,
                     Some(&screen),
+                    false,
                     true,
                     Mode::Terminal,
                     frame.area(),

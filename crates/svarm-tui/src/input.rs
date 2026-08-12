@@ -16,6 +16,7 @@ pub(crate) enum ManagementCommand {
     ChooseAgent,
     CloseAgent,
     ArchiveAgent,
+    ResumeArchived,
     Detach,
     ConfirmQuit,
     ToggleSidebar,
@@ -29,52 +30,74 @@ pub(crate) enum ManagementCommand {
 pub(crate) struct Keybinding {
     pub keys: &'static str,
     pub action: &'static str,
+    pub command: ManagementCommand,
 }
 
 pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
     Keybinding {
         keys: "Ctrl+B, j/k or arrows",
         action: "next/previous agent",
+        command: ManagementCommand::NextAgent,
     },
     Keybinding {
         keys: "Ctrl+B, 1..9",
         action: "select conversation",
+        command: ManagementCommand::SelectAgent(0),
     },
     Keybinding {
         keys: "Ctrl+B, PageUp/PageDown",
         action: "scroll agent history",
+        command: ManagementCommand::ScrollTerminalUp,
     },
     Keybinding {
         keys: "Ctrl+B, n",
         action: "start an agent",
+        command: ManagementCommand::ChooseAgent,
     },
     Keybinding {
         keys: "Ctrl+B, x",
         action: "close selected agent",
+        command: ManagementCommand::CloseAgent,
     },
     Keybinding {
         keys: "Ctrl+B, a",
         action: "archive selected conversation",
+        command: ManagementCommand::ArchiveAgent,
+    },
+    Keybinding {
+        keys: "Ctrl+B, r",
+        action: "reactivate archived conversation",
+        command: ManagementCommand::ResumeArchived,
     },
     Keybinding {
         keys: "Ctrl+B, d",
         action: "detach — agents keep running",
+        command: ManagementCommand::Detach,
     },
     Keybinding {
         keys: "Ctrl+B, q",
         action: "stop session — terminates all agents",
+        command: ManagementCommand::ConfirmQuit,
     },
     Keybinding {
         keys: "Ctrl+B, b",
         action: "toggle sidebar",
+        command: ManagementCommand::ToggleSidebar,
     },
     Keybinding {
         keys: "Ctrl+B, m",
         action: "open menu",
+        command: ManagementCommand::OpenMenu,
+    },
+    Keybinding {
+        keys: "Ctrl+B, ?",
+        action: "open keybinds",
+        command: ManagementCommand::OpenKeybinds,
     },
     Keybinding {
         keys: "Ctrl+B, Ctrl+B",
         action: "send Ctrl+B to agent",
+        command: ManagementCommand::LiteralPrefix,
     },
 ];
 
@@ -94,6 +117,7 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         HostKeyCode::Char('n') => ManagementCommand::ChooseAgent,
         HostKeyCode::Char('x') => ManagementCommand::CloseAgent,
         HostKeyCode::Char('a') => ManagementCommand::ArchiveAgent,
+        HostKeyCode::Char('r') => ManagementCommand::ResumeArchived,
         HostKeyCode::Char('d') => ManagementCommand::Detach,
         HostKeyCode::Char('q') => ManagementCommand::ConfirmQuit,
         HostKeyCode::Char('b') => ManagementCommand::ToggleSidebar,
@@ -200,6 +224,10 @@ mod tests {
         assert_eq!(
             management_command(key(HostKeyCode::Char('a'), KeyModifiers::NONE)),
             ManagementCommand::ArchiveAgent
+        );
+        assert_eq!(
+            management_command(key(HostKeyCode::Char('r'), KeyModifiers::NONE)),
+            ManagementCommand::ResumeArchived
         );
         assert!(
             MANAGEMENT_KEYBINDINGS

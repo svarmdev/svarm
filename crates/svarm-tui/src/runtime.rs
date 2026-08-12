@@ -222,12 +222,10 @@ fn handle_host_event(
         }
         HostEvent::Mouse(mouse) => {
             let area = terminal.terminal().size()?.into();
-            if app.mode() == Mode::NewAgent(NewAgentPage::EmbeddedBrowser) {
-                if let Err(error) = resources.browser.mouse(mouse, area) {
-                    app.set_notice(format!("could not send mouse input to Yazi: {error}"));
-                }
-            } else {
-                dirty |= handle_mouse(app, agents, resources.settings, mouse, area)?;
+            let (resize, redraw) = handle_mouse(app, agents, &mut resources, mouse, area)?;
+            dirty |= redraw;
+            if resize {
+                resize_agents(agents, app, terminal.terminal().size()?.into())?;
             }
         }
         _ => {}
@@ -374,6 +372,8 @@ fn handle_key(
             _ => {}
         },
         Mode::ConfirmResume => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.cycle_pending_archive(1),
+            KeyCode::Char('k') | KeyCode::Up => app.cycle_pending_archive(-1),
             KeyCode::Char('y') => resume_selected_archive(app, agents)?,
             KeyCode::Char('n') | KeyCode::Esc => app.cancel_confirmation(),
             _ => {}
@@ -470,6 +470,12 @@ fn handle_management_command(
                 archive_selected(app, agents)?;
             }
         }
+        ManagementCommand::ResumeArchived => {
+            if !app.request_resume_archived(0) {
+                app.set_notice("no archived conversations");
+                app.set_mode(Mode::Terminal);
+            }
+        }
         ManagementCommand::ConfirmQuit => app.set_mode(Mode::ConfirmQuit),
         ManagementCommand::Detach => app.request_detach(),
         ManagementCommand::ToggleSidebar => {
@@ -503,65 +509,37 @@ fn handle_management_command(
 fn handle_mouse(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings: &Settings,
+    resources: &mut InteractionResources<'_>,
     mouse: MouseEvent,
     area: Rect,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     if app.mode() == Mode::Terminal && handle_sidebar_wheel(app, mouse, area) {
-        return Ok(true);
+        return Ok((false, true));
     }
 
-    if matches!(
-        app.mode(),
-        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
-    ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(action) = ui::click_action(app, area, mouse.column, mouse.row)
     {
-        if app.mode() != Mode::Menu
-            && ui::new_agent_button_area(area, app.sidebar_visible())
-                .is_some_and(|button| contains(button, mouse.column, mouse.row))
-        {
-            handle_management_command(app, agents, settings, area, ManagementCommand::ChooseAgent)?;
-            return Ok(true);
-        }
+        return apply_click_action(app, agents, resources, area, action);
+    }
 
-        if ui::menu_button_area(area, app.sidebar_visible())
-            .is_some_and(|button| contains(button, mouse.column, mouse.row))
-        {
-            app.set_mode(if app.mode() == Mode::Menu {
-                Mode::Terminal
-            } else {
-                Mode::Menu
-            });
-            return Ok(true);
+    if app.mode() == Mode::NewAgent(NewAgentPage::EmbeddedBrowser) {
+        if let Err(error) = resources.browser.mouse(mouse, area) {
+            app.set_notice(format!("could not send mouse input to Yazi: {error}"));
+            return Ok((false, true));
         }
-
-        if app.mode() == Mode::Menu
-            && let Some(item) = ui::menu_item_at(area, mouse.column, mouse.row)
-        {
-            app.select_menu_item(item);
-            app.open_selected_menu_item();
-            return Ok(true);
-        }
-
-        if app.mode() == Mode::Terminal
-            && let Some(index) = ui::agent_item_at(app, area, mouse.column, mouse.row)
-        {
-            if app.select_sidebar_index(index) {
-                sync_selection(app, agents)?;
-            }
-            return Ok(true);
-        }
+        return Ok((false, false));
     }
 
     if app.mode() != Mode::Terminal {
-        return Ok(false);
+        return Ok((false, false));
     }
     let child_area = ui::terminal_area(area, app.sidebar_visible());
     if !contains(child_area, mouse.column, mouse.row) {
-        return Ok(false);
+        return Ok((false, false));
     }
     let Some(id) = app.selected_agent_id() else {
-        return Ok(false);
+        return Ok((false, false));
     };
     if let Some(steps) = wheel_steps(mouse.kind) {
         match agents.wheel_routing(id) {
@@ -569,16 +547,16 @@ fn handle_mouse(
             WheelRouting::AlternateScreen => {
                 agents.show_live(id);
                 agents.key(id, alternate_scroll_input(steps))?;
-                return Ok(true);
+                return Ok((false, true));
             }
             WheelRouting::Scrollback => {
                 agents.scroll(id, -steps * 3)?;
-                return Ok(true);
+                return Ok((false, true));
             }
         }
     }
     if agents.wheel_routing(id) != WheelRouting::ChildMouse {
-        return Ok(false);
+        return Ok((false, false));
     }
     let redraw = agents.show_live(id);
     let translated = MouseEvent {
@@ -587,7 +565,144 @@ fn handle_mouse(
         ..mouse
     };
     agents.mouse(id, mouse_input(translated))?;
-    Ok(redraw)
+    Ok((false, redraw))
+}
+
+fn apply_click_action(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    resources: &mut InteractionResources<'_>,
+    area: Rect,
+    action: ui::ClickAction,
+) -> Result<(bool, bool)> {
+    match action {
+        ui::ClickAction::Management(command) => {
+            handle_management_command(app, agents, resources.settings, area, command)
+        }
+        ui::ClickAction::ToggleMenu => {
+            app.set_mode(if app.mode() == Mode::Menu {
+                Mode::Terminal
+            } else {
+                Mode::Menu
+            });
+            Ok((false, true))
+        }
+        ui::ClickAction::SidebarItem(index) => {
+            if app.select_sidebar_index(index) {
+                sync_selection(app, agents)?;
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::MenuItem(item) => {
+            app.select_menu_item(item);
+            app.open_selected_menu_item();
+            Ok((false, true))
+        }
+        ui::ClickAction::Next => {
+            if app.mode() == Mode::ConfirmResume {
+                app.cycle_pending_archive(1);
+            } else {
+                app.move_new_agent_selection(1);
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::Previous => {
+            if app.mode() == Mode::ConfirmResume {
+                app.cycle_pending_archive(-1);
+            } else {
+                app.move_new_agent_selection(-1);
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::Confirm => {
+            match app.mode() {
+                Mode::NewAgent(NewAgentPage::Form) => {
+                    activate_new_agent_field(app, agents, resources)
+                }
+                Mode::NewAgent(NewAgentPage::Workspaces) => app.confirm_workspace(),
+                Mode::NewAgent(NewAgentPage::Agents) => app.confirm_agent(),
+                Mode::NewAgent(NewAgentPage::NativeBrowser) => {
+                    activate_native_browser(app, resources.browser)
+                }
+                Mode::ConfirmClose => close_selected(app, agents)?,
+                Mode::ConfirmArchive => archive_selected(app, agents)?,
+                Mode::ConfirmResume => resume_selected_archive(app, agents)?,
+                Mode::ConfirmQuit => app.request_stop(),
+                _ => {}
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::Cancel => {
+            match app.mode() {
+                Mode::NewAgent(NewAgentPage::Form) => app.cancel_new_agent(),
+                Mode::NewAgent(NewAgentPage::Workspaces | NewAgentPage::Agents) => {
+                    app.back_to_new_agent_form()
+                }
+                Mode::NewAgent(NewAgentPage::NativeBrowser) => app.close_native_browser(),
+                Mode::ConfirmArchive | Mode::ConfirmResume => app.cancel_confirmation(),
+                Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
+                Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
+                _ => {}
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::NewAgentField(field) => {
+            app.select_new_agent_field(field);
+            activate_new_agent_field(app, agents, resources);
+            Ok((false, true))
+        }
+        ui::ClickAction::Workspace(index) => {
+            app.select_workspace(index);
+            app.confirm_workspace();
+            Ok((false, true))
+        }
+        ui::ClickAction::BrowseWorkspaces => {
+            resources
+                .browser
+                .open(app, resources.settings, resources.host_area);
+            Ok((false, true))
+        }
+        ui::ClickAction::AgentKind(index) => {
+            app.select_agent_kind(index);
+            app.confirm_agent();
+            Ok((false, true))
+        }
+        ui::ClickAction::NativeBrowserItem(index) => {
+            app.set_native_browser_position(index);
+            activate_native_browser(app, resources.browser);
+            Ok((false, true))
+        }
+        ui::ClickAction::NativeBrowserParent => {
+            open_native_browser_parent(app, resources.browser);
+            Ok((false, true))
+        }
+        ui::ClickAction::ThemePrevious => {
+            save_theme(app, resources.settings_store, resources.settings, -1);
+            Ok((false, true))
+        }
+        ui::ClickAction::ThemeNext => {
+            save_theme(app, resources.settings_store, resources.settings, 1);
+            Ok((false, true))
+        }
+        ui::ClickAction::EmbeddedAccept | ui::ClickAction::EmbeddedCancel => {
+            let code = if action == ui::ClickAction::EmbeddedAccept {
+                'q'
+            } else {
+                'Q'
+            };
+            if let Err(error) = resources.browser.send_key(KeyEvent::new(
+                KeyCode::Char(code),
+                crossterm::event::KeyModifiers::NONE,
+            )) {
+                app.set_notice(format!("could not send input to Yazi: {error}"));
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::EmbeddedForceClose => {
+            resources.browser.force_close(app);
+            Ok((false, true))
+        }
+    }
 }
 
 fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
@@ -643,6 +758,19 @@ fn submit_new_agent(
     }
 }
 
+fn activate_new_agent_field(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    resources: &mut InteractionResources<'_>,
+) {
+    match app.new_agent().map(|state| state.draft.selected_field) {
+        Some(NewAgentField::Workspace) => app.open_workspace_choices(),
+        Some(NewAgentField::Agent) => app.open_agent_choices(),
+        Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
+        None => {}
+    }
+}
+
 fn handle_new_agent_key(
     app: &mut App,
     agents: &mut RemoteAgents,
@@ -654,14 +782,7 @@ fn handle_new_agent_key(
         NewAgentPage::Form => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                match app.new_agent().map(|state| state.draft.selected_field) {
-                    Some(NewAgentField::Workspace) => app.open_workspace_choices(),
-                    Some(NewAgentField::Agent) => app.open_agent_choices(),
-                    Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
-                    None => {}
-                }
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => activate_new_agent_field(app, agents, resources),
             KeyCode::Esc => app.cancel_new_agent(),
             _ => {}
         },
@@ -711,25 +832,33 @@ fn handle_native_browser_key(app: &mut App, browser: &mut BrowserRuntime, key: K
         KeyCode::PageUp => app.move_new_agent_selection(-8),
         KeyCode::PageDown => app.move_new_agent_selection(8),
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-            if let Some(parent) = app
-                .native_browser()
-                .and_then(|state| state.current_path.parent())
-                .map(PathBuf::from)
-            {
-                browser.load(app, parent);
-            }
+            open_native_browser_parent(app, browser)
         }
-        KeyCode::Enter | KeyCode::Char('l') => match app.native_browser_action() {
-            Some(BrowserAction::Select(path)) => match path.canonicalize() {
-                Ok(path) if path.is_dir() => app.choose_browsed_workspace(path),
-                Ok(_) => app.set_notice("selected workspace is not a directory"),
-                Err(error) => app.set_notice(format!("could not select workspace: {error}")),
-            },
-            Some(BrowserAction::Load(path)) => browser.load(app, path),
-            None => {}
-        },
+        KeyCode::Enter | KeyCode::Char('l') => activate_native_browser(app, browser),
         KeyCode::Esc => app.close_native_browser(),
         _ => {}
+    }
+}
+
+fn open_native_browser_parent(app: &mut App, browser: &mut BrowserRuntime) {
+    if let Some(parent) = app
+        .native_browser()
+        .and_then(|state| state.current_path.parent())
+        .map(PathBuf::from)
+    {
+        browser.load(app, parent);
+    }
+}
+
+fn activate_native_browser(app: &mut App, browser: &mut BrowserRuntime) {
+    match app.native_browser_action() {
+        Some(BrowserAction::Select(path)) => match path.canonicalize() {
+            Ok(path) if path.is_dir() => app.choose_browsed_workspace(path),
+            Ok(_) => app.set_notice("selected workspace is not a directory"),
+            Err(error) => app.set_notice(format!("could not select workspace: {error}")),
+        },
+        Some(BrowserAction::Load(path)) => browser.load(app, path),
+        None => {}
     }
 }
 
