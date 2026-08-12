@@ -972,7 +972,7 @@ mod tests {
     fn terminal_snapshot(rows: u16, cols: u16, text: &str) -> TerminalSnapshot {
         let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(rows, cols));
         for (column, character) in text.chars().enumerate() {
-            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string().into();
         }
         snapshot.state.cursor.position = TerminalPosition {
             row: 0,

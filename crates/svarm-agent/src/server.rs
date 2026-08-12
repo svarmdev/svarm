@@ -2638,8 +2638,13 @@ mod tests {
                 .diff
                 .cells
                 .iter()
-                .map(|patch| patch.cell.contents.as_str())
-                .collect::<String>()
+                .fold(String::new(), |mut text, patch| {
+                    patch
+                        .cell
+                        .contents
+                        .with_str(|contents| text.push_str(contents));
+                    text
+                })
                 .contains(needle),
             _ => false,
         }

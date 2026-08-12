@@ -1,8 +1,9 @@
 # Svarm protocol
 
 Svarm uses length-prefixed JSON envelopes over its local Unix socket. Protocol version 6 replaced
-terminal-emulator byte streams with Svarm-owned semantic terminal frames. Clients do not need a VT
-parser and terminal backends are not part of the wire format.
+terminal-emulator byte streams with Svarm-owned semantic terminal frames. Protocol version 7 keeps
+those semantics while encoding terminal grids as compact style-tagged row runs. Clients do not need
+a VT parser and terminal backends are not part of the wire format.
 
 ## Semantic terminal state
 
@@ -15,7 +16,7 @@ contains:
   one-based OSC 8 hyperlink reference;
 - wrapped-row flags;
 - cursor position, visibility, and requested style;
-- alternate-screen state and scrollback position, retained row count, and capacity;
+- alternate-screen state, scrollback position, and retained row count;
 - application cursor/keypad, bracketed paste, keyboard, alternate-scroll, mouse protocol, and mouse
   encoding modes;
 - title, OSC 7 working directory, OSC 8 hyperlink URI table, OSC 9;4 progress, pending OSC 52
@@ -24,6 +25,11 @@ contains:
 Colors are `default`, an indexed palette entry, or an RGB triple. Text attributes are independent
 booleans for bold, dim, italic, underline, inverse, blink, hidden, and strikethrough. Cell contents
 are Unicode strings and may include combining characters.
+
+On the wire, a snapshot contains a dictionary of unique cell styles and one list of runs per row.
+Runs contain either a count of empty cells, consecutive Unicode scalar text, or the uncommon list
+of multi-scalar graphemes. Wide-cell flags are packed into each run and wrapped state is stored once
+per row. This representation is a protocol detail; decoded clients receive the same semantic cells.
 
 A `terminal_viewport` event carries the same complete snapshot shape for a requested historical
 scrollback position. Historical viewports are separate from the live frame sequence.

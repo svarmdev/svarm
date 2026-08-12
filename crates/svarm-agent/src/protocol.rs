@@ -9,7 +9,7 @@ use crate::{
 
 pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -586,7 +586,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_six_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_seven_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_six_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_seven_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,
@@ -698,7 +698,7 @@ mod tests {
         .unwrap();
 
         assert!(json.contains("\"snapshot\""));
-        assert!(json.contains("\"contents\":\"λ\""));
+        assert!(json.contains("\"t\":\"λ\""));
         assert!(!json.contains("formatted_screen"));
         assert!(!json.contains("formatted_changes"));
         assert!(!json.contains("\\u001b"));

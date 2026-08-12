@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::Shutdown,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -475,22 +475,32 @@ impl RemoteAgents {
         if frame.snapshot.validate().is_err() {
             return FrameDisposition::Gap;
         }
-        let terminal = self
-            .terminals
-            .entry(frame.agent_id)
-            .or_insert_with(|| CachedTerminal {
-                snapshot: frame.snapshot.clone(),
-                tracker: TerminalFrameTracker::default(),
-                scrollback: None,
-                scrollback_request: None,
-                scrollback_target: None,
-            });
-        let disposition = terminal.tracker.accept_full(frame.sequence);
+        let disposition = match self.terminals.entry(frame.agent_id) {
+            Entry::Vacant(entry) => {
+                let mut tracker = TerminalFrameTracker::default();
+                let disposition = tracker.accept_full(frame.sequence);
+                entry.insert(CachedTerminal {
+                    snapshot: frame.snapshot,
+                    tracker,
+                    scrollback: None,
+                    scrollback_request: None,
+                    scrollback_target: None,
+                });
+                disposition
+            }
+            Entry::Occupied(mut entry) => {
+                let terminal = entry.get_mut();
+                let disposition = terminal.tracker.accept_full(frame.sequence);
+                if disposition == FrameDisposition::Apply {
+                    terminal.snapshot = frame.snapshot;
+                    terminal.scrollback = None;
+                    terminal.scrollback_request = None;
+                    terminal.scrollback_target = None;
+                }
+                disposition
+            }
+        };
         if disposition == FrameDisposition::Apply {
-            terminal.snapshot = frame.snapshot;
-            terminal.scrollback = None;
-            terminal.scrollback_request = None;
-            terminal.scrollback_target = None;
             self.pending_resync.remove(&frame.agent_id);
         }
         disposition
@@ -503,11 +513,9 @@ impl RemoteAgents {
         let disposition = terminal
             .tracker
             .accept_diff(frame.base_sequence, frame.sequence);
-        if disposition == FrameDisposition::Apply {
-            if terminal.snapshot.apply(&frame.diff).is_err() {
-                terminal.tracker.reset();
-                return FrameDisposition::Gap;
-            }
+        if disposition == FrameDisposition::Apply && terminal.snapshot.apply(&frame.diff).is_err() {
+            terminal.tracker.reset();
+            return FrameDisposition::Gap;
         }
         disposition
     }
@@ -673,7 +681,7 @@ mod tests {
     fn snapshot(text: &str) -> TerminalSnapshot {
         let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(2, 12));
         for (column, character) in text.chars().enumerate() {
-            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string().into();
         }
         snapshot
     }

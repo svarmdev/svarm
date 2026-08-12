@@ -1,6 +1,9 @@
 use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
 
+const MAX_HYPERLINK_URI_BYTES: usize = 4 * 1024;
+const MAX_HYPERLINK_STORAGE_BYTES: usize = 1_000_000;
+
 /// Parse an OSC 7 URI into a filesystem path.
 /// Accepts `file://hostname/path`, `file:///path`, or a bare `/path`.
 /// Percent-decodes the path component.
@@ -136,9 +139,10 @@ pub struct Screen {
 
     /// OSC 8 hyperlink store.  URIs are interned here; a cell's `Attrs.link`
     /// is the index into this Vec plus 1 (0 = no link), mirroring tmux's
-    /// per-screen hyperlink table.  Grows for the life of the screen, which is
-    /// fine: real workloads use a bounded set of distinct URIs.
+    /// per-screen hyperlink table. The table has an independent byte limit so
+    /// unique URIs cannot grow outside the scrollback memory budget forever.
     hyperlinks: Vec<String>,
+    hyperlink_bytes: usize,
 
     /// Currently-running command as announced by the shell via shell-integration
     /// OSC sequences (issue #299). `None` when the shell is idle (at the prompt)
@@ -219,6 +223,7 @@ impl Screen {
             osc94_progress: None,
             osc52_clipboard: None,
             hyperlinks: Vec::new(),
+            hyperlink_bytes: 0,
             osc_shell_command: None,
             squelch_cleared: false,
             squelch_clear_pending: false,
@@ -872,6 +877,13 @@ impl Screen {
         {
             pos + 1
         } else {
+            if uri.len() > MAX_HYPERLINK_URI_BYTES
+                || self.hyperlink_bytes.saturating_add(uri.len()) > MAX_HYPERLINK_STORAGE_BYTES
+            {
+                self.attrs.link = 0;
+                return;
+            }
+            self.hyperlink_bytes += uri.len();
             self.hyperlinks.push(uri.into_owned());
             self.hyperlinks.len()
         };
@@ -890,6 +902,12 @@ impl Screen {
             return None;
         }
         self.hyperlinks.get((id - 1) as usize).map(String::as_str)
+    }
+
+    /// Returns bytes retained by the interned OSC 8 hyperlink table.
+    #[must_use]
+    pub fn hyperlink_storage_bytes(&self) -> usize {
+        self.hyperlink_bytes
     }
 
     /// Peek at the pending OSC 52 clipboard payload without consuming it.

@@ -36,3 +36,14 @@ reapply it and run the regression test before updating this version entry.
 
 When upgrading the crate, remove this patch if upstream offers an equivalent byte budget that
 includes active rows. Otherwise, reapply it and run the regression tests above.
+
+### Bound OSC 8 hyperlink metadata
+
+- File: `vt100-psmux/src/screen.rs`
+- Change: reject individual hyperlink URIs above 4 KiB and stop interning new unique URIs after
+  the per-screen table reaches 1 MB. Existing links remain valid and duplicate URIs remain usable.
+- Reason: cells store hyperlink identifiers, but the URI table otherwise grows independently of
+  scrollback eviction and could defeat the terminal memory budget.
+- Regression test: `terminal_backend::tests::hyperlink_metadata_is_bounded`.
+
+When upgrading the crate, retain equivalent per-screen limits or reapply this patch and its test.

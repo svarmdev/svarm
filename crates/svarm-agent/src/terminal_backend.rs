@@ -101,7 +101,7 @@ impl Vt100Backend {
                     })
                 });
                 TerminalCell {
-                    contents: cell.contents().to_owned(),
+                    contents: cell.contents().into(),
                     foreground: color(cell.fgcolor()),
                     background: color(cell.bgcolor()),
                     attributes: TerminalAttributes {
@@ -137,7 +137,6 @@ impl Vt100Backend {
                 scrollback: TerminalScrollback {
                     position: screen.scrollback(),
                     retained_rows: screen.scrollback_filled(),
-                    capacity: screen.scrollback_len(),
                 },
                 modes,
                 title: screen.title().to_owned(),
@@ -355,5 +354,19 @@ mod tests {
         assert!(screen.scrollback_storage_bytes() <= 20_000);
         assert!(screen.scrollback() <= screen.scrollback_filled());
         assert!(screen.scrollback_filled() > 1);
+    }
+
+    #[test]
+    fn hyperlink_metadata_is_bounded() {
+        let mut backend =
+            Vt100Backend::new_with_scrollback_bytes(TerminalSize::new(2, 12), 100_000);
+        let suffix = "x".repeat(3_900);
+        for index in 0..300 {
+            backend.process(
+                format!("\x1b]8;;https://example.com/{index}/{suffix}\x07x\x1b]8;;\x07").as_bytes(),
+            );
+        }
+
+        assert!(backend.parser.screen().hyperlink_storage_bytes() <= 1_000_000);
     }
 }

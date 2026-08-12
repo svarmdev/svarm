@@ -51,10 +51,8 @@ impl Widget for TerminalScreen<'_> {
                     continue;
                 };
                 let buffer_cell = &mut buffer[(area.x + column, area.y + row)];
-                buffer_cell.set_symbol(if !cell.contents.is_empty() {
-                    &cell.contents
-                } else {
-                    " "
+                cell.contents.with_str(|contents| {
+                    buffer_cell.set_symbol(if contents.is_empty() { " " } else { contents });
                 });
                 buffer_cell.set_style(style(cell));
             }
@@ -125,7 +123,7 @@ mod tests {
     fn screen(text: &str) -> TerminalSnapshot {
         let mut screen = TerminalSnapshot::blank(TerminalSize::new(2, 12));
         for (column, character) in text.chars().enumerate() {
-            screen.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+            screen.cell_mut(0, column as u16).unwrap().contents = character.to_string().into();
         }
         screen.state.cursor.position = TerminalPosition {
             row: 0,
