@@ -142,6 +142,9 @@ mod tests {
 
         let remembered = Cli::try_parse_from(["svarm", "--agent", "claude"]).unwrap();
         assert_eq!(remembered.agent, Some(AgentKind::Claude));
+
+        let grok = Cli::try_parse_from(["svarm", "--agent", "grok", "/tmp/workspace"]).unwrap();
+        assert_eq!(grok.agent, Some(AgentKind::Grok));
         assert_eq!(remembered.path, None);
 
         let new = Cli::try_parse_from(["svarm", "--new-session", "/tmp/workspace"]).unwrap();

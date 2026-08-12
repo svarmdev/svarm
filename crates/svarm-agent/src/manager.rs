@@ -60,7 +60,8 @@ impl AgentManager {
 
     pub fn spawn(&mut self, kind: AgentKind, launch_directory: &Path) -> Result<SessionSnapshot> {
         let id = self.allocate_id()?;
-        let conversation_id = (kind == AgentKind::Claude)
+        let conversation_id = kind
+            .preassigns_conversation_id()
             .then(super::session::new_uuid)
             .transpose()?;
         let mut command =

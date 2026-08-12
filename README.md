@@ -1,6 +1,6 @@
 # Svarm
 
-Svarm is a small terminal multiplexer specifically for coding agents. It runs the native Codex or Claude Code TUI in a real PTY, keeps open agents in a fixed sidebar, and shows one agent at a time. A per-user background server owns the agents, so the UI can detach and reconnect later.
+Svarm is a small terminal multiplexer specifically for coding agents. It runs the native Codex, Claude Code, or Grok Build TUI in a real PTY, keeps open agents in a fixed sidebar, and shows one agent at a time. A per-user background server owns the agents, so the UI can detach and reconnect later.
 
 The local client/server [terminal frame protocol](docs/protocol.md) uses backend-independent
 semantic snapshots and diffs.
@@ -9,7 +9,7 @@ It does not speak ACP, Codex app-server, or Claude's streaming protocol. Normal 
 
 ## Install and run
 
-Codex and/or Claude Code must already be installed and available on `PATH`.
+Codex, Claude Code, and/or Grok Build must already be installed and available on `PATH`.
 
 ```sh
 cargo install --path .
@@ -17,6 +17,7 @@ svarm                         # Open or create a workspace-neutral session
 svarm .                       # Open the new-agent form with this workspace
 svarm --agent codex .         # Start Codex here
 svarm --agent claude ../repo  # Claude Code in ../repo
+svarm --agent grok .          # Grok Build here
 svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
@@ -52,7 +53,7 @@ Every key except `Ctrl+B` belongs to the native agent TUI. Press `Ctrl+B`, relea
 | `d` | Detach — agents keep running |
 | `q` | Stop session — terminates all agents, after confirmation |
 | `?` | Show keybinds directly |
-| `Ctrl+B` | Send a literal `Ctrl+B` to the agent |
+| `Ctrl+B` | Send a literal `Ctrl+B` to the agent (Grok Build uses this to background a running command) |
 
 The Menu control at the bottom of the sidebar is also clickable. Its Keybinds and
 Settings entries work with the mouse or with arrows and Enter. Settings currently
@@ -99,20 +100,22 @@ Rotating `server.log` and `client.log` files live under `$XDG_STATE_HOME/svarm`,
 
 Yazi cwd-result files are created with mode `0600` in the private runtime directory
 and removed after selection, cancellation, failure, force-close, or client shutdown.
-Settings persist only the theme, canonical workspace history, and last agent kind.
+Settings persist only the theme, canonical workspace history, and last agent kind. Grok Build
+conversation tracking installs `~/.grok/hooks/svarm-conversation.json` if that file is missing;
+the hook is a no-op unless Svarm launched the process.
 
 ## Troubleshooting
 
 - Run `svarm server status`, then `svarm list`, to distinguish a missing server from a missing session.
 - If a session is already attached, the error identifies the connection/process and attachment age. Re-run with `--attach --session ID --takeover` only when disconnecting that UI is intentional.
-- Protocol version 3 is incompatible with older live clients and servers. A mismatch leaves the live server and its agents untouched; restart or use matching builds rather than deleting its socket.
+- Protocol version 10 is incompatible with older live clients and servers. A mismatch leaves the live server and its agents untouched; restart or use matching builds rather than deleting its socket.
 - After a client connection error, Svarm restores the host terminal and prints the exact `svarm --attach --session ID` command. Agents may still be running.
 - Missing remembered workspaces remain visible with a `missing` marker and cannot be selected. Press `b` to browse to another directory.
 - If Yazi cannot be found on `PATH`, the native browser opens automatically. Permission and invalid-executable errors are reported instead of being treated as absence.
 
 ## Scope
 
-Svarm deliberately has no remote listener, shells, tabs, pane splitting, arbitrary commands, or simultaneous writable clients for one session. It recognizes only Codex and Claude Code. Provider-specific blocked or idle states are not inferred from timing or vague screen matches.
+Svarm deliberately has no remote listener, shells, tabs, pane splitting, arbitrary commands, or simultaneous writable clients for one session. It recognizes Codex, Claude Code, and Grok Build. Provider-specific blocked or idle states are not inferred from timing or vague screen matches.
 
 ## Develop
 

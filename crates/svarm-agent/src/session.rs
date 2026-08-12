@@ -22,15 +22,23 @@ pub(crate) struct ConversationTracking {
     pub(crate) kind: AgentKind,
     pub(crate) initial_id: Option<String>,
     signal: Option<ConversationSignal>,
+    leader_socket: Option<TempPath>,
 }
 
 impl ConversationTracking {
     pub(crate) fn new(kind: AgentKind, initial_id: Option<String>) -> Result<Self> {
+        if kind == AgentKind::Grok {
+            ensure_grok_conversation_hook()?;
+        }
         Ok(Self {
             kind,
             initial_id,
-            signal: (kind == AgentKind::Claude)
+            signal: kind
+                .preassigns_conversation_id()
                 .then(ConversationSignal::bind)
+                .transpose()?,
+            leader_socket: (kind == AgentKind::Grok)
+                .then(grok_leader_socket)
                 .transpose()?,
         })
     }
@@ -41,6 +49,7 @@ impl ConversationTracking {
             kind,
             initial_id,
             signal: None,
+            leader_socket: None,
         }
     }
 
@@ -48,7 +57,26 @@ impl ConversationTracking {
         if let Some(signal) = &self.signal {
             command.env(crate::CLAUDE_SIGNAL_ENV, signal.path.as_os_str());
         }
+        if let Some(socket) = &self.leader_socket {
+            command.args(["--leader-socket", &socket.0.to_string_lossy()]);
+        }
     }
+}
+
+struct TempPath(PathBuf);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn grok_leader_socket() -> Result<TempPath> {
+    Ok(TempPath(std::env::temp_dir().join(format!(
+        "svarm-grok-leader-{}-{}.sock",
+        std::process::id(),
+        new_uuid()?
+    ))))
 }
 
 struct ConversationSignal {
@@ -101,6 +129,7 @@ pub struct AgentSession {
     terminal: TerminalProcess,
     conversation_id: Arc<Mutex<Option<String>>>,
     conversation_signal: Option<ConversationSignal>,
+    _leader_socket: Option<TempPath>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -123,7 +152,10 @@ impl AgentSession {
         size: PtySize,
         palette: Option<TerminalPalette>,
     ) -> Result<Self> {
-        let conversation_id = (kind == AgentKind::Claude).then(new_uuid).transpose()?;
+        let conversation_id = kind
+            .preassigns_conversation_id()
+            .then(new_uuid)
+            .transpose()?;
         let mut command = agent_command(kind, cwd, conversation_id.as_deref())?;
         let tracking = ConversationTracking::new(kind, conversation_id)?;
         tracking.configure(&mut command);
@@ -143,6 +175,7 @@ impl AgentSession {
             kind,
             initial_id,
             signal,
+            leader_socket,
         } = conversation;
         let notify = notify.map(|notify| Arc::new(move || notify(id)) as _);
         let conversation_id = Arc::new(Mutex::new(initial_id));
@@ -171,6 +204,7 @@ impl AgentSession {
             )?,
             conversation_id,
             conversation_signal: signal,
+            _leader_socket: leader_socket,
         })
     }
 
@@ -271,6 +305,12 @@ pub(crate) fn agent_command(
             }
             command.args(["--settings", &claude_hook_settings()?]);
         }
+        AgentKind::Grok => {
+            if let Some(conversation_id) = conversation_id {
+                command.args(["--session-id", conversation_id]);
+            }
+            command.arg("--fullscreen");
+        }
     }
     Ok(command)
 }
@@ -283,7 +323,7 @@ pub(crate) fn resume_agent_command(
     let mut command = agent_command(kind, cwd, None)?;
     match kind {
         AgentKind::Codex => command.args(["resume", conversation_id]),
-        AgentKind::Claude => command.args(["--resume", conversation_id]),
+        AgentKind::Claude | AgentKind::Grok => command.args(["--resume", conversation_id]),
     }
     Ok(command)
 }
@@ -312,6 +352,51 @@ pub(crate) fn new_uuid() -> Result<String> {
         bytes[14],
         bytes[15]
     ))
+}
+
+fn grok_home() -> Option<PathBuf> {
+    std::env::var_os("GROK_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".grok"))
+        })
+}
+
+fn ensure_grok_conversation_hook() -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let Some(home) = grok_home() else {
+        return Ok(());
+    };
+    write_grok_conversation_hook(&home)
+}
+
+fn write_grok_conversation_hook(home: &Path) -> Result<()> {
+    let directory = home.join("hooks");
+    let path = directory.join("svarm-conversation.json");
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&directory)?;
+    let executable = std::env::current_exe()?;
+    let command = format!(
+        "{} __conversation-hook",
+        shell_quote(&executable.to_string_lossy())
+    );
+    let body = serde_json::json!({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [{ "type": "command", "command": command }]
+            }]
+        }
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&body)?)?;
+    Ok(())
 }
 
 fn claude_hook_settings() -> Result<String> {
@@ -434,6 +519,59 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--resume", id])
         );
+
+        let grok = agent_command(AgentKind::Grok, &cwd, Some(id)).unwrap();
+        let grok_args = grok.get_argv();
+        assert!(
+            grok_args
+                .windows(2)
+                .any(|args| args == ["--session-id", id])
+        );
+        assert!(grok_args.iter().any(|arg| arg == "--fullscreen"));
+        assert!(!grok_args.iter().any(|arg| arg == "--resume"));
+
+        let grok = resume_agent_command(AgentKind::Grok, &cwd, id).unwrap();
+        let grok_args = grok.get_argv();
+        assert!(grok_args.windows(2).any(|args| args == ["--resume", id]));
+        assert!(grok_args.iter().any(|arg| arg == "--fullscreen"));
+        assert!(!grok_args.iter().any(|arg| arg == "--session-id"));
+    }
+
+    #[test]
+    fn grok_isolates_its_leader_socket() {
+        let tracking = ConversationTracking::new(AgentKind::Grok, None).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = agent_command(AgentKind::Grok, &cwd, None).unwrap();
+        tracking.configure(&mut command);
+        let args = command.get_argv();
+        let socket = args
+            .windows(2)
+            .find(|pair| pair[0] == "--leader-socket")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .expect("grok gets a private leader socket");
+        assert!(socket.contains("svarm-grok-leader-"));
+    }
+
+    #[test]
+    fn grok_hook_file_is_written_once_and_left_alone() {
+        let home = std::env::temp_dir().join(format!(
+            "svarm-grok-hooks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_grok_conversation_hook(&home).unwrap();
+        let path = home.join("hooks/svarm-conversation.json");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("SessionStart"));
+        assert!(first.contains("__conversation-hook"));
+        assert!(first.contains("startup|resume|clear|compact"));
+        std::fs::write(&path, "user-owned").unwrap();
+        write_grok_conversation_hook(&home).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user-owned");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

@@ -55,15 +55,17 @@ impl AgentId {
 pub enum AgentKind {
     Codex,
     Claude,
+    Grok,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Grok];
 
     pub const fn command(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Grok => "grok",
         }
     }
 
@@ -71,7 +73,13 @@ impl AgentKind {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Grok => "Grok Build",
         }
+    }
+
+    /// Claude and Grok accept a client-chosen UUID on spawn, so archive/resume can start immediately.
+    pub const fn preassigns_conversation_id(self) -> bool {
+        matches!(self, Self::Claude | Self::Grok)
     }
 }
 
@@ -88,14 +96,30 @@ impl FromStr for AgentKind {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" => Ok(Self::Claude),
-            _ => Err(format!("unsupported agent {value:?}; use codex or claude")),
+            "grok" | "grok-build" => Ok(Self::Grok),
+            _ => Err(format!(
+                "unsupported agent {value:?}; use codex, claude, or grok"
+            )),
         }
     }
 }
 
 pub fn claude_hook_session_id(input: &str) -> Option<String> {
+    if let Some(id) = json_session_id(input) {
+        return Some(id);
+    }
+    std::env::var("GROK_SESSION_ID")
+        .ok()
+        .filter(|id| recognition::looks_like_uuid(id))
+        .map(|id| id.to_ascii_lowercase())
+}
+
+fn json_session_id(input: &str) -> Option<String> {
     let input = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let id = input.get("session_id")?.as_str()?;
+    let id = input
+        .get("session_id")
+        .or_else(|| input.get("sessionId"))
+        .and_then(|value| value.as_str())?;
     recognition::looks_like_uuid(id).then(|| id.to_ascii_lowercase())
 }
 
@@ -118,6 +142,8 @@ mod tests {
     fn recognizes_only_supported_agents() {
         assert_eq!("codex".parse(), Ok(AgentKind::Codex));
         assert_eq!("claude-code".parse(), Ok(AgentKind::Claude));
+        assert_eq!("grok".parse(), Ok(AgentKind::Grok));
+        assert_eq!("grok-build".parse(), Ok(AgentKind::Grok));
         assert!("opencode".parse::<AgentKind>().is_err());
     }
 
@@ -126,6 +152,13 @@ mod tests {
         assert_eq!(
             claude_hook_session_id(
                 r#"{"session_id":"019FF1D3-375E-7A72-A176-C47497827E49","source":"clear"}"#,
+            )
+            .as_deref(),
+            Some("019ff1d3-375e-7a72-a176-c47497827e49")
+        );
+        assert_eq!(
+            claude_hook_session_id(
+                r#"{"sessionId":"019FF1D3-375E-7A72-A176-C47497827E49","hookEventName":"session_start"}"#,
             )
             .as_deref(),
             Some("019ff1d3-375e-7a72-a176-c47497827e49")

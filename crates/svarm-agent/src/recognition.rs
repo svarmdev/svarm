@@ -144,6 +144,32 @@ const CLAUDE_RULES: &[Rule] = &[
     },
 ];
 
+const GROK_RULES: &[Rule] = &[
+    Rule {
+        id: "grok.approval-dialog",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &[],
+        any: &[
+            "allow once",
+            "reject once",
+            "always allow on all sessions",
+            "allow all edits this session",
+            "enable always-approve mode",
+            "always allow this command",
+        ],
+        excluded: &[],
+    },
+    Rule {
+        id: "grok.plan-approval",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &["plan ready for review"],
+        any: &[],
+        excluded: &[],
+    },
+];
+
 pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecognition> {
     if kind != AgentKind::Codex {
         return None;
@@ -269,6 +295,7 @@ pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRec
     let rules = match kind {
         AgentKind::Codex => CODEX_RULES,
         AgentKind::Claude => CLAUDE_RULES,
+        AgentKind::Grok => GROK_RULES,
     };
     for rule in rules {
         if let Some(evidence) = matches(rule, &raw, &normalized) {
@@ -545,6 +572,28 @@ mod tests {
             claude.process(format!("\x1b]777;svarm-conversation={id}\x07").as_bytes()),
             Some(id.into())
         );
+    }
+
+    #[test]
+    fn grok_recognizes_complete_permission_and_plan_prompts() {
+        assert_eq!(
+            claim(AgentKind::Grok, &[b"Allow once\r\nReject once"]),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Grok,
+                &[b"Always allow on all sessions\r\nAllow all edits this session"]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(AgentKind::Grok, &[b"Plan ready for review"]),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(claim(AgentKind::Grok, &[b"Allow onc"]), None);
+        assert_eq!(claim(AgentKind::Grok, &[b"esc to interrupt"]), None);
+        assert_eq!(claim(AgentKind::Grok, &["❯ ".as_bytes()]), None);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! The first message a user submits is kept as an immediate provisional name. This module asks the
 //! same coding agent the session runs — `claude -p` for a Claude session, `codex exec` for a Codex
-//! one — for a shorter name, off the critical path, and hands the result back through a channel.
+//! one, `grok -p` for a Grok Build session — for a shorter name, off the critical path, and hands
+//! the result back through a channel.
 //! Recognition of a usable name is pure and independently testable; only [`TitleNamer`] touches
 //! processes and threads.
 
@@ -42,12 +43,15 @@ const SCRUBBED_ENV: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
     crate::CLAUDE_SIGNAL_ENV,
+    "GROK_SESSION_ID",
+    "GROK_HOME",
 ];
 
 const fn default_model(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Claude => "haiku",
         AgentKind::Codex => "gpt-5.4-mini",
+        AgentKind::Grok => "grok-4.6",
     }
 }
 
@@ -204,6 +208,8 @@ impl GeneratorRequest {
                     command,
                     stdin: None,
                     answer_file: None,
+                    cleanup_dir: None,
+                    json_text: false,
                 }
             }
         };
@@ -219,6 +225,8 @@ struct GeneratorInvocation {
     command: Command,
     stdin: Option<String>,
     answer_file: Option<PathBuf>,
+    cleanup_dir: Option<PathBuf>,
+    json_text: bool,
 }
 
 impl GeneratorInvocation {
@@ -227,20 +235,42 @@ impl GeneratorInvocation {
             command,
             stdin,
             answer_file,
+            cleanup_dir,
+            json_text,
         } = self;
         let stdout = run_generator(command, stdin.as_deref());
-        let Some(path) = answer_file else {
-            return stdout;
+        let output = if let Some(path) = answer_file {
+            let answer = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+            stdout.and(answer)
+        } else if json_text {
+            stdout.and_then(|text| grok_answer_text(&text))
+        } else {
+            stdout
         };
-        let answer = std::fs::read_to_string(&path).ok();
-        let _ = std::fs::remove_file(&path);
-        stdout.and(answer)
+        if let Some(directory) = cleanup_dir {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        output
     }
+}
+
+fn grok_answer_text(stdout: &str) -> Option<String> {
+    if let Some(text) = json_text_field(stdout.trim()) {
+        return Some(text);
+    }
+    stdout.lines().rev().find_map(json_text_field)
+}
+
+fn json_text_field(value: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| value.get("text")?.as_str().map(str::to_owned))
 }
 
 /// The command that generates a name.
 ///
-/// Both providers are started without their user customizations: it makes them start faster, and it
+/// Providers are started without their user customizations: it makes them start faster, and it
 /// keeps this call from re-entering the hooks and settings svarm installs for managed agents.
 fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvocation {
     let mut command = Command::new(kind.command());
@@ -264,6 +294,45 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 command,
                 stdin: Some(user_message(log)),
                 answer_file: None,
+                cleanup_dir: None,
+                json_text: false,
+            }
+        }
+        AgentKind::Grok => {
+            let home = isolated_grok_home();
+            command.args([
+                "-p",
+                &user_message(log),
+                "--model",
+                model,
+                "--reasoning-effort",
+                "low",
+                "--system-prompt-override",
+                SYSTEM_PROMPT,
+                "--output-format",
+                "json",
+                "--tools",
+                "",
+                "--no-subagents",
+                "--no-plan",
+                "--no-memory",
+                "--disable-web-search",
+                "--max-turns",
+                "1",
+                "--permission-mode",
+                "dontAsk",
+                "--no-auto-update",
+            ]);
+            prepare_generator_environment(&mut command);
+            if let Some(home) = &home {
+                command.env("GROK_HOME", home);
+            }
+            GeneratorInvocation {
+                command,
+                stdin: None,
+                answer_file: None,
+                cleanup_dir: home,
+                json_text: true,
             }
         }
         AgentKind::Codex => {
@@ -294,9 +363,30 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 command,
                 stdin: None,
                 answer_file: Some(answer_file),
+                cleanup_dir: None,
+                json_text: false,
             }
         }
     }
+}
+
+fn isolated_grok_home() -> Option<PathBuf> {
+    let source = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".grok"))?;
+    let destination = std::env::temp_dir().join(format!(
+        "svarm-grok-title-{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    ));
+    std::fs::create_dir_all(&destination).ok()?;
+    for name in ["auth.json", "config.toml"] {
+        let from = source.join(name);
+        if from.exists() {
+            let _ = std::fs::copy(&from, destination.join(name));
+        }
+    }
+    Some(destination)
 }
 
 fn answer_file_path() -> PathBuf {
@@ -579,6 +669,55 @@ mod tests {
         assert!(codex_args.windows(2).any(|pair| {
             pair[0] == "--output-last-message" && pair[1] == answer_file.to_string_lossy()
         }));
+
+        let grok = generator_command(AgentKind::Grok, "grok-4.6", "1. do a thing");
+        let grok_args = grok
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(grok.command.get_program(), AgentKind::Grok.command());
+        assert!(grok_args.contains(&"-p".to_owned()));
+        assert!(
+            grok_args
+                .windows(2)
+                .any(|pair| pair == ["--model", "grok-4.6"])
+        );
+        assert!(
+            grok_args
+                .windows(2)
+                .any(|pair| pair == ["--reasoning-effort", "low"])
+        );
+        assert!(
+            grok_args
+                .windows(2)
+                .any(|pair| pair == ["--output-format", "json"])
+        );
+        assert!(grok_args.contains(&"--no-auto-update".to_owned()));
+        assert!(grok.json_text);
+        assert_eq!(grok.stdin, None);
+        let grok_home = grok
+            .command
+            .get_envs()
+            .find(|(key, _)| *key == "GROK_HOME")
+            .and_then(|(_, value)| value.map(|value| value.to_os_string()));
+        assert!(grok_home.is_some(), "namer must isolate GROK_HOME");
+        if let Some(directory) = grok.cleanup_dir {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn grok_names_are_taken_from_json_text() {
+        assert_eq!(
+            grok_answer_text(r#"{"text":"Sidebar truncation fix","sessionId":"abc"}"#).as_deref(),
+            Some("Sidebar truncation fix")
+        );
+        assert_eq!(
+            grok_answer_text("noise\n{\"text\":\"Archive modal rework\"}\n"),
+            Some("Archive modal rework".into())
+        );
+        assert_eq!(grok_answer_text("not json"), None);
     }
 
     #[test]
