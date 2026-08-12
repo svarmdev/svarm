@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use svarm_agent::vt100::Screen;
+use svarm_agent::terminal_model::TerminalSnapshot;
 
 use crate::{
     app::{AgentDisplayStatus, App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
@@ -50,7 +50,7 @@ impl ModalSize {
 #[derive(Clone, Copy)]
 pub(crate) struct UiModel<'a> {
     pub app: &'a App,
-    pub screen: Option<&'a Screen>,
+    pub screen: Option<&'a TerminalSnapshot>,
     pub scrolled: bool,
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
@@ -522,7 +522,7 @@ fn render_menu(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
 
 fn render_terminal(
     frame: &mut Frame<'_>,
-    screen: Option<&Screen>,
+    screen: Option<&TerminalSnapshot>,
     scrolled: bool,
     mode: Mode,
     area: Rect,
@@ -778,7 +778,7 @@ fn render_embedded_browser(
     );
     let content = embedded_terminal_area(frame.area());
     if let Some(snapshot) = snapshot {
-        let terminal = TerminalScreen::new(&snapshot.screen);
+        let terminal = TerminalScreen::new(&snapshot.terminal);
         if let Some(position) = terminal.cursor_position(content) {
             frame.set_cursor_position(position);
         }
@@ -965,8 +965,21 @@ mod tests {
         AgentActivity, AgentSnapshot, AttachmentSummary, ConnectionId, GitContext, SessionId,
         SessionRevision, SessionSummary, SvarmSessionSnapshot, TerminalSequence,
     };
+    use svarm_agent::terminal_model::{TerminalPosition, TerminalSize};
 
     use super::*;
+
+    fn terminal_snapshot(rows: u16, cols: u16, text: &str) -> TerminalSnapshot {
+        let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(rows, cols));
+        for (column, character) in text.chars().enumerate() {
+            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+        }
+        snapshot.state.cursor.position = TerminalPosition {
+            row: 0,
+            column: text.chars().count() as u16,
+        };
+        snapshot
+    }
 
     #[test]
     fn terminal_area_only_reserves_the_sidebar() {
@@ -1415,8 +1428,7 @@ mod tests {
 
     #[test]
     fn the_agent_cursor_is_the_host_terminal_cursor_not_a_painted_cell() {
-        let mut parser = svarm_agent::vt100::Parser::new(24, 55, 0);
-        parser.process(b"prompt> ");
+        let screen = terminal_snapshot(24, 55, "prompt> ");
         let mut app = App::new(
             "workspace".into(),
             crate::theme::ThemeName::Dark,
@@ -1432,7 +1444,7 @@ mod tests {
                     frame,
                     UiModel {
                         app: &app,
-                        screen: Some(parser.screen()),
+                        screen: Some(&screen),
                         scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(true),
@@ -1456,15 +1468,14 @@ mod tests {
 
     #[test]
     fn scrollback_does_not_overlay_a_position_label() {
-        let mut parser = svarm_agent::vt100::Parser::new(24, 80, 0);
-        parser.process(b"terminal output");
+        let screen = terminal_snapshot(24, 80, "terminal output");
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         terminal
             .draw(|frame| {
                 render_terminal(
                     frame,
-                    Some(parser.screen()),
+                    Some(&screen),
                     true,
                     Mode::Terminal,
                     frame.area(),
@@ -1486,8 +1497,8 @@ mod tests {
 
     #[test]
     fn a_hidden_agent_cursor_leaves_the_host_cursor_hidden() {
-        let mut parser = svarm_agent::vt100::Parser::new(24, 55, 0);
-        parser.process(b"working\x1b[?25l");
+        let mut screen = terminal_snapshot(24, 55, "working");
+        screen.state.cursor.visible = false;
         let mut app = App::new(
             "workspace".into(),
             crate::theme::ThemeName::Dark,
@@ -1503,7 +1514,7 @@ mod tests {
                     frame,
                     UiModel {
                         app: &app,
-                        screen: Some(parser.screen()),
+                        screen: Some(&screen),
                         scrolled: false,
                         embedded: None,
                         theme: app.theme().theme(true),
@@ -1518,11 +1529,10 @@ mod tests {
 
     #[test]
     fn embedded_terminal_uses_prepared_screen_area_and_cursor_at_80x24() {
-        let mut parser = svarm_agent::vt100::Parser::new(18, 74, 0);
-        parser.process(b"yazi> ");
+        let mut terminal = terminal_snapshot(18, 74, "yazi> ");
+        terminal.state.cursor.style = svarm_agent::CursorStyle::SteadyBar;
         let snapshot = TerminalProcessSnapshot {
-            screen: parser.screen().clone(),
-            cursor_style: svarm_agent::CursorStyle::SteadyBar,
+            terminal,
             status: SessionStatus::Running,
             exit: None,
             read_error: None,

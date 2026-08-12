@@ -2,12 +2,6 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-mod base64;
-
-/// The terminal emulator behind every agent screen, re-exported so the interface parses and
-/// renders exactly the state the agent side produced.
-pub use vt100;
-
 pub mod framing;
 mod git;
 pub mod input;
@@ -25,6 +19,8 @@ pub mod server;
 pub mod server_session;
 mod session;
 mod terminal;
+mod terminal_backend;
+pub mod terminal_model;
 mod terminal_process;
 
 pub use manager::{AgentManager, pty_size};

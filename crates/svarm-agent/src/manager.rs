@@ -11,7 +11,7 @@ use portable_pty::PtySize;
 
 use crate::{
     AgentId, AgentKind, AgentSession, Result, SessionSnapshot, SessionStatus, TerminalPalette,
-    session::OutputNotifier,
+    session::OutputNotifier, terminal_model::TerminalSnapshot,
 };
 
 pub struct AgentManager {
@@ -92,24 +92,24 @@ impl AgentManager {
         Ok(())
     }
 
-    pub fn with_screen<T>(&self, id: AgentId, read: impl FnOnce(&vt100::Screen) -> T) -> Option<T> {
-        self.sessions
-            .get(&id)
-            .map(|session| session.with_screen(read))
-    }
-
-    pub fn formatted_viewport(
+    pub fn with_terminal<T>(
         &self,
         id: AgentId,
-        requested: usize,
-    ) -> Option<(u16, u16, usize, Vec<u8>)> {
+        read: impl FnOnce(&TerminalSnapshot) -> T,
+    ) -> Option<T> {
         self.sessions
             .get(&id)
-            .map(|session| session.formatted_viewport(requested))
+            .map(|session| session.with_terminal(read))
     }
 
-    pub fn cursor_style(&self, id: AgentId) -> Option<crate::CursorStyle> {
-        self.sessions.get(&id).map(AgentSession::cursor_style)
+    pub fn terminal_snapshot(&self, id: AgentId) -> Option<TerminalSnapshot> {
+        self.sessions.get(&id).map(AgentSession::terminal_snapshot)
+    }
+
+    pub fn viewport(&self, id: AgentId, requested: usize) -> Option<TerminalSnapshot> {
+        self.sessions
+            .get(&id)
+            .map(|session| session.viewport(requested))
     }
 
     pub fn terminal_modes(&self, id: AgentId) -> Option<crate::protocol::TerminalModes> {

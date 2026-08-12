@@ -2,9 +2,14 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, AgentKind, CursorStyle, ProcessExit, SessionStatus, TerminalPalette};
+use crate::{
+    AgentId, AgentKind, ProcessExit, SessionStatus, TerminalPalette,
+    terminal_model::{TerminalSnapshot, TerminalSnapshotDiff},
+};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
+
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -383,77 +388,29 @@ pub struct SvarmSessionSnapshot {
     pub agents: Vec<AgentSnapshot>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TerminalModes {
-    pub application_cursor: bool,
-    pub application_keypad: bool,
-    pub bracketed_paste: bool,
-    /// The child requested xterm alternate-scroll mode (DEC private mode 1007).
-    #[serde(default)]
-    pub mouse_alternate_scroll: bool,
-    /// The agent enabled the kitty keyboard protocol's "disambiguate escape codes" mode, so keys
-    /// the legacy encoding cannot express are reported as `CSI ... u` instead.
-    pub keyboard_disambiguate: bool,
-    pub mouse_protocol: MouseProtocol,
-    pub mouse_encoding: MouseEncoding,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseProtocol {
-    #[default]
-    None,
-    Press,
-    PressRelease,
-    ButtonMotion,
-    AnyMotion,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseEncoding {
-    #[default]
-    Default,
-    Utf8,
-    Sgr,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalFull {
     pub agent_id: AgentId,
-    pub rows: u16,
-    pub cols: u16,
     pub output_generation: u64,
     pub sequence: TerminalSequence,
-    #[serde(with = "crate::base64")]
-    pub formatted_screen: Vec<u8>,
-    pub modes: TerminalModes,
-    pub cursor_style: CursorStyle,
+    pub snapshot: TerminalSnapshot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalDiff {
     pub agent_id: AgentId,
-    pub rows: u16,
-    pub cols: u16,
     pub output_generation: u64,
     pub base_sequence: TerminalSequence,
     pub sequence: TerminalSequence,
-    #[serde(with = "crate::base64")]
-    pub formatted_changes: Vec<u8>,
-    pub modes: TerminalModes,
-    pub cursor_style: CursorStyle,
+    pub diff: TerminalSnapshotDiff,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TerminalViewport {
     pub agent_id: AgentId,
-    pub rows: u16,
-    pub cols: u16,
     pub requested_scrollback: usize,
     pub scrollback: usize,
-    #[serde(with = "crate::base64")]
-    pub formatted_screen: Vec<u8>,
+    pub snapshot: TerminalSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,10 +581,12 @@ impl ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use crate::terminal_model::TerminalSize;
+
     use super::*;
 
     #[test]
-    fn protocol_five_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_six_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -646,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_five_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_six_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,
@@ -724,5 +683,24 @@ mod tests {
             FrameDisposition::Apply
         );
         assert_eq!(tracker.sequence(), Some(TerminalSequence(3)));
+    }
+
+    #[test]
+    fn terminal_frames_serialize_semantics_without_backend_vt_streams() {
+        let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(1, 2));
+        snapshot.cells[0].contents = "λ".into();
+        let json = serde_json::to_string(&Event::TerminalFull(TerminalFull {
+            agent_id: AgentId::new(7),
+            output_generation: 3,
+            sequence: TerminalSequence(9),
+            snapshot,
+        }))
+        .unwrap();
+
+        assert!(json.contains("\"snapshot\""));
+        assert!(json.contains("\"contents\":\"λ\""));
+        assert!(!json.contains("formatted_screen"));
+        assert!(!json.contains("formatted_changes"));
+        assert!(!json.contains("\\u001b"));
     }
 }

@@ -13,10 +13,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use vt100::Parser;
-#[cfg(test)]
-use vt100::Screen;
-
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
     framing::{read_frame, write_frame},
@@ -33,6 +29,7 @@ use crate::{
     pty_size,
     recognition::{self, ScreenRecognition},
     server_session::{ServerSessionState, sort_session_summaries},
+    terminal_model::{TerminalSnapshot, TerminalSnapshotDiff},
 };
 
 const EVENT_TICK: Duration = Duration::from_millis(16);
@@ -395,14 +392,14 @@ impl InputDraft {
 struct FrameBasis {
     sequence: TerminalSequence,
     acknowledged: Option<TerminalSequence>,
-    parser: Parser,
+    snapshot: TerminalSnapshot,
 }
 
 enum FramePayload {
-    Full(Vec<u8>),
+    Full(TerminalSnapshot),
     Diff {
         base_sequence: TerminalSequence,
-        bytes: Vec<u8>,
+        diff: TerminalSnapshotDiff,
     },
 }
 
@@ -522,9 +519,9 @@ impl SessionRuntime {
         force_git: bool,
     ) -> ObservedAgent {
         let previous = self.previous.get(&session.id).cloned();
-        let screen = self.agents.with_screen(session.id, |screen| {
+        let screen = self.agents.with_terminal(session.id, |screen| {
             (
-                screen.title().trim().to_owned(),
+                screen.state.title.trim().to_owned(),
                 recognition::recognize(session.kind, screen),
             )
         });
@@ -611,63 +608,40 @@ impl SessionRuntime {
     }
 
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
-        let snapshot = self.agents.snapshot(id)?;
-        let modes = self.agents.terminal_modes(id)?;
+        let agent = self.agents.snapshot(id)?;
+        let terminal = self.agents.terminal_snapshot(id)?;
         let old_basis = self.frame_bases.remove(&id);
         let previous = old_basis.as_ref().filter(|_| !force_full);
-        // The basis parser deliberately has no scrollback. Updating it with the bytes already
-        // headed to the client avoids cloning the authoritative terminal's retained history on
-        // every frame.
-        let (payload, rows, cols) = self.agents.with_screen(id, |screen| {
-            let previous = previous.filter(|basis| basis.parser.screen().size() == screen.size());
-            let payload = match previous {
-                Some(basis) => FramePayload::Diff {
-                    base_sequence: basis.sequence,
-                    bytes: screen.state_diff(basis.parser.screen()),
-                },
-                None => FramePayload::Full(screen.state_formatted()),
-            };
-            let (rows, cols) = screen.size();
-            (payload, rows, cols)
-        })?;
+        let payload = previous
+            .and_then(|basis| {
+                basis
+                    .snapshot
+                    .diff(&terminal)
+                    .map(|diff| FramePayload::Diff {
+                        base_sequence: basis.sequence,
+                        diff,
+                    })
+            })
+            .unwrap_or_else(|| FramePayload::Full(terminal.clone()));
 
         let acknowledged = old_basis.as_ref().and_then(|basis| basis.acknowledged);
-        let mut basis_parser = match (&payload, old_basis) {
-            (FramePayload::Diff { .. }, Some(basis)) => basis.parser,
-            _ => Parser::new(rows, cols, 0),
-        };
-        match &payload {
-            FramePayload::Full(bytes) | FramePayload::Diff { bytes, .. } => {
-                basis_parser.process(bytes)
-            }
-        }
-
-        let cursor_style = self.agents.cursor_style(id).unwrap_or_default();
         let sequence = self.state.next_terminal_sequence(id).ok()?;
         let event = match payload {
-            FramePayload::Full(formatted_screen) => Event::TerminalFull(TerminalFull {
+            FramePayload::Full(snapshot) => Event::TerminalFull(TerminalFull {
                 agent_id: id,
-                rows,
-                cols,
-                output_generation: snapshot.output_generation,
+                output_generation: agent.output_generation,
                 sequence,
-                formatted_screen,
-                modes,
-                cursor_style,
+                snapshot,
             }),
             FramePayload::Diff {
                 base_sequence,
-                bytes,
+                diff,
             } => Event::TerminalDiff(TerminalDiff {
                 agent_id: id,
-                rows,
-                cols,
-                output_generation: snapshot.output_generation,
+                output_generation: agent.output_generation,
                 base_sequence,
                 sequence,
-                formatted_changes: bytes,
-                modes,
-                cursor_style,
+                diff,
             }),
         };
         self.frame_bases.insert(
@@ -675,22 +649,20 @@ impl SessionRuntime {
             FrameBasis {
                 sequence,
                 acknowledged,
-                parser: basis_parser,
+                snapshot: terminal,
             },
         );
         Some(event)
     }
 
     fn terminal_viewport(&self, id: AgentId, requested: usize) -> Option<Event> {
-        let (rows, cols, scrollback, formatted_screen) =
-            self.agents.formatted_viewport(id, requested)?;
+        let snapshot = self.agents.viewport(id, requested)?;
+        let scrollback = snapshot.state.scrollback.position;
         Some(Event::TerminalViewport(TerminalViewport {
             agent_id: id,
-            rows,
-            cols,
             requested_scrollback: requested,
             scrollback,
-            formatted_screen,
+            snapshot,
         }))
     }
 
@@ -1776,8 +1748,9 @@ mod tests {
     use crate::{
         CursorStyle,
         protocol::{Hello, HostTerminalCapabilities, PROTOCOL_VERSION, TerminalDiff, TerminalFull},
+        terminal_backend::Vt100Backend,
+        terminal_model::{TerminalBackend, TerminalSize},
     };
-    use vt100::Parser;
 
     struct Client {
         stream: UnixStream,
@@ -1994,7 +1967,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         while runtime
             .agents
-            .with_screen(snapshot.id, |screen| screen.scrollback_filled())
+            .with_terminal(snapshot.id, |screen| screen.state.scrollback.retained_rows)
             .unwrap_or(0)
             == 0
             && Instant::now() < deadline
@@ -2004,11 +1977,8 @@ mod tests {
 
         runtime.terminal_event(snapshot.id, true).unwrap();
         assert_eq!(
-            runtime.frame_bases[&snapshot.id]
-                .parser
-                .screen()
-                .scrollback_len(),
-            0
+            runtime.frame_bases[&snapshot.id].snapshot.cells.len(),
+            5 * 30
         );
         let Event::TerminalViewport(viewport) =
             runtime.terminal_viewport(snapshot.id, usize::MAX).unwrap()
@@ -2016,9 +1986,7 @@ mod tests {
             panic!("expected terminal viewport");
         };
         assert!(viewport.scrollback > 0);
-        let mut parser = Parser::new(viewport.rows, viewport.cols, 0);
-        parser.process(&viewport.formatted_screen);
-        assert!(parser.screen().contents().contains("line-01"));
+        assert!(viewport.snapshot.contents().contains("line-01"));
 
         runtime.agents.stop_all();
     }
@@ -2260,10 +2228,7 @@ mod tests {
             kind: AgentKind::Codex,
             launch_directory: directory.clone(),
         });
-        let first = client.event_until(|event| {
-            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"before"))
-                || matches!(event, Event::TerminalDiff(frame) if contains(&frame.formatted_changes, b"before"))
-        });
+        let first = client.event_until(|event| terminal_event_contains(event, "before"));
         assert!(matches!(
             first,
             Event::TerminalFull(_) | Event::TerminalDiff(_)
@@ -2284,10 +2249,7 @@ mod tests {
             Response::Attached { lease_token, .. } => lease_token,
             other => panic!("unexpected attach response: {other:?}"),
         };
-        let _ = reattached.event_until(|event| {
-            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"after"))
-                || matches!(event, Event::TerminalDiff(frame) if contains(&frame.formatted_changes, b"after"))
-        });
+        let _ = reattached.event_until(|event| terminal_event_contains(event, "after"));
         let _ = reattached.request(Request::StopAttachedSession { lease_token });
         drop(reattached);
 
@@ -2466,7 +2428,9 @@ mod tests {
         let full = old.event_until(
             |event| matches!(event, Event::TerminalFull(frame) if frame.agent_id == agent_id),
         );
-        assert!(matches!(full, Event::TerminalFull(frame) if (frame.rows, frame.cols) == (10, 40)));
+        assert!(
+            matches!(full, Event::TerminalFull(frame) if frame.snapshot.size() == TerminalSize::new(10, 40))
+        );
         drop(inspector);
         drop(conflict);
 
@@ -2544,9 +2508,7 @@ mod tests {
         assert!(
             matches!(snapshot, Event::SvarmSessionSnapshot(snapshot) if snapshot.agents[0].exit.is_some())
         );
-        let _ = reattached.event_until(|event| {
-            matches!(event, Event::TerminalFull(frame) if contains(&frame.formatted_screen, b"finished"))
-        });
+        let _ = reattached.event_until(|event| terminal_event_contains(event, "finished"));
         let _ = reattached.request(Request::StopAttachedSession { lease_token });
         drop(reattached);
 
@@ -2559,23 +2521,18 @@ mod tests {
 
     #[test]
     fn full_and_diff_frames_reconstruct_screen_cursor_and_input_modes() {
-        let mut authoritative = Parser::new(5, 30, 100);
-        authoritative
+        let mut backend = Vt100Backend::new(TerminalSize::new(5, 30), 100);
+        backend
             .process(b"\x1b[?2004h\x1b[?1000h\x1b[31mprimary\x1b[?1049h\x1b[2J\x1b[32malternate");
-        let full = authoritative.screen().state_formatted();
-        let mut client = Parser::new(5, 30, 100);
-        for byte in full {
-            client.process(&[byte]);
-        }
-        assert_screens_match(authoritative.screen(), client.screen());
+        let full = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let mut client = full.clone();
+        assert_eq!(client, full);
 
-        let previous = authoritative.screen().clone();
-        authoritative.process(b"\x1b[?1049l\x1b[2;3H\x1b[34msecond\x1b[?1000l\x1b[?1003h");
-        let diff = authoritative.screen().state_diff(&previous);
-        for byte in diff {
-            client.process(&[byte]);
-        }
-        assert_screens_match(authoritative.screen(), client.screen());
+        backend.process(b"\x1b[?1049l\x1b[2;3H\x1b[34msecond\x1b[?1000l\x1b[?1003h");
+        let next = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let diff = full.diff(&next).unwrap();
+        client.apply(&diff).unwrap();
+        assert_eq!(client, next);
     }
 
     #[test]
@@ -2605,45 +2562,40 @@ mod tests {
         assert_eq!(queue.len(), 1);
     }
 
-    fn assert_screens_match(expected: &Screen, actual: &Screen) {
-        assert_eq!(actual.size(), expected.size());
-        assert_eq!(actual.contents(), expected.contents());
-        assert_eq!(actual.state_formatted(), expected.state_formatted());
-        assert_eq!(actual.cursor_position(), expected.cursor_position());
-        assert_eq!(actual.application_cursor(), expected.application_cursor());
-        assert_eq!(actual.application_keypad(), expected.application_keypad());
-        assert_eq!(actual.bracketed_paste(), expected.bracketed_paste());
-        assert_eq!(actual.mouse_protocol_mode(), expected.mouse_protocol_mode());
-        assert_eq!(
-            actual.mouse_protocol_encoding(),
-            expected.mouse_protocol_encoding()
-        );
+    fn terminal_event_contains(event: &Event, needle: &str) -> bool {
+        match event {
+            Event::TerminalFull(frame) => frame.snapshot.contents().contains(needle),
+            Event::TerminalDiff(frame) => frame
+                .diff
+                .cells
+                .iter()
+                .map(|patch| patch.cell.contents.as_str())
+                .collect::<String>()
+                .contains(needle),
+            _ => false,
+        }
     }
 
     fn terminal_envelope(full: bool, sequence: u64) -> Envelope {
         let sequence = TerminalSequence(sequence);
+        let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(1, 1));
+        snapshot.cells[0].contents = "x".into();
         let message = if full {
             Message::Event(Event::TerminalFull(TerminalFull {
                 agent_id: AgentId::new(1),
-                rows: 1,
-                cols: 1,
                 output_generation: sequence.0,
                 sequence,
-                formatted_screen: vec![b'x'],
-                modes: TerminalModes::default(),
-                cursor_style: CursorStyle::default(),
+                snapshot,
             }))
         } else {
+            let blank = TerminalSnapshot::blank(TerminalSize::new(1, 1));
+            let diff = blank.diff(&snapshot).unwrap();
             Message::Event(Event::TerminalDiff(TerminalDiff {
                 agent_id: AgentId::new(1),
-                rows: 1,
-                cols: 1,
                 output_generation: sequence.0,
                 base_sequence: TerminalSequence(sequence.0.saturating_sub(1)),
                 sequence,
-                formatted_changes: vec![b'x'],
-                modes: TerminalModes::default(),
-                cursor_style: CursorStyle::default(),
+                diff,
             }))
         };
         Envelope {
@@ -2651,11 +2603,5 @@ mod tests {
             request_id: None,
             message,
         }
-    }
-
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
     }
 }

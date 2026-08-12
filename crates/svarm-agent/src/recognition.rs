@@ -1,8 +1,7 @@
-use vt100::Screen;
-
 use crate::{
     AgentKind,
     protocol::{AgentActivity, RecognitionEvidence},
+    terminal_model::TerminalSnapshot,
 };
 
 const STATUS_ROWS: usize = 5;
@@ -148,9 +147,8 @@ fn looks_like_uuid(value: &str) -> bool {
         })
 }
 
-pub(crate) fn recognize(kind: AgentKind, screen: &Screen) -> ScreenRecognition {
-    let (_, cols) = screen.size();
-    let raw = screen.rows(0, cols).collect::<Vec<_>>();
+pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRecognition {
+    let raw = screen.rows().collect::<Vec<_>>();
     let normalized = raw.iter().map(|row| normalize(row)).collect::<Vec<_>>();
 
     if is_history_overlay(&normalized) {
@@ -233,22 +231,28 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        CursorStyle,
+        terminal_backend::Vt100Backend,
+        terminal_model::{TerminalBackend, TerminalSize},
+    };
 
-    fn screen(chunks: &[&[u8]]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(24, 80, 0);
+    fn screen(chunks: &[&[u8]]) -> TerminalSnapshot {
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
         for chunk in chunks {
-            parser.process(chunk);
+            backend.process(chunk);
         }
-        parser
+        backend.snapshot(CursorStyle::default(), backend.modes(false, false))
     }
 
     fn claim(kind: AgentKind, chunks: &[&[u8]]) -> Option<AgentActivity> {
-        let mut parser = vt100::Parser::new(24, 80, 0);
-        parser.process(b"\x1b[20;1H");
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process(b"\x1b[20;1H");
         for chunk in chunks {
-            parser.process(chunk);
+            backend.process(chunk);
         }
-        match recognize(kind, parser.screen()) {
+        let snapshot = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        match recognize(kind, &snapshot) {
             ScreenRecognition::Recognized(evidence) => Some(evidence.claim),
             ScreenRecognition::Preserve | ScreenRecognition::Unknown => None,
         }
@@ -340,7 +344,7 @@ mod tests {
             "❯ ".as_bytes(),
         ]);
         assert!(matches!(
-            recognize(AgentKind::Claude, parser.screen()),
+            recognize(AgentKind::Claude, &parser),
             ScreenRecognition::Recognized(RecognitionEvidence {
                 claim: AgentActivity::Idle,
                 ..
@@ -352,7 +356,7 @@ mod tests {
     fn transcript_overlay_preserves_the_previous_state() {
         let parser = screen(&[b"Transcript\x1b[24;1HEsc to close"]);
         assert!(matches!(
-            recognize(AgentKind::Codex, parser.screen()),
+            recognize(AgentKind::Codex, &parser),
             ScreenRecognition::Preserve
         ));
     }

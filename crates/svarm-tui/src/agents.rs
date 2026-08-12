@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use svarm_agent::vt100::{Parser, Screen};
 use svarm_agent::{
     AgentId, AgentKind, CursorStyle, Result, TerminalPalette,
     framing::{read_frame, write_frame},
@@ -16,14 +15,12 @@ use svarm_agent::{
         ConnectionRole, Envelope, Event, FrameDisposition, Hello, HostTerminalCapabilities,
         KeyInput, LeaseToken, Message, MouseInput, MouseProtocol, PROTOCOL_VERSION, ProtocolRange,
         Request, RequestId, Response, SessionId, StopSummary, SvarmSessionSnapshot,
-        TerminalFrameTracker, TerminalModes, TerminalSequence, TerminalViewport,
+        TerminalFrameTracker, TerminalSequence, TerminalViewport,
     },
+    terminal_model::TerminalSnapshot,
 };
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
-/// Live frames carry only the visible grid. Historical viewports arrive separately on demand.
-const SCROLLBACK_ROWS: usize = 0;
-
 #[derive(Clone, Debug)]
 pub enum InitialSession {
     Create,
@@ -61,16 +58,14 @@ pub(crate) enum ClientEvent {
 }
 
 struct CachedTerminal {
-    parser: Parser,
+    snapshot: TerminalSnapshot,
     tracker: TerminalFrameTracker,
-    cursor_style: CursorStyle,
-    modes: TerminalModes,
     scrollback: Option<ScrollbackView>,
     scrollback_request: Option<usize>,
 }
 
 struct ScrollbackView {
-    parser: Parser,
+    snapshot: TerminalSnapshot,
     offset: usize,
 }
 
@@ -279,15 +274,15 @@ impl RemoteAgents {
     pub fn cursor_style(&self, id: AgentId) -> Option<CursorStyle> {
         self.terminals
             .get(&id)
-            .map(|terminal| terminal.cursor_style)
+            .map(|terminal| terminal.snapshot.state.cursor.style)
     }
 
-    pub fn screen(&self, id: AgentId) -> Option<&Screen> {
+    pub fn screen(&self, id: AgentId) -> Option<&TerminalSnapshot> {
         self.terminals.get(&id).map(|terminal| {
             terminal
                 .scrollback
                 .as_ref()
-                .map_or_else(|| terminal.parser.screen(), |view| view.parser.screen())
+                .map_or(&terminal.snapshot, |view| &view.snapshot)
         })
     }
 
@@ -301,10 +296,10 @@ impl RemoteAgents {
         let Some(terminal) = self.terminals.get(&id) else {
             return WheelRouting::ChildMouse;
         };
-        if terminal.modes.mouse_protocol != MouseProtocol::None {
+        if terminal.snapshot.state.modes.mouse_protocol != MouseProtocol::None {
             WheelRouting::ChildMouse
-        } else if terminal.parser.screen().alternate_screen()
-            && terminal.modes.mouse_alternate_scroll
+        } else if terminal.snapshot.state.alternate_screen
+            && terminal.snapshot.state.modes.mouse_alternate_scroll
         {
             WheelRouting::AlternateScreen
         } else {
@@ -461,23 +456,21 @@ impl RemoteAgents {
     }
 
     fn apply_full(&mut self, frame: svarm_agent::protocol::TerminalFull) -> FrameDisposition {
+        if frame.snapshot.validate().is_err() {
+            return FrameDisposition::Gap;
+        }
         let terminal = self
             .terminals
             .entry(frame.agent_id)
             .or_insert_with(|| CachedTerminal {
-                parser: Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS),
+                snapshot: frame.snapshot.clone(),
                 tracker: TerminalFrameTracker::default(),
-                cursor_style: CursorStyle::default(),
-                modes: TerminalModes::default(),
                 scrollback: None,
                 scrollback_request: None,
             });
         let disposition = terminal.tracker.accept_full(frame.sequence);
         if disposition == FrameDisposition::Apply {
-            terminal.parser = Parser::new(frame.rows, frame.cols, SCROLLBACK_ROWS);
-            terminal.parser.process(&frame.formatted_screen);
-            terminal.cursor_style = frame.cursor_style;
-            terminal.modes = frame.modes;
+            terminal.snapshot = frame.snapshot;
             terminal.scrollback = None;
             terminal.scrollback_request = None;
             self.pending_resync.remove(&frame.agent_id);
@@ -489,16 +482,18 @@ impl RemoteAgents {
         let Some(terminal) = self.terminals.get_mut(&frame.agent_id) else {
             return FrameDisposition::Gap;
         };
-        if terminal.parser.screen().size() != (frame.rows, frame.cols) {
-            return FrameDisposition::Gap;
-        }
+        let snapshot = match terminal.snapshot.applied(&frame.diff) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                terminal.tracker.reset();
+                return FrameDisposition::Gap;
+            }
+        };
         let disposition = terminal
             .tracker
             .accept_diff(frame.base_sequence, frame.sequence);
         if disposition == FrameDisposition::Apply {
-            terminal.parser.process(&frame.formatted_changes);
-            terminal.cursor_style = frame.cursor_style;
-            terminal.modes = frame.modes;
+            terminal.snapshot = snapshot;
         }
         disposition
     }
@@ -515,10 +510,11 @@ impl RemoteAgents {
             terminal.scrollback_request = None;
             return;
         }
-        let mut parser = Parser::new(viewport.rows, viewport.cols, 0);
-        parser.process(&viewport.formatted_screen);
+        if viewport.snapshot.validate().is_err() {
+            return;
+        }
         terminal.scrollback = Some(ScrollbackView {
-            parser,
+            snapshot: viewport.snapshot,
             offset: viewport.scrollback,
         });
         terminal.scrollback_request = Some(viewport.scrollback);
@@ -530,13 +526,24 @@ impl RemoteAgents {
         sequence: TerminalSequence,
         disposition: FrameDisposition,
     ) {
+        if let Some(request) = self.frame_follow_up(agent_id, sequence, disposition) {
+            let _ = self.send(request);
+        }
+    }
+
+    fn frame_follow_up(
+        &mut self,
+        agent_id: AgentId,
+        sequence: TerminalSequence,
+        disposition: FrameDisposition,
+    ) -> Option<Request> {
         match disposition {
             FrameDisposition::Apply | FrameDisposition::Duplicate => {
-                let _ = self.send(Request::AcknowledgeFrame {
+                Some(Request::AcknowledgeFrame {
                     lease_token: self.lease_token.clone(),
                     agent_id,
                     sequence,
-                });
+                })
             }
             FrameDisposition::Gap => {
                 if self.pending_resync.insert(agent_id) {
@@ -544,11 +551,13 @@ impl RemoteAgents {
                         .terminals
                         .get(&agent_id)
                         .and_then(|terminal| terminal.tracker.sequence());
-                    let _ = self.send(Request::ResyncTerminal {
+                    Some(Request::ResyncTerminal {
                         lease_token: self.lease_token.clone(),
                         agent_id,
                         last_sequence,
-                    });
+                    })
+                } else {
+                    None
                 }
             }
         }
@@ -625,14 +634,127 @@ impl Drop for RemoteAgents {
 
 #[cfg(test)]
 mod tests {
+    use svarm_agent::{
+        protocol::{TerminalDiff, TerminalFull},
+        terminal_model::{TerminalCell, TerminalCellPatch, TerminalModes, TerminalSize},
+    };
+
     use super::*;
 
+    fn snapshot(text: &str) -> TerminalSnapshot {
+        let mut snapshot = TerminalSnapshot::blank(TerminalSize::new(2, 12));
+        for (column, character) in text.chars().enumerate() {
+            snapshot.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+        }
+        snapshot
+    }
+
+    fn remote(writer: UnixStream) -> RemoteAgents {
+        RemoteAgents {
+            writer,
+            next_request_id: 1,
+            session_id: SessionId(1),
+            lease_token: LeaseToken("test".into()),
+            terminals: HashMap::new(),
+            pending_resync: HashSet::new(),
+        }
+    }
+
     #[test]
-    fn historical_viewport_is_separate_from_the_live_parser() {
+    fn semantic_frames_apply_in_order_and_gaps_request_a_full_resync() {
         let (writer, _peer) = UnixStream::pair().unwrap();
         let id = AgentId::new(1);
-        let mut live = Parser::new(2, 12, 0);
-        live.process(b"live");
+        let mut agents = remote(writer);
+
+        assert_eq!(
+            agents.apply_full(TerminalFull {
+                agent_id: id,
+                output_generation: 1,
+                sequence: TerminalSequence(1),
+                snapshot: snapshot("one"),
+            }),
+            FrameDisposition::Apply
+        );
+        assert_eq!(agents.screen(id).unwrap().contents().trim(), "one");
+
+        assert_eq!(
+            agents.apply_full(TerminalFull {
+                agent_id: id,
+                output_generation: 1,
+                sequence: TerminalSequence(1),
+                snapshot: snapshot("duplicate"),
+            }),
+            FrameDisposition::Duplicate
+        );
+        assert_eq!(agents.screen(id).unwrap().contents().trim(), "one");
+
+        let before = snapshot("one");
+        let after = snapshot("two");
+        assert_eq!(
+            agents.apply_diff(TerminalDiff {
+                agent_id: id,
+                output_generation: 2,
+                base_sequence: TerminalSequence(1),
+                sequence: TerminalSequence(2),
+                diff: before.diff(&after).unwrap(),
+            }),
+            FrameDisposition::Apply
+        );
+        assert_eq!(agents.screen(id).unwrap().contents().trim(), "two");
+
+        let disposition = agents.apply_diff(TerminalDiff {
+            agent_id: id,
+            output_generation: 3,
+            base_sequence: TerminalSequence(99),
+            sequence: TerminalSequence(3),
+            diff: after.diff(&snapshot("gap")).unwrap(),
+        });
+        assert_eq!(disposition, FrameDisposition::Gap);
+        let request = agents
+            .frame_follow_up(id, TerminalSequence(3), disposition)
+            .unwrap();
+        assert!(matches!(
+            request,
+            Request::ResyncTerminal {
+                agent_id,
+                last_sequence: Some(TerminalSequence(2)),
+                ..
+            } if agent_id == id
+        ));
+
+        let mut invalid = after.diff(&snapshot("bad")).unwrap();
+        invalid.cells.push(TerminalCellPatch {
+            index: 99,
+            cell: TerminalCell::default(),
+        });
+        assert_eq!(
+            agents.apply_diff(TerminalDiff {
+                agent_id: id,
+                output_generation: 3,
+                base_sequence: TerminalSequence(2),
+                sequence: TerminalSequence(3),
+                diff: invalid,
+            }),
+            FrameDisposition::Gap
+        );
+
+        assert_eq!(
+            agents.apply_full(TerminalFull {
+                agent_id: id,
+                output_generation: 4,
+                sequence: TerminalSequence(4),
+                snapshot: TerminalSnapshot::blank(TerminalSize::new(3, 20)),
+            }),
+            FrameDisposition::Apply
+        );
+        assert_eq!(agents.screen(id).unwrap().size(), TerminalSize::new(3, 20));
+        assert!(!agents.pending_resync.contains(&id));
+    }
+
+    #[test]
+    fn historical_viewport_is_separate_from_the_live_snapshot() {
+        let (writer, _peer) = UnixStream::pair().unwrap();
+        let id = AgentId::new(1);
         let mut agents = RemoteAgents {
             writer,
             next_request_id: 1,
@@ -641,10 +763,8 @@ mod tests {
             terminals: HashMap::from([(
                 id,
                 CachedTerminal {
-                    parser: live,
+                    snapshot: snapshot("live"),
                     tracker: TerminalFrameTracker::default(),
-                    cursor_style: CursorStyle::default(),
-                    modes: TerminalModes::default(),
                     scrollback: None,
                     scrollback_request: Some(4),
                 },
@@ -654,11 +774,9 @@ mod tests {
 
         agents.apply_viewport(TerminalViewport {
             agent_id: id,
-            rows: 2,
-            cols: 12,
             requested_scrollback: 4,
             scrollback: 4,
-            formatted_screen: b"older".to_vec(),
+            snapshot: snapshot("older"),
         });
 
         assert!(agents.screen(id).unwrap().contents().contains("older"));
@@ -672,13 +790,14 @@ mod tests {
     fn wheel_routing_follows_the_live_child_terminal_modes() {
         let (writer, _peer) = UnixStream::pair().unwrap();
         let id = AgentId::new(1);
-        let terminal = |parser, modes| CachedTerminal {
-            parser,
-            tracker: TerminalFrameTracker::default(),
-            cursor_style: CursorStyle::default(),
-            modes,
-            scrollback: None,
-            scrollback_request: None,
+        let terminal = |mut snapshot: TerminalSnapshot, modes| {
+            snapshot.state.modes = modes;
+            CachedTerminal {
+                snapshot,
+                tracker: TerminalFrameTracker::default(),
+                scrollback: None,
+                scrollback_request: None,
+            }
         };
         let mut agents = RemoteAgents {
             writer,
@@ -689,29 +808,38 @@ mod tests {
             pending_resync: HashSet::new(),
         };
 
-        agents.terminals.insert(
-            id,
-            terminal(Parser::new(2, 12, 0), TerminalModes::default()),
-        );
+        agents
+            .terminals
+            .insert(id, terminal(snapshot(""), TerminalModes::default()));
         assert_eq!(agents.wheel_routing(id), WheelRouting::Scrollback);
 
         agents
             .terminals
             .get_mut(&id)
             .unwrap()
-            .parser
-            .process(b"\x1b[?1049h");
+            .snapshot
+            .state
+            .alternate_screen = true;
         assert_eq!(agents.wheel_routing(id), WheelRouting::Scrollback);
 
         agents
             .terminals
             .get_mut(&id)
             .unwrap()
+            .snapshot
+            .state
             .modes
             .mouse_alternate_scroll = true;
         assert_eq!(agents.wheel_routing(id), WheelRouting::AlternateScreen);
 
-        agents.terminals.get_mut(&id).unwrap().modes.mouse_protocol = MouseProtocol::PressRelease;
+        agents
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .snapshot
+            .state
+            .modes
+            .mouse_protocol = MouseProtocol::PressRelease;
         assert_eq!(agents.wheel_routing(id), WheelRouting::ChildMouse);
     }
 
@@ -727,10 +855,8 @@ mod tests {
             terminals: HashMap::from([(
                 id,
                 CachedTerminal {
-                    parser: Parser::new(2, 12, 0),
+                    snapshot: snapshot(""),
                     tracker: TerminalFrameTracker::default(),
-                    cursor_style: CursorStyle::default(),
-                    modes: TerminalModes::default(),
                     scrollback: None,
                     scrollback_request: None,
                 },
@@ -753,22 +879,18 @@ mod tests {
 
         agents.apply_viewport(TerminalViewport {
             agent_id: id,
-            rows: 2,
-            cols: 12,
             requested_scrollback: 3,
             scrollback: 3,
-            formatted_screen: b"stale".to_vec(),
+            snapshot: snapshot("stale"),
         });
         assert!(agents.terminals[&id].scrollback.is_none());
         assert_eq!(agents.terminals[&id].scrollback_request, Some(6));
 
         agents.apply_viewport(TerminalViewport {
             agent_id: id,
-            rows: 2,
-            cols: 12,
             requested_scrollback: 6,
             scrollback: 5,
-            formatted_screen: b"latest".to_vec(),
+            snapshot: snapshot("latest"),
         });
         assert_eq!(agents.terminals[&id].scrollback.as_ref().unwrap().offset, 5);
         assert_eq!(agents.terminals[&id].scrollback_request, Some(5));

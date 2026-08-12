@@ -2,6 +2,9 @@
 
 Svarm is a small terminal multiplexer specifically for coding agents. It runs the native Codex or Claude Code TUI in a real PTY, keeps open agents in a fixed sidebar, and shows one agent at a time. A per-user background server owns the agents, so the UI can detach and reconnect later.
 
+The local client/server [terminal frame protocol](docs/protocol.md) uses backend-independent
+semantic snapshots and diffs.
+
 It does not speak ACP, Codex app-server, or Claude's streaming protocol. Normal input goes directly to the focused agent.
 
 ## Install and run

@@ -10,17 +10,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
-use serde::{Deserialize, Serialize};
-use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
-
 use crate::{
-    protocol::{MouseEncoding, MouseProtocol, TerminalModes},
+    protocol::TerminalModes,
     terminal::{
         ColorQueryDetector, ControlDetector, CursorStyle, KeyboardState, Recognized,
         TerminalPalette, color_query_responses,
     },
+    terminal_backend,
+    terminal_model::{TerminalBackend, TerminalSize, TerminalSnapshot},
 };
+use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -54,8 +54,7 @@ impl From<portable_pty::ExitStatus> for ProcessExit {
 }
 
 pub struct TerminalProcessSnapshot {
-    pub screen: vt100::Screen,
-    pub cursor_style: CursorStyle,
+    pub terminal: TerminalSnapshot,
     pub status: SessionStatus,
     pub exit: Option<ProcessExit>,
     pub read_error: Option<String>,
@@ -65,7 +64,7 @@ pub struct TerminalProcessSnapshot {
 }
 
 pub struct TerminalProcess {
-    parser: Arc<Mutex<Parser>>,
+    backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -149,9 +148,8 @@ impl TerminalProcess {
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(Parser::new(
-            size.rows.max(1),
-            size.cols.max(1),
+        let backend = Arc::new(Mutex::new(terminal_backend::create(
+            TerminalSize::new(size.rows, size.cols),
             scrollback_rows,
         )));
         let generation = Arc::new(AtomicU64::new(0));
@@ -164,7 +162,7 @@ impl TerminalProcess {
         spawn_reader(
             reader,
             ReaderState {
-                parser: parser.clone(),
+                backend: backend.clone(),
                 writer: writer.clone(),
                 terminal_palette: terminal_palette.clone(),
                 generation: generation.clone(),
@@ -178,7 +176,7 @@ impl TerminalProcess {
         );
 
         Ok(Self {
-            parser,
+            backend,
             writer,
             master: pair.master,
             child,
@@ -212,7 +210,8 @@ impl TerminalProcess {
             pixel_height: 0,
         };
         self.master.resize(size)?;
-        self.parser().screen_mut().set_size(size.rows, size.cols);
+        self.backend()
+            .resize(TerminalSize::new(size.rows, size.cols));
         Ok(())
     }
 
@@ -224,11 +223,11 @@ impl TerminalProcess {
     }
 
     pub fn snapshot(&self) -> TerminalProcessSnapshot {
-        let screen = self.parser().screen().clone();
+        let backend = self.backend();
+        let modes = self.modes(backend.as_ref());
         TerminalProcessSnapshot {
-            modes: self.modes(&screen),
-            screen,
-            cursor_style: self.cursor_style(),
+            terminal: backend.snapshot(self.cursor_style(), modes),
+            modes,
             status: self.status,
             exit: self.exit.clone(),
             read_error: self.read_error(),
@@ -264,20 +263,21 @@ impl TerminalProcess {
         Ok(())
     }
 
-    pub fn with_screen<T>(&self, read: impl FnOnce(&vt100::Screen) -> T) -> T {
-        read(self.parser().screen())
+    pub fn with_terminal<T>(&self, read: impl FnOnce(&TerminalSnapshot) -> T) -> T {
+        let snapshot = self.terminal_snapshot();
+        read(&snapshot)
     }
 
-    pub(crate) fn formatted_viewport(&self, requested: usize) -> (u16, u16, usize, Vec<u8>) {
-        let mut parser = self.parser();
-        let screen = parser.screen_mut();
-        let original = screen.scrollback();
-        screen.set_scrollback(requested);
-        let scrollback = screen.scrollback();
-        let (rows, cols) = screen.size();
-        let formatted = screen.contents_formatted();
-        screen.set_scrollback(original);
-        (rows, cols, scrollback, formatted)
+    pub(crate) fn terminal_snapshot(&self) -> TerminalSnapshot {
+        let backend = self.backend();
+        let modes = self.modes(backend.as_ref());
+        backend.snapshot(self.cursor_style(), modes)
+    }
+
+    pub(crate) fn viewport(&self, requested: usize) -> TerminalSnapshot {
+        let mut backend = self.backend();
+        let modes = self.modes(backend.as_ref());
+        backend.viewport(requested, self.cursor_style(), modes)
     }
 
     pub(crate) fn keyboard_disambiguates(&self) -> bool {
@@ -288,8 +288,8 @@ impl TerminalProcess {
     }
 
     pub(crate) fn terminal_modes(&self) -> TerminalModes {
-        let parser = self.parser();
-        self.modes(parser.screen())
+        let backend = self.backend();
+        self.modes(backend.as_ref())
     }
 
     pub(crate) fn cursor_style(&self) -> CursorStyle {
@@ -318,32 +318,17 @@ impl TerminalProcess {
         self.exit.clone()
     }
 
-    fn parser(&self) -> MutexGuard<'_, Parser> {
-        self.parser
+    fn backend(&self) -> MutexGuard<'_, Box<dyn TerminalBackend>> {
+        self.backend
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn modes(&self, screen: &vt100::Screen) -> TerminalModes {
-        TerminalModes {
-            keyboard_disambiguate: self.keyboard_disambiguates(),
-            application_cursor: screen.application_cursor(),
-            application_keypad: screen.application_keypad(),
-            bracketed_paste: screen.bracketed_paste(),
-            mouse_alternate_scroll: self.alternate_scroll.load(Ordering::Acquire),
-            mouse_protocol: match screen.mouse_protocol_mode() {
-                MouseProtocolMode::None => MouseProtocol::None,
-                MouseProtocolMode::Press => MouseProtocol::Press,
-                MouseProtocolMode::PressRelease => MouseProtocol::PressRelease,
-                MouseProtocolMode::ButtonMotion => MouseProtocol::ButtonMotion,
-                MouseProtocolMode::AnyMotion => MouseProtocol::AnyMotion,
-            },
-            mouse_encoding: match screen.mouse_protocol_encoding() {
-                MouseProtocolEncoding::Default => MouseEncoding::Default,
-                MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
-                MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
-            },
-        }
+    fn modes(&self, backend: &dyn TerminalBackend) -> TerminalModes {
+        backend.modes(
+            self.keyboard_disambiguates(),
+            self.alternate_scroll.load(Ordering::Acquire),
+        )
     }
 
     fn record_exit(&mut self, status: portable_pty::ExitStatus) {
@@ -359,7 +344,7 @@ impl Drop for TerminalProcess {
 }
 
 struct ReaderState {
-    parser: Arc<Mutex<Parser>>,
+    backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     terminal_palette: Arc<Mutex<Option<TerminalPalette>>>,
     generation: Arc<AtomicU64>,
@@ -402,11 +387,11 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
 
                     let mut consumed = 0;
                     for (offset, recognized) in controls.process(output) {
-                        let mut parser = state
-                            .parser
+                        let mut backend = state
+                            .backend
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner());
-                        parser.process(&output[consumed..offset]);
+                        backend.process(&output[consumed..offset]);
                         consumed = offset;
                         match recognized {
                             Recognized::CursorStyle(style) => {
@@ -416,9 +401,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                                     .unwrap_or_else(|poison| poison.into_inner()) = style;
                             }
                             Recognized::Query(query) => {
-                                let cursor = parser.screen().cursor_position();
-                                drop(parser);
-                                reply(query.response(cursor).as_bytes());
+                                let cursor = backend.cursor_position();
+                                drop(backend);
+                                reply(query.response((cursor.row, cursor.column)).as_bytes());
                             }
                             Recognized::KeyboardQuery => {
                                 let flags = state
@@ -426,7 +411,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                                     .lock()
                                     .unwrap_or_else(|poison| poison.into_inner())
                                     .flags();
-                                drop(parser);
+                                drop(backend);
                                 reply(format!("\x1b[?{flags}u").as_bytes());
                             }
                             Recognized::Keyboard(change) => {
@@ -442,7 +427,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, state: ReaderState) {
                         }
                     }
                     state
-                        .parser
+                        .backend
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .process(&output[consumed..]);
@@ -505,13 +490,13 @@ mod tests {
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !process.with_screen(|screen| screen.contents().contains("[2;9R"))
+        while !process.with_terminal(|screen| screen.contents().contains("[2;9R"))
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
 
-        let contents = process.with_screen(vt100::Screen::contents);
+        let contents = process.with_terminal(TerminalSnapshot::contents);
         assert!(contents.contains("[2;9R"), "screen was {contents:?}");
     }
 
@@ -531,13 +516,13 @@ mod tests {
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !process.with_screen(|screen| screen.contents().contains("1b 5b 3f 37 75"))
+        while !process.with_terminal(|screen| screen.contents().contains("1b 5b 3f 37 75"))
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
 
-        let screen = process.with_screen(vt100::Screen::contents);
+        let screen = process.with_terminal(TerminalSnapshot::contents);
         assert!(
             screen.contains("1b 5b 3f 37 75"),
             "keyboard query reply was not returned: {screen:?}"
@@ -547,16 +532,20 @@ mod tests {
 
     #[test]
     fn top_anchored_scroll_regions_feed_host_history() {
-        let mut parser = Parser::new(5, 10, 100);
-        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut backend = terminal_backend::create(TerminalSize::new(5, 10), 100);
+        backend.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
 
         // Inline TUIs keep their composer below this region and move completed transcript rows
         // out through its top edge.
-        parser.process(b"\x1b[1;3r\x1b[3;1H\x1b[S");
-        parser.screen_mut().set_scrollback(usize::MAX);
+        backend.process(b"\x1b[1;3r\x1b[3;1H\x1b[S");
+        let snapshot = backend.viewport(
+            usize::MAX,
+            CursorStyle::default(),
+            backend.modes(false, false),
+        );
 
-        assert_eq!(parser.screen().scrollback(), 1);
-        assert!(parser.screen().contents().starts_with("one"));
+        assert_eq!(snapshot.state.scrollback.position, 1);
+        assert!(snapshot.contents().starts_with("one"));
     }
 
     #[test]
@@ -567,12 +556,12 @@ mod tests {
                 .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !process.with_screen(|screen| screen.contents().contains("svarm"))
+        while !process.with_terminal(|screen| screen.contents().contains("svarm"))
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(process.with_screen(|screen| screen.contents().contains("svarm")));
+        assert!(process.with_terminal(|screen| screen.contents().contains("svarm")));
         while process.poll().unwrap() == SessionStatus::Running && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
@@ -639,12 +628,12 @@ mod tests {
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !process.with_screen(|screen| screen.contents().contains("literal value"))
+        while !process.with_terminal(|screen| screen.contents().contains("literal value"))
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(process.with_screen(|screen| {
+        assert!(process.with_terminal(|screen| {
             screen
                 .contents()
                 .contains("path with spaces;$():literal value")
@@ -673,7 +662,8 @@ mod tests {
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while process.with_screen(|screen| !screen.alternate_screen()) && Instant::now() < deadline
+        while process.with_terminal(|screen| !screen.state.alternate_screen)
+            && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }

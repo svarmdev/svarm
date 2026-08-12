@@ -121,7 +121,7 @@ pub fn run(
                         .and_then(|id| agents.cursor_style(id))
                         .unwrap_or_default()
                 },
-                |snapshot| snapshot.cursor_style,
+                |snapshot| snapshot.terminal.state.cursor.style,
             );
             terminal.set_cursor_style(cursor_style)?;
             terminal.terminal().draw(|frame| ui::render(frame, model))?;

@@ -19,24 +19,25 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
-use svarm_agent::vt100::{Cell, Color as TerminalColor, Screen};
+use svarm_agent::terminal_model::{TerminalCell, TerminalColor, TerminalSnapshot};
 
 pub(crate) struct TerminalScreen<'a> {
-    screen: &'a Screen,
+    screen: &'a TerminalSnapshot,
 }
 
 impl<'a> TerminalScreen<'a> {
-    pub const fn new(screen: &'a Screen) -> Self {
+    pub const fn new(screen: &'a TerminalSnapshot) -> Self {
         Self { screen }
     }
 
     /// Where the host terminal should place its own cursor, in frame coordinates, or `None` when
     /// the agent has hidden it or it falls outside the pane.
     pub fn cursor_position(&self, area: Rect) -> Option<Position> {
-        if self.screen.hide_cursor() {
+        if !self.screen.state.cursor.visible {
             return None;
         }
-        let (row, column) = self.screen.cursor_position();
+        let row = self.screen.state.cursor.position.row;
+        let column = self.screen.state.cursor.position.column;
         (row < area.height && column < area.width)
             .then(|| Position::new(area.x + column, area.y + row))
     }
@@ -50,8 +51,8 @@ impl Widget for TerminalScreen<'_> {
                     continue;
                 };
                 let buffer_cell = &mut buffer[(area.x + column, area.y + row)];
-                buffer_cell.set_symbol(if cell.has_contents() {
-                    cell.contents()
+                buffer_cell.set_symbol(if !cell.contents.is_empty() {
+                    &cell.contents
                 } else {
                     " "
                 });
@@ -61,33 +62,33 @@ impl Widget for TerminalScreen<'_> {
     }
 }
 
-fn style(cell: &Cell) -> Style {
+fn style(cell: &TerminalCell) -> Style {
     let mut modifiers = Modifier::empty();
     for (active, modifier) in [
-        (cell.bold(), Modifier::BOLD),
-        (cell.dim(), Modifier::DIM),
-        (cell.italic(), Modifier::ITALIC),
-        (cell.underline(), Modifier::UNDERLINED),
-        (cell.inverse(), Modifier::REVERSED),
-        (cell.blink(), Modifier::SLOW_BLINK),
-        (cell.hidden(), Modifier::HIDDEN),
-        (cell.strikethrough(), Modifier::CROSSED_OUT),
+        (cell.attributes.bold, Modifier::BOLD),
+        (cell.attributes.dim, Modifier::DIM),
+        (cell.attributes.italic, Modifier::ITALIC),
+        (cell.attributes.underline, Modifier::UNDERLINED),
+        (cell.attributes.inverse, Modifier::REVERSED),
+        (cell.attributes.blink, Modifier::SLOW_BLINK),
+        (cell.attributes.hidden, Modifier::HIDDEN),
+        (cell.attributes.strikethrough, Modifier::CROSSED_OUT),
     ] {
         if active {
             modifiers |= modifier;
         }
     }
     Style::reset()
-        .fg(color(cell.fgcolor()))
-        .bg(color(cell.bgcolor()))
+        .fg(color(cell.foreground))
+        .bg(color(cell.background))
         .add_modifier(modifiers)
 }
 
 fn color(color: TerminalColor) -> Color {
     match color {
         TerminalColor::Default => Color::Reset,
-        TerminalColor::Idx(index) => ansi(index),
-        TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+        TerminalColor::Indexed(index) => ansi(index),
+        TerminalColor::Rgb([red, green, blue]) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -117,16 +118,26 @@ fn ansi(index: u8) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use svarm_agent::vt100::Parser;
+    use svarm_agent::terminal_model::{TerminalAttributes, TerminalPosition, TerminalSize};
 
     use super::*;
 
-    fn render(output: &[u8]) -> Buffer {
-        let mut parser = Parser::new(2, 12, 0);
-        parser.process(output);
+    fn screen(text: &str) -> TerminalSnapshot {
+        let mut screen = TerminalSnapshot::blank(TerminalSize::new(2, 12));
+        for (column, character) in text.chars().enumerate() {
+            screen.cell_mut(0, column as u16).unwrap().contents = character.to_string();
+        }
+        screen.state.cursor.position = TerminalPosition {
+            row: 0,
+            column: text.chars().count() as u16,
+        };
+        screen
+    }
+
+    fn render(screen: &TerminalSnapshot) -> Buffer {
         let area = Rect::new(0, 0, 12, 2);
         let mut buffer = Buffer::empty(area);
-        TerminalScreen::new(parser.screen()).render(area, &mut buffer);
+        TerminalScreen::new(screen).render(area, &mut buffer);
         buffer
     }
 
@@ -134,49 +145,103 @@ mod tests {
     fn ansi_colors_keep_their_named_form_so_the_terminal_can_apply_its_own_rules() {
         // Written back as `SGR 1` and `SGR 31`, which is what the agent sent and what a terminal
         // brightens; an indexed color would instead be pinned to its literal palette entry.
-        let buffer = render(b"\x1b[1;31mred");
+        let mut screen = screen("red");
+        screen.cells[0].foreground = TerminalColor::Indexed(1);
+        screen.cells[0].attributes.bold = true;
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].fg, Color::Red);
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
 
-        let buffer = render(b"\x1b[91mbright");
+        screen.cells[0].foreground = TerminalColor::Indexed(9);
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].fg, Color::LightRed);
 
-        let buffer = render(b"\x1b[41mon-red");
+        screen.cells[0].foreground = TerminalColor::Default;
+        screen.cells[0].background = TerminalColor::Indexed(1);
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].bg, Color::Red);
         assert_eq!(buffer[(0, 0)].fg, Color::Reset);
     }
 
     #[test]
     fn palette_and_true_color_requests_are_passed_through_unchanged() {
-        let buffer = render(b"\x1b[38;5;200mpink");
+        let mut screen = screen("pink");
+        screen.cells[0].foreground = TerminalColor::Indexed(200);
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(200));
 
-        let buffer = render(b"\x1b[38;2;10;20;30mrgb");
+        screen.cells[0].foreground = TerminalColor::Rgb([10, 20, 30]);
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].fg, Color::Rgb(10, 20, 30));
 
-        let buffer = render(b"\x1b[48;2;1;2;3mrgb");
+        screen.cells[0].background = TerminalColor::Rgb([1, 2, 3]);
+        let buffer = render(&screen);
         assert_eq!(buffer[(0, 0)].bg, Color::Rgb(1, 2, 3));
     }
 
     #[test]
     fn default_colors_defer_to_the_host_terminal() {
-        let buffer = render(b"plain");
+        let buffer = render(&screen("plain"));
         assert_eq!(buffer[(0, 0)].fg, Color::Reset);
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
     }
 
     #[test]
     fn attributes_beyond_the_common_four_survive_rendering() {
-        for (output, modifier) in [
-            (&b"\x1b[9mgone"[..], Modifier::CROSSED_OUT),
-            (&b"\x1b[5mblink"[..], Modifier::SLOW_BLINK),
-            (&b"\x1b[8mhidden"[..], Modifier::HIDDEN),
-            (&b"\x1b[3mitalic"[..], Modifier::ITALIC),
-            (&b"\x1b[2mdim"[..], Modifier::DIM),
-            (&b"\x1b[4munder"[..], Modifier::UNDERLINED),
-            (&b"\x1b[7minv"[..], Modifier::REVERSED),
+        for (attributes, modifier) in [
+            (
+                TerminalAttributes {
+                    strikethrough: true,
+                    ..Default::default()
+                },
+                Modifier::CROSSED_OUT,
+            ),
+            (
+                TerminalAttributes {
+                    blink: true,
+                    ..Default::default()
+                },
+                Modifier::SLOW_BLINK,
+            ),
+            (
+                TerminalAttributes {
+                    hidden: true,
+                    ..Default::default()
+                },
+                Modifier::HIDDEN,
+            ),
+            (
+                TerminalAttributes {
+                    italic: true,
+                    ..Default::default()
+                },
+                Modifier::ITALIC,
+            ),
+            (
+                TerminalAttributes {
+                    dim: true,
+                    ..Default::default()
+                },
+                Modifier::DIM,
+            ),
+            (
+                TerminalAttributes {
+                    underline: true,
+                    ..Default::default()
+                },
+                Modifier::UNDERLINED,
+            ),
+            (
+                TerminalAttributes {
+                    inverse: true,
+                    ..Default::default()
+                },
+                Modifier::REVERSED,
+            ),
         ] {
-            let buffer = render(output);
+            let mut screen = screen("test");
+            screen.cells[0].attributes = attributes;
+            let buffer = render(&screen);
             assert!(
                 buffer[(0, 0)].modifier.contains(modifier),
                 "{modifier:?} was dropped"
@@ -188,27 +253,21 @@ mod tests {
     fn cells_the_agent_never_wrote_do_not_keep_earlier_content() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
         buffer[(4, 0)].set_symbol("x");
-        let mut parser = Parser::new(2, 12, 0);
-        parser.process(b"ab");
-        TerminalScreen::new(parser.screen()).render(Rect::new(0, 0, 12, 2), &mut buffer);
+        TerminalScreen::new(&screen("ab")).render(Rect::new(0, 0, 12, 2), &mut buffer);
 
         assert_eq!(buffer[(4, 0)].symbol(), " ");
     }
 
     #[test]
     fn the_cursor_reports_its_place_in_frame_coordinates_and_hides_on_request() {
-        let mut parser = Parser::new(2, 12, 0);
-        parser.process(b"ab");
+        let mut screen = screen("ab");
         let area = Rect::new(3, 1, 12, 2);
         assert_eq!(
-            TerminalScreen::new(parser.screen()).cursor_position(area),
+            TerminalScreen::new(&screen).cursor_position(area),
             Some(Position::new(5, 1))
         );
 
-        parser.process(b"\x1b[?25l");
-        assert_eq!(
-            TerminalScreen::new(parser.screen()).cursor_position(area),
-            None
-        );
+        screen.state.cursor.visible = false;
+        assert_eq!(TerminalScreen::new(&screen).cursor_position(area), None);
     }
 }

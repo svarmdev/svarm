@@ -7,8 +7,8 @@ use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentKind, CursorStyle, ProcessExit, Result, SessionStatus, TerminalPalette,
-    terminal_process::TerminalProcess,
+    AgentId, AgentKind, ProcessExit, Result, SessionStatus, TerminalPalette,
+    terminal_model::TerminalSnapshot, terminal_process::TerminalProcess,
 };
 
 /// Called when an agent's terminal changes so its owner can wake immediately.
@@ -75,16 +75,16 @@ impl AgentSession {
         self.terminal.terminal_modes()
     }
 
-    pub fn cursor_style(&self) -> CursorStyle {
-        self.terminal.cursor_style()
+    pub fn with_terminal<T>(&self, read: impl FnOnce(&TerminalSnapshot) -> T) -> T {
+        self.terminal.with_terminal(read)
     }
 
-    pub fn with_screen<T>(&self, read: impl FnOnce(&vt100::Screen) -> T) -> T {
-        self.terminal.with_screen(read)
+    pub fn terminal_snapshot(&self) -> TerminalSnapshot {
+        self.terminal.terminal_snapshot()
     }
 
-    pub fn formatted_viewport(&self, requested: usize) -> (u16, u16, usize, Vec<u8>) {
-        self.terminal.formatted_viewport(requested)
+    pub fn viewport(&self, requested: usize) -> TerminalSnapshot {
+        self.terminal.viewport(requested)
     }
 
     pub fn set_terminal_palette(&self, palette: Option<TerminalPalette>) {
