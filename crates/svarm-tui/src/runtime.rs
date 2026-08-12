@@ -296,7 +296,9 @@ fn apply_remote_update(
                 unreachable!("terminal frames are applied by adapter")
             }
         },
-        RemoteUpdate::TerminalChanged => dirty = true,
+        RemoteUpdate::TerminalChanged(agent_id) => {
+            dirty = app.selected_agent_id() == Some(agent_id)
+        }
         RemoteUpdate::Error(error) => {
             app.set_notice(error);
             dirty = true;
@@ -1177,6 +1179,41 @@ mod tests {
             KeyCode::Char('b'),
             KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn only_the_selected_agents_terminal_requests_a_redraw() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        for id in 1..=2 {
+            app.add_agent(SessionSnapshot {
+                id: AgentId::new(id),
+                kind: AgentKind::Codex,
+                launch_directory: PathBuf::from("/tmp/workspace"),
+                status: SessionStatus::Running,
+                output_generation: 0,
+                read_error: None,
+                exit: None,
+                conversation_id: None,
+            });
+        }
+        assert_eq!(app.selected_agent_id(), Some(AgentId::new(2)));
+
+        let mut connection_failure = None;
+        assert!(!apply_remote_update(
+            &mut app,
+            &mut connection_failure,
+            RemoteUpdate::TerminalChanged(AgentId::new(1)),
+        ));
+        assert!(apply_remote_update(
+            &mut app,
+            &mut connection_failure,
+            RemoteUpdate::TerminalChanged(AgentId::new(2)),
+        ));
     }
 
     #[test]

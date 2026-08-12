@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     io,
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -35,7 +35,8 @@ use crate::{
 };
 
 const EVENT_TICK: Duration = Duration::from_millis(16);
-const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SELECTED_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const BACKGROUND_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const EMPTY_SERVER_GRACE: Duration = Duration::from_secs(2);
 const CONNECTION_QUEUE: usize = 64;
 const INPUT_QUEUE: usize = 1_024;
@@ -309,9 +310,24 @@ struct SessionRuntime {
     previous: HashMap<AgentId, ObservedAgent>,
     input_drafts: HashMap<AgentId, InputDraft>,
     git_checked: HashMap<AgentId, Instant>,
+    git_cache: HashMap<PathBuf, CachedGitContext>,
+    git_worker: git::ContextWorker,
+    git_in_flight: Option<GitProbe>,
     frame_bases: HashMap<AgentId, FrameBasis>,
     archived: Vec<ArchivedConversation>,
     namer: TitleNamer,
+}
+
+struct GitProbe {
+    agent_id: AgentId,
+    working_directory: Option<PathBuf>,
+    directory: PathBuf,
+}
+
+#[derive(Clone)]
+struct CachedGitContext {
+    checked_at: Instant,
+    context: Option<GitContext>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +488,9 @@ impl SessionRuntime {
             previous: HashMap::new(),
             input_drafts: HashMap::new(),
             git_checked: HashMap::new(),
+            git_cache: HashMap::new(),
+            git_worker: git::ContextWorker::new(),
+            git_in_flight: None,
             frame_bases: HashMap::new(),
             archived: Vec::new(),
             namer,
@@ -498,7 +517,7 @@ impl SessionRuntime {
         self.state
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
         self.input_drafts.insert(snapshot.id, InputDraft::default());
-        let observed = self.observe(snapshot.clone(), Instant::now(), true);
+        let observed = self.observe(snapshot.clone());
         self.previous.insert(snapshot.id, observed);
         Ok(snapshot)
     }
@@ -591,7 +610,7 @@ impl SessionRuntime {
             .register_agent(snapshot.id, snapshot.output_generation, now_ms);
         self.input_drafts
             .insert(snapshot.id, InputDraft::named(conversation.title));
-        let observed = self.observe(snapshot.clone(), Instant::now(), true);
+        let observed = self.observe(snapshot.clone());
         self.previous.insert(snapshot.id, observed);
         self.archived.remove(index);
         self.state.metadata_changed();
@@ -661,12 +680,7 @@ impl SessionRuntime {
         }
     }
 
-    fn observe(
-        &mut self,
-        session: SessionSnapshot,
-        now: Instant,
-        force_git: bool,
-    ) -> ObservedAgent {
+    fn observe(&mut self, session: SessionSnapshot) -> ObservedAgent {
         let screen_changed = self
             .previous
             .get(&session.id)
@@ -674,14 +688,12 @@ impl SessionRuntime {
         let terminal = screen_changed
             .then(|| self.agents.terminal_snapshot(session.id))
             .flatten();
-        self.observe_with_terminal(session, now, force_git, terminal.as_ref())
+        self.observe_with_terminal(session, terminal.as_ref())
     }
 
     fn observe_with_terminal(
         &mut self,
         session: SessionSnapshot,
-        now: Instant,
-        force_git: bool,
         screen: Option<&TerminalSnapshot>,
     ) -> ObservedAgent {
         let previous = self.previous.get(&session.id).cloned();
@@ -746,27 +758,9 @@ impl SessionRuntime {
             Some(activity)
         };
 
-        let refresh_git = force_git
-            || self
-                .git_checked
-                .get(&session.id)
-                .is_none_or(|checked| now.duration_since(*checked) >= GIT_REFRESH_INTERVAL);
-        // An agent that enters another checkout leaves its launch directory behind, so the git
-        // context has to be read where the agent actually is.
-        let (working_directory, git) = if refresh_git {
-            self.git_checked.insert(session.id, now);
-            let working_directory = self.agents.working_directory(session.id);
-            let git = git::context(
-                working_directory
-                    .as_deref()
-                    .unwrap_or(&session.launch_directory),
-            );
-            (working_directory, git)
-        } else {
-            match previous.as_ref() {
-                Some(agent) => (agent.working_directory.clone(), agent.git.clone()),
-                None => (None, None),
-            }
+        let (working_directory, git) = match previous.as_ref() {
+            Some(agent) => (agent.working_directory.clone(), agent.git.clone()),
+            None => (None, None),
         };
 
         ObservedAgent {
@@ -779,6 +773,155 @@ impl SessionRuntime {
             working_directory,
             git,
         }
+    }
+
+    fn apply_git_result(&mut self, now: Instant) -> BTreeSet<AgentId> {
+        let mut changed = BTreeSet::new();
+        let Some(result) = self.git_worker.try_result() else {
+            return changed;
+        };
+        let Some(probe) = self.git_in_flight.take() else {
+            return changed;
+        };
+        debug_assert_eq!(result.directory, probe.directory);
+
+        let cache_key = result.context.as_ref().map_or_else(
+            || probe.directory.clone(),
+            |context| context.worktree.clone(),
+        );
+        let cached = CachedGitContext {
+            checked_at: now,
+            context: result.context,
+        };
+        self.git_cache.insert(cache_key, cached.clone());
+
+        // Do not apply a result to an agent that moved while Git was running. Clearing its last
+        // check makes the new directory the next probe rather than showing stale worktree data.
+        let current_working_directory = self.agents.working_directory(probe.agent_id);
+        if current_working_directory == probe.working_directory {
+            if self.apply_git_observation(probe.agent_id, probe.working_directory, &cached) {
+                changed.insert(probe.agent_id);
+            }
+        } else {
+            if let Some(observed) = self.previous.get_mut(&probe.agent_id) {
+                let observation_changed = observed.working_directory != current_working_directory
+                    || observed.git.is_some();
+                observed.working_directory = current_working_directory;
+                observed.git = None;
+                if observation_changed {
+                    changed.insert(probe.agent_id);
+                }
+            }
+            self.git_checked.remove(&probe.agent_id);
+        }
+
+        // A single worktree probe is valid for every agent currently inside that worktree.
+        if let Some(worktree) = cached.context.as_ref().map(|context| &context.worktree) {
+            let shared = self
+                .previous
+                .iter()
+                .filter_map(|(id, observed)| {
+                    let directory = observed
+                        .working_directory
+                        .as_deref()
+                        .unwrap_or(&observed.session.launch_directory);
+                    (*id != probe.agent_id && directory.starts_with(worktree)).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in shared {
+                let working_directory = self.previous[&id].working_directory.clone();
+                if self.apply_git_observation(id, working_directory, &cached) {
+                    changed.insert(id);
+                }
+            }
+        }
+        changed
+    }
+
+    fn schedule_git_refresh(&mut self, now: Instant) -> BTreeSet<AgentId> {
+        let mut changed = BTreeSet::new();
+        if self.git_in_flight.is_some() {
+            return changed;
+        }
+
+        let selected = self.state.selected_agent_id();
+        let mut candidates = self.agents.agent_ids().to_vec();
+        if let Some(selected) = selected
+            && let Some(index) = candidates.iter().position(|id| *id == selected)
+        {
+            candidates.swap(0, index);
+        }
+        for id in candidates {
+            let interval = git_refresh_interval(selected == Some(id));
+            if self
+                .git_checked
+                .get(&id)
+                .is_some_and(|checked| now.duration_since(*checked) < interval)
+            {
+                continue;
+            }
+            let Some(observed) = self.previous.get(&id) else {
+                continue;
+            };
+            let working_directory = self.agents.working_directory(id);
+            let directory = working_directory
+                .clone()
+                .unwrap_or_else(|| observed.session.launch_directory.clone());
+
+            if let Some(cached) = self.cached_git_context(&directory, interval, now) {
+                if self.apply_git_observation(id, working_directory, &cached) {
+                    changed.insert(id);
+                }
+                continue;
+            }
+            if self.git_worker.request(directory.clone()) {
+                self.git_in_flight = Some(GitProbe {
+                    agent_id: id,
+                    working_directory,
+                    directory,
+                });
+            }
+            break;
+        }
+        changed
+    }
+
+    fn cached_git_context(
+        &self,
+        directory: &Path,
+        interval: Duration,
+        now: Instant,
+    ) -> Option<CachedGitContext> {
+        self.git_cache.iter().find_map(|(key, cached)| {
+            let fresh = now.duration_since(cached.checked_at) < interval;
+            let contains = key == directory
+                || cached
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| directory.starts_with(&context.worktree));
+            (fresh && contains).then(|| cached.clone())
+        })
+    }
+
+    fn apply_git_observation(
+        &mut self,
+        id: AgentId,
+        working_directory: Option<PathBuf>,
+        cached: &CachedGitContext,
+    ) -> bool {
+        let Some(observed) = self.previous.get_mut(&id) else {
+            return false;
+        };
+        let changed =
+            observed.working_directory != working_directory || observed.git != cached.context;
+        observed.working_directory = working_directory;
+        observed.git = cached.context.clone();
+        self.git_checked.insert(id, cached.checked_at);
+        changed
+    }
+
+    fn force_git_refresh(&mut self, id: AgentId) {
+        self.git_checked.remove(&id);
     }
 
     /// The modes the agent's input has to be encoded against. Read in place: this runs on every
@@ -967,8 +1110,9 @@ impl SessionRuntime {
         let dirty = self.agents.drain_dirty();
         let attached = self.state.attachment().is_some();
         let now = Instant::now();
-        let mut changed = Vec::new();
+        let mut changed = self.apply_git_result(now);
         let mut switched = Vec::new();
+        let mut switched_ids = BTreeSet::new();
         let mut terminals = Vec::new();
         for result in self.agents.poll() {
             let Ok(snapshot) = result else {
@@ -1020,12 +1164,13 @@ impl SessionRuntime {
             let terminal = screen_changed
                 .then(|| self.agents.terminal_snapshot(snapshot.id))
                 .flatten();
-            let observed =
-                self.observe_with_terminal(snapshot.clone(), now, false, terminal.as_ref());
+            let observed = self.observe_with_terminal(snapshot.clone(), terminal.as_ref());
             if id_changed {
+                changed.remove(&snapshot.id);
+                switched_ids.insert(snapshot.id);
                 switched.push((snapshot.clone(), archived, reactivated_id));
             } else if previous.as_ref() != Some(&observed) {
-                changed.push(snapshot.clone());
+                changed.insert(snapshot.id);
             }
             self.previous.insert(snapshot.id, observed);
             if attached
@@ -1037,12 +1182,17 @@ impl SessionRuntime {
                 terminals.push((snapshot.id, terminal));
             }
         }
+        changed.extend(self.schedule_git_refresh(now));
+        for id in switched_ids {
+            changed.remove(&id);
+        }
         if !changed.is_empty() || !switched.is_empty() {
             self.state.metadata_changed();
         }
         let revision = self.state.revision();
         let mut events = changed
             .into_iter()
+            .filter_map(|id| self.agents.snapshot(id))
             .map(|snapshot| Event::AgentChanged {
                 revision,
                 agent: Box::new(self.agent_snapshot(snapshot)),
@@ -1132,15 +1282,17 @@ impl Server {
     }
 
     fn run(mut self) -> AgentResult<()> {
+        let mut next_session_poll = Instant::now();
         while !self.stopping {
             if self.config.handle_signals && SHUTDOWN_REQUESTED.swap(false, Ordering::SeqCst) {
                 self.begin_shutdown();
                 continue;
             }
             self.accept_connections()?;
-            // Agent output raises a wake, so this blocks only while nothing is happening; the
-            // tick just paces connection accounting and the idle-shutdown check.
-            match self.input_rx.recv_timeout(EVENT_TICK) {
+            // Input still wakes the coordinator immediately, but terminal observation is paced
+            // below. A noisy child therefore cannot turn each PTY read into its own frame.
+            let timeout = next_session_poll.saturating_duration_since(Instant::now());
+            match self.input_rx.recv_timeout(timeout) {
                 Ok(input) => self.handle_input(input),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1148,8 +1300,13 @@ impl Server {
             while let Ok(input) = self.input_rx.try_recv() {
                 self.handle_input(input);
             }
-            self.output_wake.clear();
-            self.poll_sessions();
+            let now = Instant::now();
+            if session_poll_due(&mut next_session_poll, now) {
+                // Keep output notifications coalesced until the frame boundary. Clearing before
+                // polling lets output that arrives during the poll schedule the following frame.
+                self.output_wake.clear();
+                self.poll_sessions();
+            }
             self.update_lifetime();
         }
         self.finish_shutdown();
@@ -1182,8 +1339,8 @@ impl Server {
         match input {
             ServerInput::Frame(id, envelope) => self.handle_envelope(id, *envelope),
             ServerInput::Disconnected(id) => self.disconnect(id),
-            // Nothing to do: the wake exists only to break out of `recv_timeout` so that the
-            // `poll_sessions` call below runs now instead of up to a tick later.
+            // Nothing to do: the wake only records that output is pending for the next frame
+            // boundary. `OutputWake` keeps later reads coalesced until that boundary.
             ServerInput::AgentOutput => {}
         }
     }
@@ -1456,11 +1613,9 @@ impl Server {
             } => {
                 let session_id = self.attached_session(id, &lease_token)?;
                 let now = self.now_ms();
-                self.sessions
-                    .get_mut(&session_id)
-                    .unwrap()
-                    .state
-                    .select_agent(agent_id, now)?;
+                let runtime = self.sessions.get_mut(&session_id).unwrap();
+                runtime.state.select_agent(agent_id, now)?;
+                runtime.force_git_refresh(agent_id);
                 Ok(Outcome::new(Response::Ok))
             }
             Request::MarkSeen {
@@ -1998,6 +2153,22 @@ impl Server {
     }
 }
 
+fn session_poll_due(next: &mut Instant, now: Instant) -> bool {
+    if now < *next {
+        return false;
+    }
+    *next = now + EVENT_TICK;
+    true
+}
+
+const fn git_refresh_interval(selected: bool) -> Duration {
+    if selected {
+        SELECTED_GIT_REFRESH_INTERVAL
+    } else {
+        BACKGROUND_GIT_REFRESH_INTERVAL
+    }
+}
+
 fn start_connection(
     id: ConnectionId,
     stream: UnixStream,
@@ -2250,6 +2421,71 @@ mod tests {
     }
 
     #[test]
+    fn session_polling_advances_at_most_once_per_frame_interval() {
+        let start = Instant::now();
+        let mut next = start;
+
+        assert!(session_poll_due(&mut next, start));
+        assert_eq!(next, start + EVENT_TICK);
+        assert!(!session_poll_due(
+            &mut next,
+            start + EVENT_TICK - Duration::from_millis(1)
+        ));
+        assert!(session_poll_due(&mut next, start + EVENT_TICK));
+        assert_eq!(next, start + EVENT_TICK + EVENT_TICK);
+    }
+
+    #[test]
+    fn selected_git_refreshes_more_often_than_background_git() {
+        assert_eq!(git_refresh_interval(true), Duration::from_secs(1));
+        assert_eq!(git_refresh_interval(false), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn fresh_git_context_is_shared_with_directories_inside_the_worktree() {
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let now = Instant::now();
+        let worktree = PathBuf::from("/repo");
+        let context = GitContext {
+            branch: "main".into(),
+            worktree: worktree.clone(),
+            linked: false,
+            additions: 0,
+            deletions: 0,
+            ahead: None,
+            behind: None,
+        };
+        runtime.git_cache.insert(
+            worktree,
+            CachedGitContext {
+                checked_at: now,
+                context: Some(context.clone()),
+            },
+        );
+
+        assert_eq!(
+            runtime
+                .cached_git_context(
+                    Path::new("/repo/crates/svarm"),
+                    SELECTED_GIT_REFRESH_INTERVAL,
+                    now + Duration::from_millis(999),
+                )
+                .and_then(|cached| cached.context),
+            Some(context)
+        );
+        assert!(
+            runtime
+                .cached_git_context(
+                    Path::new("/repo/crates/svarm"),
+                    SELECTED_GIT_REFRESH_INTERVAL,
+                    now + SELECTED_GIT_REFRESH_INTERVAL,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn first_submitted_message_becomes_the_thread_title() {
         let mut draft = InputDraft::default();
         for character in "  refactor   the sidebar  ".chars() {
@@ -2453,7 +2689,7 @@ mod tests {
             ScreenRecognition::Recognized(evidence) if evidence.claim == AgentActivity::Idle
         ));
 
-        let observed = runtime.observe_with_terminal(session, Instant::now(), false, Some(&screen));
+        let observed = runtime.observe_with_terminal(session, Some(&screen));
         assert_eq!(observed.activity, AgentActivity::Blocked);
     }
 
@@ -2685,25 +2921,43 @@ mod tests {
         let spawned = runtime
             .spawn(AgentKind::Codex, &directory, 0, &config)
             .unwrap();
-        assert_eq!(
-            runtime.snapshot().agents[0].git.as_ref().unwrap().branch,
-            "main"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            runtime.poll_events();
+            if runtime.snapshot().agents[0]
+                .git
+                .as_ref()
+                .is_some_and(|git| git.branch == "main")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial Git context was not observed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
 
         run_git(&directory, &["switch", "-q", "-c", "feature/sidebar"]);
-        runtime.git_checked.insert(
-            spawned.id,
-            Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_millis(1),
-        );
-
-        let events = runtime.poll_events();
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                Event::AgentChanged { agent, .. }
-                    if agent.git.as_ref().is_some_and(|git| git.branch == "feature/sidebar")
-            )
-        }));
+        runtime.force_git_refresh(spawned.id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = runtime.poll_events();
+            if events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::AgentChanged { agent, .. }
+                        if agent.git.as_ref().is_some_and(|git| git.branch == "feature/sidebar")
+                )
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "updated Git branch was not observed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
 
         runtime.agents.stop_all();
         fs::remove_dir_all(directory).unwrap();
@@ -2753,11 +3007,8 @@ mod tests {
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        runtime.force_git_refresh(spawned.id);
         let observed = loop {
-            runtime.git_checked.insert(
-                spawned.id,
-                Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_millis(1),
-            );
             let _ = runtime.poll_events();
             let agent = runtime.snapshot().agents.remove(0);
             if agent.git.as_ref().is_some_and(|git| git.linked) || Instant::now() >= deadline {
