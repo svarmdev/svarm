@@ -168,12 +168,32 @@ const GROK_RULES: &[Rule] = &[
         any: &[],
         excluded: &[],
     },
+    Rule {
+        id: "grok.active-turn",
+        activity: AgentActivity::Working,
+        rows_from_bottom: STATUS_ROWS,
+        required: &[],
+        any: &[
+            "waiting for response",
+            "waiting on subagent",
+            "waiting on task output",
+            "waiting on tasks",
+            "send a message to interrupt",
+            ":cancel",
+        ],
+        excluded: &[],
+    },
 ];
 
 pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecognition> {
-    if kind != AgentKind::Codex {
-        return None;
+    match kind {
+        AgentKind::Codex => recognize_codex_title(title),
+        AgentKind::Grok => recognize_grok_title(title),
+        AgentKind::Claude => None,
     }
+}
+
+fn recognize_codex_title(title: &str) -> Option<TitleRecognition> {
     let (status, conversation_title) = title.split_once(" | ").unwrap_or((title, ""));
     let normalized = normalize(status);
     let (claim, rule, evidence) = if normalized.contains("action required") {
@@ -193,18 +213,119 @@ pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecog
         return None;
     };
 
-    Some(TitleRecognition {
+    Some(title_recognition(
+        AgentKind::Codex,
+        conversation_title,
+        claim,
+        rule,
+        evidence,
+    ))
+}
+
+fn recognize_grok_title(title: &str) -> Option<TitleRecognition> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts = trimmed
+        .split(" - ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !is_spinner_token(part))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut claim = None;
+    let mut evidence = None;
+    let mut conversation_parts = Vec::new();
+    for part in &parts {
+        match grok_title_part_activity(part) {
+            Some(activity) => {
+                if claim != Some(AgentActivity::Blocked) {
+                    claim = Some(activity);
+                    evidence = Some(*part);
+                }
+            }
+            None if normalize(part) != "grok" => conversation_parts.push(*part),
+            None => {}
+        }
+    }
+
+    let (claim, rule, evidence) = if let Some(claim) = claim {
+        let rule = if claim == AgentActivity::Blocked {
+            "grok.title-action-required"
+        } else {
+            "grok.title-active"
+        };
+        (claim, rule, evidence.unwrap_or(trimmed))
+    } else if parts.last().is_some_and(|part| normalize(part) == "grok") {
+        (AgentActivity::Idle, "grok.title-ready", trimmed)
+    } else {
+        return None;
+    };
+
+    Some(title_recognition(
+        AgentKind::Grok,
+        &conversation_parts.join(" - "),
+        claim,
+        rule,
+        evidence,
+    ))
+}
+
+fn title_recognition(
+    provider: AgentKind,
+    conversation_title: &str,
+    claim: AgentActivity,
+    rule: &'static str,
+    evidence: &str,
+) -> TitleRecognition {
+    TitleRecognition {
         conversation_title: (!conversation_title.trim().is_empty())
             .then(|| conversation_title.trim())
             .filter(|title| !looks_like_uuid(title))
             .map(str::to_owned),
         evidence: RecognitionEvidence {
-            provider: kind,
+            provider,
             claim,
             rule: rule.into(),
             evidence: evidence.into(),
         },
-    })
+    }
+}
+
+fn grok_title_part_activity(part: &str) -> Option<AgentActivity> {
+    let normalized = strip_title_ellipsis(&normalize(part));
+    if normalized.contains("action required") {
+        return Some(AgentActivity::Blocked);
+    }
+    let working = matches!(
+        normalized.as_str(),
+        "thinking" | "responding" | "compacting" | "preparing" | "working" | "running tool"
+    ) || normalized.starts_with("waiting for response")
+        || normalized.starts_with("waiting on subagent")
+        || normalized.starts_with("waiting on task")
+        || normalized.starts_with("retrying")
+        || normalized.starts_with("running:");
+    working.then_some(AgentActivity::Working)
+}
+
+fn is_spinner_token(value: &str) -> bool {
+    let mut characters = value.chars();
+    match (characters.next(), characters.next()) {
+        (Some(character), None) => ('\u{2800}'..='\u{28FF}').contains(&character),
+        _ => false,
+    }
+}
+
+fn strip_title_ellipsis(value: &str) -> String {
+    value
+        .trim_end_matches('…')
+        .trim_end_matches("...")
+        .trim()
+        .to_owned()
 }
 
 pub(crate) fn looks_like_uuid(value: &str) -> bool {
@@ -439,6 +560,7 @@ mod tests {
             );
         }
         assert!(recognize_title(AgentKind::Claude, "Ready | Conversation").is_none());
+        assert!(recognize_title(AgentKind::Grok, "Ready | Conversation").is_none());
         assert!(recognize_title(AgentKind::Codex, "Conversation only").is_none());
         assert_eq!(
             recognize_title(
@@ -594,6 +716,73 @@ mod tests {
         assert_eq!(claim(AgentKind::Grok, &[b"Allow onc"]), None);
         assert_eq!(claim(AgentKind::Grok, &[b"esc to interrupt"]), None);
         assert_eq!(claim(AgentKind::Grok, &["❯ ".as_bytes()]), None);
+    }
+
+    #[test]
+    fn grok_recognizes_working_from_status_line_and_cancel_hint() {
+        assert_eq!(
+            claim(
+                AgentKind::Grok,
+                &[b"Waiting for respo", b"nse\r\nEsc  :cancel"]
+            ),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(AgentKind::Grok, &[b"Waiting on subagent"]),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(AgentKind::Grok, &[b"Waiting on task output"]),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::Grok,
+                &[b"1 command still running | send a message to interrupt"]
+            ),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(claim(AgentKind::Grok, &[b"Waiting for respo"]), None);
+        assert_eq!(claim(AgentKind::Grok, &[b":cance"]), None);
+        assert_eq!(claim(AgentKind::Grok, &[b"1 command still running"]), None);
+    }
+
+    #[test]
+    fn grok_title_reports_live_state_and_session_name() {
+        for (title, expected, session) in [
+            (
+                "⠦ - Waiting for response… - grok",
+                AgentActivity::Working,
+                None,
+            ),
+            ("⠹ - Thinking - grok", AgentActivity::Working, None),
+            ("⠸ - Responding - grok", AgentActivity::Working, None),
+            (
+                "⠦ - Thinking - Refactor sidebar - grok",
+                AgentActivity::Working,
+                Some("Refactor sidebar"),
+            ),
+            ("Action Required - grok", AgentActivity::Blocked, None),
+            ("grok", AgentActivity::Idle, None),
+            (
+                "Simple 2+2 Arithmetic Question - grok",
+                AgentActivity::Idle,
+                Some("Simple 2+2 Arithmetic Question"),
+            ),
+        ] {
+            let recognized = recognize_title(AgentKind::Grok, title).unwrap();
+            assert_eq!(recognized.evidence.claim, expected, "{title}");
+            assert_eq!(recognized.conversation_title.as_deref(), session, "{title}");
+        }
+        // A session name that merely mentions thinking is not an activity segment.
+        let named = recognize_title(AgentKind::Grok, "Thinking about rust - grok").unwrap();
+        assert_eq!(named.evidence.claim, AgentActivity::Idle);
+        assert_eq!(
+            named.conversation_title.as_deref(),
+            Some("Thinking about rust")
+        );
+        assert!(recognize_title(AgentKind::Grok, "Conversation only").is_none());
+        assert!(recognize_title(AgentKind::Grok, "Ready | Conversation").is_none());
     }
 
     #[test]
