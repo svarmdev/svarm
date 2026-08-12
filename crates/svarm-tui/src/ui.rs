@@ -357,6 +357,8 @@ fn render_sidebar(
         .iter()
         .enumerate()
         .map(|(index, agent)| {
+            let selected = index == app.selected_index();
+            let marker = if selected { "▌" } else { " " };
             let status = agent.display_status();
             let (circle, status_style) = status_display(status, colors_enabled);
             let content_width = usize::from(agents_area.width.saturating_sub(2));
@@ -375,20 +377,14 @@ fn render_sidebar(
                 .to_string_lossy();
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(
-                        if index == app.selected_index() {
-                            "▌"
-                        } else {
-                            " "
-                        },
-                        accent(theme),
-                    ),
+                    Span::styled(marker, accent(theme)),
                     Span::styled(format!("{circle} "), status_style),
                     Span::styled(number, theme.muted()),
                     Span::styled(title, text(theme).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
-                    Span::raw("  "),
+                    Span::styled(marker, accent(theme)),
+                    Span::raw(" "),
                     Span::styled(agent.kind().label(), text(theme)),
                     Span::styled(" · ", theme.muted()),
                     Span::styled(
@@ -422,16 +418,17 @@ fn render_sidebar(
                     .saturating_sub(deletions.chars().count())
                     .saturating_sub(tracking.chars().count());
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
+                    Span::styled(marker, accent(theme)),
+                    Span::raw(" "),
                     Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
                     Span::styled(additions, success(theme)),
                     Span::styled(deletions, Style::default().fg(theme.error)),
                     Span::styled(tracking, theme.muted()),
                 ]));
             } else {
-                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(marker, accent(theme))));
             }
-            ListItem::new(lines).style(if index == app.selected_index() {
+            ListItem::new(lines).style(if selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -1322,6 +1319,27 @@ mod tests {
         assert!(rendered.contains("Codex · plain-directory"));
         assert!(rendered.contains("Codex · project-eight"));
         assert!(rendered.contains("featur… +557 -300 ↑2 ↓4"), "{rendered}");
+        assert_eq!(
+            rendered.matches('▌').count(),
+            usize::from(AGENT_CARD_HEIGHT)
+        );
+
+        let plain = agent(1, SessionStatus::Exited, 1, 1);
+        let plain_app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary.clone(),
+                selected_agent_id: Some(plain.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![plain],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+        assert_eq!(
+            render_app_text(&plain_app).matches('▌').count(),
+            usize::from(AGENT_CARD_HEIGHT)
+        );
 
         let mut clean = agent(2, SessionStatus::Running, 2, 1);
         let git = clean.git.as_mut().unwrap();
