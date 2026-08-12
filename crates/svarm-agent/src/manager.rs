@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{Receiver, SyncSender, sync_channel},
@@ -143,6 +143,12 @@ impl AgentManager {
         self.sessions
             .get(&id)
             .map(|session| session.viewport(requested))
+    }
+
+    pub(crate) fn working_directory(&self, id: AgentId) -> Option<PathBuf> {
+        self.sessions
+            .get(&id)
+            .and_then(AgentSession::working_directory)
     }
 
     pub fn terminal_modes(&self, id: AgentId) -> Option<crate::protocol::TerminalModes> {

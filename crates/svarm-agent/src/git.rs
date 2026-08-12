@@ -6,7 +6,14 @@ pub(crate) fn context(path: &Path) -> Option<GitContext> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--abbrev-ref",
+            "HEAD",
+            "--git-dir",
+            "--git-common-dir",
+        ])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .output()
@@ -48,6 +55,10 @@ fn parse(output: &str) -> Option<GitContext> {
     if worktree.is_empty() || branch.is_empty() {
         return None;
     }
+    // A linked worktree keeps its own git directory under the repository's common one; the main
+    // checkout reports the same path twice.
+    let git_directory = lines.next().map(str::trim);
+    let common_directory = lines.next().map(str::trim);
     Some(GitContext {
         branch: if branch == "HEAD" {
             "detached".into()
@@ -55,6 +66,7 @@ fn parse(output: &str) -> Option<GitContext> {
             branch.into()
         },
         worktree: worktree.into(),
+        linked: git_directory.is_some() && git_directory != common_directory,
         additions: 0,
         deletions: 0,
         ahead: None,
@@ -115,17 +127,24 @@ mod tests {
     #[test]
     fn parses_branch_and_detached_worktree_contexts() {
         assert_eq!(
-            parse("/tmp/project\nfeature/sidebar\n"),
+            parse("/tmp/project\nfeature/sidebar\n.git\n.git\n"),
             Some(GitContext {
                 branch: "feature/sidebar".into(),
                 worktree: "/tmp/project".into(),
+                linked: false,
                 additions: 0,
                 deletions: 0,
                 ahead: None,
                 behind: None,
             })
         );
+        assert!(
+            parse("/tmp/linked\nlinked-branch\n/tmp/project/.git/worktrees/linked\n/tmp/project/.git\n")
+                .unwrap()
+                .linked
+        );
         assert_eq!(parse("/tmp/project\nHEAD\n").unwrap().branch, "detached");
+        assert!(!parse("/tmp/project\nHEAD\n").unwrap().linked);
         assert_eq!(parse("fatal: not a repository\n"), None);
     }
 
@@ -163,7 +182,9 @@ mod tests {
                 "initial",
             ],
         );
-        assert_eq!(context(&root).unwrap().branch, "main");
+        let main_context = context(&root).unwrap();
+        assert_eq!(main_context.branch, "main");
+        assert!(!main_context.linked);
 
         run(&root, &["switch", "-q", "-c", "feature/sidebar"]);
         fs::write(root.join("tracked.txt"), "old\n").unwrap();
@@ -203,6 +224,7 @@ mod tests {
         let linked_context = context(&linked).unwrap();
         assert_eq!(linked_context.branch, "linked-branch");
         assert_eq!(linked_context.worktree, linked.canonicalize().unwrap());
+        assert!(linked_context.linked);
 
         fs::remove_dir_all(&linked).unwrap();
         fs::remove_dir_all(&root).unwrap();

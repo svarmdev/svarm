@@ -242,11 +242,11 @@ fn apply_remote_update(
     match update {
         RemoteUpdate::Event(event) => match *event {
             ServerEvent::AgentAdded { agent, .. } => {
-                app.add_remote_agent(agent);
+                app.add_remote_agent(*agent);
                 dirty = true;
             }
             ServerEvent::AgentChanged { agent, .. } => {
-                dirty |= app.update_remote_agent(agent);
+                dirty |= app.update_remote_agent(*agent);
             }
             ServerEvent::AgentRemoved { agent_id, .. } => {
                 app.remove_agent(agent_id);
