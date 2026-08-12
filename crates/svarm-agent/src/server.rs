@@ -529,32 +529,51 @@ impl SessionRuntime {
         now: Instant,
         force_git: bool,
     ) -> ObservedAgent {
+        let screen_changed = self
+            .previous
+            .get(&session.id)
+            .is_none_or(|previous| previous.session.output_generation != session.output_generation);
+        let terminal = screen_changed
+            .then(|| self.agents.terminal_snapshot(session.id))
+            .flatten();
+        self.observe_with_terminal(session, now, force_git, terminal.as_ref())
+    }
+
+    fn observe_with_terminal(
+        &mut self,
+        session: SessionSnapshot,
+        now: Instant,
+        force_git: bool,
+        screen: Option<&TerminalSnapshot>,
+    ) -> ObservedAgent {
         let previous = self.previous.get(&session.id).cloned();
-        let screen = self.agents.with_terminal(session.id, |screen| {
-            (
-                screen.state.title.trim().to_owned(),
-                recognition::recognize(session.kind, screen),
-            )
-        });
-        let (title, screen_recognition) =
-            screen.unwrap_or((String::new(), ScreenRecognition::Unknown));
-        let title_recognition = recognition::recognize_title(session.kind, &title);
-        // Provider titles still contribute status evidence, but thread names come from the first
-        // user message below.
-        let _ = title_recognition
-            .as_ref()
-            .and_then(|recognized| recognized.conversation_title.as_ref());
         let conversation_title = self
             .input_drafts
             .get(&session.id)
             .and_then(InputDraft::title)
             .map(str::to_owned);
-        let recognition = match screen_recognition {
-            ScreenRecognition::Recognized(evidence) => Some(evidence),
-            ScreenRecognition::Preserve => previous
+        let recognition = if let Some(screen) = screen {
+            let screen_recognition = recognition::recognize(session.kind, screen);
+            let title_recognition =
+                recognition::recognize_title(session.kind, screen.state.title.trim());
+            // Provider titles still contribute status evidence, but thread names come from the
+            // first user message above.
+            let _ = title_recognition
                 .as_ref()
-                .and_then(|agent| agent.recognition.clone()),
-            ScreenRecognition::Unknown => title_recognition.map(|recognized| recognized.evidence),
+                .and_then(|recognized| recognized.conversation_title.as_ref());
+            match screen_recognition {
+                ScreenRecognition::Recognized(evidence) => Some(evidence),
+                ScreenRecognition::Preserve => previous
+                    .as_ref()
+                    .and_then(|agent| agent.recognition.clone()),
+                ScreenRecognition::Unknown => {
+                    title_recognition.map(|recognized| recognized.evidence)
+                }
+            }
+        } else {
+            previous
+                .as_ref()
+                .and_then(|agent| agent.recognition.clone())
         };
         let activity = recognition
             .as_ref()
@@ -619,8 +638,17 @@ impl SessionRuntime {
     }
 
     fn terminal_event(&mut self, id: AgentId, force_full: bool) -> Option<Event> {
+        self.terminal_event_with_snapshot(id, force_full, None)
+    }
+
+    fn terminal_event_with_snapshot(
+        &mut self,
+        id: AgentId,
+        force_full: bool,
+        terminal: Option<TerminalSnapshot>,
+    ) -> Option<Event> {
         let agent = self.agents.snapshot(id)?;
-        let terminal = self.agents.terminal_snapshot(id)?;
+        let terminal = terminal.or_else(|| self.agents.terminal_snapshot(id))?;
         let old_basis = self.frame_bases.remove(&id);
         let previous = old_basis.as_ref().filter(|_| !force_full);
         let payload = previous
@@ -723,13 +751,20 @@ impl SessionRuntime {
         let attached = self.state.attachment().is_some();
         let now = Instant::now();
         let mut changed = Vec::new();
-        let mut terminal_ids = Vec::new();
+        let mut terminals = Vec::new();
         for result in self.agents.poll() {
             let Ok(snapshot) = result else {
                 continue;
             };
             let previous = self.previous.get(&snapshot.id).cloned();
-            let observed = self.observe(snapshot.clone(), now, false);
+            let screen_changed = previous.as_ref().is_none_or(|previous| {
+                previous.session.output_generation != snapshot.output_generation
+            });
+            let terminal = screen_changed
+                .then(|| self.agents.terminal_snapshot(snapshot.id))
+                .flatten();
+            let observed =
+                self.observe_with_terminal(snapshot.clone(), now, false, terminal.as_ref());
             if previous.as_ref() != Some(&observed) {
                 changed.push(snapshot.clone());
             }
@@ -740,7 +775,7 @@ impl SessionRuntime {
                         old.session.output_generation != snapshot.output_generation
                     }))
             {
-                terminal_ids.push(snapshot.id);
+                terminals.push((snapshot.id, terminal));
             }
         }
         if !changed.is_empty() {
@@ -754,8 +789,8 @@ impl SessionRuntime {
                 agent: self.agent_snapshot(snapshot),
             })
             .collect::<Vec<_>>();
-        for id in terminal_ids {
-            if let Some(event) = self.terminal_event(id, false) {
+        for (id, terminal) in terminals {
+            if let Some(event) = self.terminal_event_with_snapshot(id, false, terminal) {
                 events.push(event);
             }
         }
