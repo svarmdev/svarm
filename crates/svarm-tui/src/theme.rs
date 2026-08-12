@@ -1,7 +1,12 @@
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
-// Sele's palettes, kept local because Svarm only needs a theme preference.
+// Named palettes use official source colors mapped onto Svarm's semantic slots.
+// Solarized: ethanschoonover.com/solarized
+// Catppuccin: catppuccin.com/palette
+// Tokyo Night (Night): folke/tokyonight.nvim extras/lua/tokyonight_night.lua
+// Gruvbox Dark (medium): morhetz/gruvbox
+// Nord: nordtheme.com/docs/colors-and-palettes
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -160,7 +165,7 @@ impl ThemeName {
                 selection: rgb(0x45475a),
                 on_selection: rgb(0xcdd6f4),
                 border: rgb(0x585b70),
-                text: rgb(0xbac2de),
+                text: rgb(0xcdd6f4),
                 dim: rgb(0x7f849c),
                 strong: rgb(0xcdd6f4),
                 accent: rgb(0x89b4fa),
@@ -174,7 +179,7 @@ impl ThemeName {
                 selection: rgb(0xccd0da),
                 on_selection: rgb(0x4c4f69),
                 border: rgb(0xacb0be),
-                text: rgb(0x5c5f77),
+                text: rgb(0x4c4f69),
                 dim: rgb(0x8c8fa1),
                 strong: rgb(0x4c4f69),
                 accent: rgb(0x1e66f5),
@@ -184,11 +189,11 @@ impl ThemeName {
             },
             Self::TokyoNight => Theme {
                 bg: rgb(0x1a1b26),
-                surface: rgb(0x24283b),
-                selection: rgb(0x364a82),
+                surface: rgb(0x292e42),
+                selection: rgb(0x283457),
                 on_selection: rgb(0xc0caf5),
                 border: rgb(0x3b4261),
-                text: rgb(0xa9b1d6),
+                text: rgb(0xc0caf5),
                 dim: rgb(0x565f89),
                 strong: rgb(0xc0caf5),
                 accent: rgb(0x7aa2f7),
@@ -217,7 +222,7 @@ impl ThemeName {
                 on_selection: rgb(0xeceff4),
                 border: rgb(0x4c566a),
                 text: rgb(0xd8dee9),
-                dim: rgb(0x616e88),
+                dim: rgb(0x4c566a),
                 strong: rgb(0xeceff4),
                 accent: rgb(0x88c0d0),
                 ok: rgb(0xa3be8c),
@@ -311,6 +316,129 @@ mod tests {
         assert_eq!(
             ThemeName::TokyoNight.theme(false),
             ThemeName::Monochrome.palette()
+        );
+    }
+
+    #[test]
+    fn named_palettes_use_official_source_colors() {
+        assert_eq!(
+            ThemeName::SolarizedDark.palette(),
+            Theme {
+                bg: rgb(0x002b36),
+                surface: rgb(0x073642),
+                selection: rgb(0x586e75),
+                on_selection: rgb(0xfdf6e3),
+                border: rgb(0x586e75),
+                text: rgb(0x839496),
+                dim: rgb(0x586e75),
+                strong: rgb(0x93a1a1),
+                accent: rgb(0x268bd2),
+                ok: rgb(0x859900),
+                warn: rgb(0xb58900),
+                error: rgb(0xdc322f),
+            }
+        );
+        assert_eq!(
+            ThemeName::SolarizedLight.palette(),
+            Theme {
+                bg: rgb(0xfdf6e3),
+                surface: rgb(0xeee8d5),
+                selection: rgb(0x93a1a1),
+                on_selection: rgb(0x002b36),
+                border: rgb(0x93a1a1),
+                text: rgb(0x657b83),
+                dim: rgb(0x93a1a1),
+                strong: rgb(0x586e75),
+                accent: rgb(0x268bd2),
+                ok: rgb(0x859900),
+                warn: rgb(0xcb4b16),
+                error: rgb(0xdc322f),
+            }
+        );
+        assert_eq!(
+            ThemeName::CatppuccinMocha.palette(),
+            Theme {
+                bg: rgb(0x1e1e2e),
+                surface: rgb(0x313244),
+                selection: rgb(0x45475a),
+                on_selection: rgb(0xcdd6f4),
+                border: rgb(0x585b70),
+                text: rgb(0xcdd6f4),
+                dim: rgb(0x7f849c),
+                strong: rgb(0xcdd6f4),
+                accent: rgb(0x89b4fa),
+                ok: rgb(0xa6e3a1),
+                warn: rgb(0xf9e2af),
+                error: rgb(0xf38ba8),
+            }
+        );
+        assert_eq!(
+            ThemeName::CatppuccinLatte.palette(),
+            Theme {
+                bg: rgb(0xeff1f5),
+                surface: rgb(0xe6e9ef),
+                selection: rgb(0xccd0da),
+                on_selection: rgb(0x4c4f69),
+                border: rgb(0xacb0be),
+                text: rgb(0x4c4f69),
+                dim: rgb(0x8c8fa1),
+                strong: rgb(0x4c4f69),
+                accent: rgb(0x1e66f5),
+                ok: rgb(0x40a02b),
+                warn: rgb(0xdf8e1d),
+                error: rgb(0xd20f39),
+            }
+        );
+        assert_eq!(
+            ThemeName::TokyoNight.palette(),
+            Theme {
+                bg: rgb(0x1a1b26),
+                surface: rgb(0x292e42),
+                selection: rgb(0x283457),
+                on_selection: rgb(0xc0caf5),
+                border: rgb(0x3b4261),
+                text: rgb(0xc0caf5),
+                dim: rgb(0x565f89),
+                strong: rgb(0xc0caf5),
+                accent: rgb(0x7aa2f7),
+                ok: rgb(0x9ece6a),
+                warn: rgb(0xe0af68),
+                error: rgb(0xf7768e),
+            }
+        );
+        assert_eq!(
+            ThemeName::GruvboxDark.palette(),
+            Theme {
+                bg: rgb(0x282828),
+                surface: rgb(0x3c3836),
+                selection: rgb(0x504945),
+                on_selection: rgb(0xfbf1c7),
+                border: rgb(0x665c54),
+                text: rgb(0xebdbb2),
+                dim: rgb(0x928374),
+                strong: rgb(0xfbf1c7),
+                accent: rgb(0x83a598),
+                ok: rgb(0xb8bb26),
+                warn: rgb(0xfabd2f),
+                error: rgb(0xfb4934),
+            }
+        );
+        assert_eq!(
+            ThemeName::Nord.palette(),
+            Theme {
+                bg: rgb(0x2e3440),
+                surface: rgb(0x3b4252),
+                selection: rgb(0x434c5e),
+                on_selection: rgb(0xeceff4),
+                border: rgb(0x4c566a),
+                text: rgb(0xd8dee9),
+                dim: rgb(0x4c566a),
+                strong: rgb(0xeceff4),
+                accent: rgb(0x88c0d0),
+                ok: rgb(0xa3be8c),
+                warn: rgb(0xebcb8b),
+                error: rgb(0xbf616a),
+            }
         );
     }
 }
