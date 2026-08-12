@@ -365,6 +365,14 @@ fn render_sidebar(
                 agent.conversation_title().unwrap_or("Unnamed conversation"),
                 usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
             );
+            let directory = agent
+                .git()
+                .map(|git| git.worktree.as_path())
+                .unwrap_or_else(|| agent.launch_directory());
+            let directory = directory
+                .file_name()
+                .unwrap_or(directory.as_os_str())
+                .to_string_lossy();
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
@@ -382,19 +390,36 @@ fn render_sidebar(
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(agent.kind().label(), text(theme)),
+                    Span::styled(" · ", theme.muted()),
+                    Span::styled(
+                        end_truncate(
+                            &directory,
+                            content_width.saturating_sub(agent.kind().label().chars().count() + 5),
+                        ),
+                        text(theme),
+                    ),
                 ]),
             ];
             if let Some(git) = agent.git() {
-                let worktree = git
-                    .worktree
-                    .file_name()
-                    .unwrap_or(git.worktree.as_os_str())
-                    .to_string_lossy();
-                let value =
-                    paired_truncate(&worktree, &git.branch, content_width.saturating_sub(2));
+                let tracking = git
+                    .ahead
+                    .zip(git.behind)
+                    .map_or_else(String::new, |(ahead, behind)| {
+                        format!(" ↑{ahead} ↓{behind}")
+                    });
+                let additions = format!(" +{}", git.additions);
+                let deletions = format!(" -{}", git.deletions);
+                let branch_width = content_width
+                    .saturating_sub(2)
+                    .saturating_sub(additions.chars().count())
+                    .saturating_sub(deletions.chars().count())
+                    .saturating_sub(tracking.chars().count());
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(value, accent(theme)),
+                    Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
+                    Span::styled(additions, success(theme)),
+                    Span::styled(deletions, Style::default().fg(theme.error)),
+                    Span::styled(tracking, theme.muted()),
                 ]));
             } else {
                 lines.push(Line::default());
@@ -457,22 +482,6 @@ fn end_truncate(value: &str, width: usize) -> String {
         truncated.push('…');
     }
     truncated
-}
-
-fn paired_truncate(left: &str, right: &str, width: usize) -> String {
-    const SEPARATOR: &str = " · ";
-    if width <= SEPARATOR.chars().count() {
-        return end_truncate(left, width);
-    }
-    let available = width - SEPARATOR.chars().count();
-    let left_width = available / 2;
-    let right_width = available - left_width;
-    format!(
-        "{}{}{}",
-        end_truncate(left, left_width),
-        SEPARATOR,
-        end_truncate(right, right_width)
-    )
 }
 
 fn status_display(status: AgentDisplayStatus, colors_enabled: bool) -> (&'static str, Style) {
@@ -1256,7 +1265,11 @@ mod tests {
         let agent = |id, status, output_generation, seen_generation| AgentSnapshot {
             id: svarm_agent::AgentId::new(id),
             kind: svarm_agent::AgentKind::Codex,
-            launch_directory: PathBuf::from("/tmp/project-eight"),
+            launch_directory: PathBuf::from(if id == 1 {
+                "/tmp/plain-directory"
+            } else {
+                "/tmp/project-eight"
+            }),
             status,
             exit: (status == SessionStatus::Exited).then_some(svarm_agent::ProcessExit {
                 code: 1,
@@ -1274,6 +1287,10 @@ mod tests {
             git: (id == 2).then_some(GitContext {
                 branch: "feature/sidebar".into(),
                 worktree: "/tmp/project-eight".into(),
+                additions: 557,
+                deletions: 300,
+                ahead: Some(2),
+                behind: Some(4),
             }),
         };
         let exited = agent(1, SessionStatus::Exited, 1, 1);
@@ -1295,7 +1312,9 @@ mod tests {
         assert!(!rendered.contains("failed"));
         assert!(!rendered.contains("done"));
         assert!(!rendered.contains("/tmp/project-eight"));
-        assert!(rendered.contains("project-e… · feature/s…"));
+        assert!(rendered.contains("Codex · plain-directory"));
+        assert!(rendered.contains("Codex · project-eight"));
+        assert!(rendered.contains("featur… +557 -300 ↑2 ↓4"), "{rendered}");
 
         let theme = crate::theme::ThemeName::CatppuccinMocha.theme(true);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

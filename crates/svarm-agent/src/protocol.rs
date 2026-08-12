@@ -9,7 +9,7 @@ use crate::{
 
 pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -359,6 +359,10 @@ pub enum AgentActivity {
 pub struct GitContext {
     pub branch: String,
     pub worktree: PathBuf,
+    pub additions: u64,
+    pub deletions: u64,
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -586,7 +590,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_seven_spawn_request_has_a_stable_launch_directory() {
+    fn protocol_eight_spawn_request_has_a_stable_launch_directory() {
         let request = Request::SpawnAgent {
             lease_token: LeaseToken("lease".into()),
             kind: AgentKind::Codex,
@@ -605,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_seven_session_requests_are_workspace_neutral_and_id_targeted() {
+    fn protocol_eight_session_requests_are_workspace_neutral_and_id_targeted() {
         assert_eq!(
             serde_json::to_value(Request::CreateSession {
                 rows: 24,

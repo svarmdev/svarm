@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use svarm_agent::SessionSnapshot;
@@ -348,6 +348,10 @@ impl AgentState {
 
     pub const fn kind(&self) -> AgentKind {
         self.kind
+    }
+
+    pub fn launch_directory(&self) -> &Path {
+        &self.launch_directory
     }
 
     pub const fn status(&self) -> SessionStatus {

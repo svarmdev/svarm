@@ -14,7 +14,31 @@ pub(crate) fn context(path: &Path) -> Option<GitContext> {
     if !output.status.success() {
         return None;
     }
-    parse(&String::from_utf8(output.stdout).ok()?)
+    let mut context = parse(&String::from_utf8(output.stdout).ok()?)?;
+    if let Some(output) = git_output(path, &["diff", "--numstat", "HEAD", "--"])
+        .or_else(|| git_output(path, &["diff", "--cached", "--numstat", "--"]))
+    {
+        (context.additions, context.deletions) = parse_diff(&output);
+    }
+    if let Some(output) = git_output(
+        path,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    ) {
+        (context.ahead, context.behind) = parse_tracking(&output);
+    }
+    Some(context)
+}
+
+fn git_output(path: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 fn parse(output: &str) -> Option<GitContext> {
@@ -31,7 +55,50 @@ fn parse(output: &str) -> Option<GitContext> {
             branch.into()
         },
         worktree: worktree.into(),
+        additions: 0,
+        deletions: 0,
+        ahead: None,
+        behind: None,
     })
+}
+
+fn parse_diff(output: &[u8]) -> (u64, u64) {
+    output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.split(|byte| *byte == b'\t');
+            let additions = std::str::from_utf8(fields.next()?)
+                .ok()?
+                .parse::<u64>()
+                .ok()?;
+            let deletions = std::str::from_utf8(fields.next()?)
+                .ok()?
+                .parse::<u64>()
+                .ok()?;
+            Some((additions, deletions))
+        })
+        .fold((0_u64, 0_u64), |totals, change| {
+            (
+                totals.0.saturating_add(change.0),
+                totals.1.saturating_add(change.1),
+            )
+        })
+}
+
+fn parse_tracking(output: &[u8]) -> (Option<u64>, Option<u64>) {
+    let mut counts = output.split(|byte| byte.is_ascii_whitespace());
+    let ahead = counts
+        .next()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse().ok());
+    let behind = counts
+        .next()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse().ok());
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => (Some(ahead), Some(behind)),
+        _ => (None, None),
+    }
 }
 
 #[cfg(test)]
@@ -52,10 +119,24 @@ mod tests {
             Some(GitContext {
                 branch: "feature/sidebar".into(),
                 worktree: "/tmp/project".into(),
+                additions: 0,
+                deletions: 0,
+                ahead: None,
+                behind: None,
             })
         );
         assert_eq!(parse("/tmp/project\nHEAD\n").unwrap().branch, "detached");
         assert_eq!(parse("fatal: not a repository\n"), None);
+    }
+
+    #[test]
+    fn parses_worktree_diff_and_upstream_counts() {
+        assert_eq!(
+            parse_diff(b"557\t300\tsrc/main.rs\n-\t-\tasset.bin\n"),
+            (557, 300)
+        );
+        assert_eq!(parse_tracking(b"2\t4\n"), (Some(2), Some(4)));
+        assert_eq!(parse_tracking(b""), (None, None));
     }
 
     #[test]
@@ -85,7 +166,28 @@ mod tests {
         assert_eq!(context(&root).unwrap().branch, "main");
 
         run(&root, &["switch", "-q", "-c", "feature/sidebar"]);
-        assert_eq!(context(&root).unwrap().branch, "feature/sidebar");
+        fs::write(root.join("tracked.txt"), "old\n").unwrap();
+        run(&root, &["add", "tracked.txt"]);
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=Svarm Test",
+                "-c",
+                "user.email=svarm@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "add tracked file",
+            ],
+        );
+        fs::write(root.join("tracked.txt"), "new\nmore\n").unwrap();
+        let feature_context = context(&root).unwrap();
+        assert_eq!(feature_context.branch, "feature/sidebar");
+        assert_eq!(
+            (feature_context.additions, feature_context.deletions),
+            (2, 1)
+        );
 
         run(
             &root,
