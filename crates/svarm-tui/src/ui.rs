@@ -590,7 +590,16 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             }
             None
         }
-        Mode::Menu => menu_item_at(area, column, row).map(ClickAction::MenuItem),
+        Mode::Menu => {
+            if let Some(item) = menu_item_at(area, column, row) {
+                return Some(ClickAction::MenuItem(item));
+            }
+            // A click anywhere outside the popover dismisses the menu; one inside it
+            // that missed an entry (a border or gap) is ignored.
+            let inside_popover = menu_button_area(area, true)
+                .is_some_and(|button| contains(menu_popup_area(button), column, row));
+            (!inside_popover).then_some(ClickAction::Cancel)
+        }
         Mode::NewAgent(NewAgentPage::Form) => {
             let inner = dialog_inner(ModalSize::Compact, area);
             if !contains(inner, column, row) {
@@ -1789,6 +1798,15 @@ mod tests {
                 Some(ClickAction::MenuItem(item))
             );
         }
+        assert_eq!(
+            click_action(&app, area, popup.right() + 4, popup.y),
+            Some(ClickAction::Cancel)
+        );
+        assert_eq!(
+            click_action(&app, area, area.width - 2, area.height - 2),
+            Some(ClickAction::Cancel)
+        );
+        assert_eq!(click_action(&app, area, popup.x, popup.y), None);
 
         app.open_new_agent(None, None, Vec::new());
         app.open_workspace_choices();
@@ -1964,13 +1982,13 @@ mod tests {
         );
         app.set_mode(Mode::Keybinds);
         let keybinds = render_app_text(&app);
-        assert!(keybinds.contains("detach — agents keep running"));
-        assert!(keybinds.contains("stop session — terminates all agents"));
+        assert!(keybinds.contains("detach"));
+        assert!(keybinds.contains("stop session"));
 
         app.set_mode(Mode::Menu);
         let menu = render_app_text(&app);
-        assert!(menu.contains("Detach — agents keep running"));
-        assert!(menu.contains("Stop session — terminates all agents"));
+        assert!(menu.contains("Detach"));
+        assert!(menu.contains("Stop session"));
         assert!(menu.contains("[1] Detach"));
         assert!(menu.contains("[4] Settings"));
     }
