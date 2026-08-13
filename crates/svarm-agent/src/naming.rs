@@ -2,7 +2,8 @@
 //!
 //! The first message a user submits is kept as an immediate provisional name. This module asks the
 //! same coding agent the session runs — `claude -p` for a Claude session, `codex exec` for a Codex
-//! one, `grok -p` for a Grok Build session — for a shorter name, off the critical path, and hands
+//! one, `grok -p` for a Grok Build session, or `opencode run` for an OpenCode session — for a
+//! shorter name, off the critical path, and hands
 //! the result back through a channel.
 //! Recognition of a usable name is pure and independently testable; only [`TitleNamer`] touches
 //! processes and threads.
@@ -45,6 +46,11 @@ const SCRUBBED_ENV: &[&str] = &[
     crate::CLAUDE_SIGNAL_ENV,
     "GROK_SESSION_ID",
     "GROK_HOME",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_TUI_CONFIG",
+    "OPENCODE_PERMISSION",
 ];
 
 const fn default_model(kind: AgentKind) -> &'static str {
@@ -52,6 +58,9 @@ const fn default_model(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "haiku",
         AgentKind::Codex => "gpt-5.4-mini",
         AgentKind::Grok => "grok-4.6",
+        // An empty model lets OpenCode use its configured default. An explicit
+        // SVARM_AUTO_TITLE_MODEL is still passed through below.
+        AgentKind::OpenCode => "",
     }
 }
 
@@ -210,6 +219,7 @@ impl GeneratorRequest {
                     answer_file: None,
                     cleanup_dir: None,
                     json_text: false,
+                    opencode_json: false,
                 }
             }
         };
@@ -227,6 +237,7 @@ struct GeneratorInvocation {
     answer_file: Option<PathBuf>,
     cleanup_dir: Option<PathBuf>,
     json_text: bool,
+    opencode_json: bool,
 }
 
 impl GeneratorInvocation {
@@ -237,6 +248,7 @@ impl GeneratorInvocation {
             answer_file,
             cleanup_dir,
             json_text,
+            opencode_json,
         } = self;
         let stdout = run_generator(command, stdin.as_deref());
         let output = if let Some(path) = answer_file {
@@ -245,6 +257,8 @@ impl GeneratorInvocation {
             stdout.and(answer)
         } else if json_text {
             stdout.and_then(|text| grok_answer_text(&text))
+        } else if opencode_json {
+            stdout.and_then(|text| opencode_answer_text(&text))
         } else {
             stdout
         };
@@ -260,6 +274,16 @@ fn grok_answer_text(stdout: &str) -> Option<String> {
         return Some(text);
     }
     stdout.lines().rev().find_map(json_text_field)
+}
+
+fn opencode_answer_text(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        (value.get("type")?.as_str()? == "text")
+            .then(|| value.get("part")?.get("text")?.as_str())
+            .flatten()
+            .map(str::to_owned)
+    })
 }
 
 fn json_text_field(value: &str) -> Option<String> {
@@ -296,6 +320,7 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 answer_file: None,
                 cleanup_dir: None,
                 json_text: false,
+                opencode_json: false,
             }
         }
         AgentKind::Grok => {
@@ -333,6 +358,7 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 answer_file: None,
                 cleanup_dir: home,
                 json_text: true,
+                opencode_json: false,
             }
         }
         AgentKind::Codex => {
@@ -365,6 +391,23 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 answer_file: Some(answer_file),
                 cleanup_dir: None,
                 json_text: false,
+                opencode_json: false,
+            }
+        }
+        AgentKind::OpenCode => {
+            command.args(["run", "--format", "json", "--pure"]);
+            if !model.trim().is_empty() {
+                command.args(["--model", model]);
+            }
+            command.arg(format!("{SYSTEM_PROMPT}\n\n{}", user_message(log)));
+            prepare_generator_environment(&mut command);
+            GeneratorInvocation {
+                command,
+                stdin: None,
+                answer_file: None,
+                cleanup_dir: None,
+                json_text: false,
+                opencode_json: true,
             }
         }
     }
@@ -705,6 +748,28 @@ mod tests {
         if let Some(directory) = grok.cleanup_dir {
             let _ = std::fs::remove_dir_all(directory);
         }
+
+        let opencode = generator_command(AgentKind::OpenCode, "", "1. do a thing");
+        let opencode_args = opencode
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opencode.command.get_program(),
+            AgentKind::OpenCode.command()
+        );
+        assert_eq!(opencode_args.first().map(String::as_str), Some("run"));
+        assert!(
+            opencode_args
+                .windows(2)
+                .any(|pair| pair == ["--format", "json"])
+        );
+        assert!(opencode_args.contains(&"--pure".to_owned()));
+        assert!(!opencode_args.contains(&"--model".to_owned()));
+        assert!(opencode_args.last().unwrap().contains("1. do a thing"));
+        assert!(opencode.opencode_json);
+        assert_eq!(opencode.stdin, None);
     }
 
     #[test]
@@ -718,6 +783,18 @@ mod tests {
             Some("Archive modal rework".into())
         );
         assert_eq!(grok_answer_text("not json"), None);
+    }
+
+    #[test]
+    fn opencode_names_are_taken_from_json_text_events() {
+        assert_eq!(
+            opencode_answer_text(
+                "{\"type\":\"step_start\"}\n{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"Sidebar truncation fix\"}}\n"
+            )
+            .as_deref(),
+            Some("Sidebar truncation fix")
+        );
+        assert_eq!(opencode_answer_text("not json\n{}"), None);
     }
 
     #[test]

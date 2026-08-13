@@ -482,9 +482,10 @@ impl SessionRuntime {
         let namer = TitleNamer::disabled();
         #[cfg(not(test))]
         let namer = TitleNamer::from_environment();
-        Self::with_namer(state, wake, namer)
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
     }
 
+    #[cfg(test)]
     fn with_namer(
         state: ServerSessionState,
         wake: Option<crate::session::OutputNotifier>,

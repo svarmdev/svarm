@@ -311,6 +311,7 @@ pub(crate) fn agent_command(
             }
             command.arg("--fullscreen");
         }
+        AgentKind::OpenCode => {}
     }
     Ok(command)
 }
@@ -324,6 +325,7 @@ pub(crate) fn resume_agent_command(
     match kind {
         AgentKind::Codex => command.args(["resume", conversation_id]),
         AgentKind::Claude | AgentKind::Grok => command.args(["--resume", conversation_id]),
+        AgentKind::OpenCode => command.args(["--session", conversation_id]),
     }
     Ok(command)
 }
@@ -535,6 +537,16 @@ mod tests {
         assert!(grok_args.windows(2).any(|args| args == ["--resume", id]));
         assert!(grok_args.iter().any(|arg| arg == "--fullscreen"));
         assert!(!grok_args.iter().any(|arg| arg == "--session-id"));
+
+        let opencode = agent_command(AgentKind::OpenCode, &cwd, None).unwrap();
+        assert_eq!(opencode.get_argv(), &[std::ffi::OsString::from("opencode")]);
+        let opencode = resume_agent_command(AgentKind::OpenCode, &cwd, id).unwrap();
+        assert!(
+            opencode
+                .get_argv()
+                .windows(2)
+                .any(|args| args == ["--session", id])
+        );
     }
 
     #[test]

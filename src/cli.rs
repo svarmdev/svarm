@@ -162,6 +162,9 @@ mod tests {
         assert_eq!(grok.agent, Some(AgentKind::Grok));
         assert_eq!(remembered.path, None);
 
+        let opencode = Cli::try_parse_from(["svarm", "--agent", "opencode"]).unwrap();
+        assert_eq!(opencode.agent, Some(AgentKind::OpenCode));
+
         let new = Cli::try_parse_from(["svarm", "--new-session", "/tmp/workspace"]).unwrap();
         assert!(new.new_session);
         assert_eq!(new.path, Some(PathBuf::from("/tmp/workspace")));
