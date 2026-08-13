@@ -22,6 +22,7 @@ pub(crate) struct ConversationHistory {
     claude_projects: Option<PathBuf>,
     codex_sessions: Option<PathBuf>,
     grok_sessions: Option<PathBuf>,
+    pi_sessions: Option<PathBuf>,
 }
 
 impl ConversationHistory {
@@ -33,10 +34,16 @@ impl ConversationHistory {
         let grok_home = env::var_os("GROK_HOME")
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|home| home.join(".grok")));
+        let pi_home = env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".pi/agent")));
         Self {
             claude_projects: home.map(|home| home.join(".claude/projects")),
             codex_sessions: codex_home.map(|home| home.join("sessions")),
             grok_sessions: grok_home.map(|home| home.join("sessions")),
+            pi_sessions: env::var_os("PI_CODING_AGENT_SESSION_DIR")
+                .map(PathBuf::from)
+                .or_else(|| pi_home.map(|home| home.join("sessions"))),
         }
     }
 
@@ -46,6 +53,7 @@ impl ConversationHistory {
             claude_projects: Some(home.join(".claude/projects")),
             codex_sessions: Some(home.join(".codex/sessions")),
             grok_sessions: Some(home.join(".grok/sessions")),
+            pi_sessions: Some(home.join(".pi/agent/sessions")),
         }
     }
 
@@ -88,6 +96,11 @@ impl ConversationHistory {
                     })
                     .and_then(|path| first_line(&path, grok_prompt))
             }
+            AgentKind::Pi => self
+                .pi_sessions
+                .as_deref()
+                .and_then(|root| find_file(root, |name| name.contains(conversation_id)))
+                .and_then(|path| first_line(&path, pi_prompt)),
             AgentKind::OpenCode => export_opencode_prompt(conversation_id, working_directory),
         }
     }
@@ -161,6 +174,15 @@ fn codex_prompt(value: &Value) -> Option<String> {
         return None;
     }
     normalize_prompt(value.get("payload")?.get("message")?.as_str()?)
+}
+
+fn pi_prompt(value: &Value) -> Option<String> {
+    if value.get("type")?.as_str()? != "message"
+        || value.get("message")?.get("role")?.as_str()? != "user"
+    {
+        return None;
+    }
+    normalize_prompt(text_content(value.get("message")?.get("content")?)?)
 }
 
 fn export_opencode_prompt(conversation_id: &str, working_directory: &Path) -> Option<String> {
@@ -296,6 +318,25 @@ mod tests {
         assert_eq!(
             history.first_user_message(AgentKind::Codex, id, Path::new("/work")),
             Some("add tests to the parser".into())
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn finds_a_pi_prompt_in_a_session_file() {
+        let home = temp_home();
+        let id = "019ff1d3-375e-4a72-a176-c47497827e49";
+        write(
+            &home.join(format!(
+                ".pi/agent/sessions/--tmp-project--/20260813_{id}.jsonl"
+            )),
+            "{\"type\":\"session\",\"version\":3,\"id\":\"019ff1d3-375e-4a72-a176-c47497827e49\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"id\":\"a1b2c3d4\",\"parentId\":null,\"timestamp\":\"2026-08-13T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"fix   the Pi adapter\"}}\n",
+        );
+
+        let history = ConversationHistory::from_home(&home);
+        assert_eq!(
+            history.first_user_message(AgentKind::Pi, id, Path::new("/tmp/project")),
+            Some("fix the Pi adapter".into())
         );
         fs::remove_dir_all(home).unwrap();
     }

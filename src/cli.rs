@@ -162,6 +162,8 @@ mod tests {
         assert_eq!(grok.agent, Some(AgentKind::Grok));
         assert_eq!(remembered.path, None);
 
+        let pi = Cli::try_parse_from(["svarm", "--agent", "pi", "/tmp/workspace"]).unwrap();
+        assert_eq!(pi.agent, Some(AgentKind::Pi));
         let opencode = Cli::try_parse_from(["svarm", "--agent", "opencode"]).unwrap();
         assert_eq!(opencode.agent, Some(AgentKind::OpenCode));
 

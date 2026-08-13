@@ -1,6 +1,6 @@
 # Svarm
 
-Svarm is a terminal workspace for coding agents. It runs the native Codex, Claude Code, or Grok Build TUI in a real PTY, keeps multiple agents in one session, and provides a sidebar for switching between them. A per-user background server owns the agents, so the UI can detach and reconnect later.
+Svarm is a terminal workspace for coding agents. It runs the native Codex, Claude Code, Grok Build, or Pi TUI in a real PTY, keeps multiple agents in one session, and provides a sidebar for switching between them. A per-user background server owns the agents, so the UI can detach and reconnect later.
 
 Normal input goes directly to the focused agent, preserving the behavior of the native agent TUI.
 
@@ -8,7 +8,7 @@ Normal input goes directly to the focused agent, preserving the behavior of the 
 
 ## Install and run
 
-Codex, Claude Code, and/or Grok Build must already be installed and available on `PATH`.
+Codex, Claude Code, Grok Build, and/or Pi must already be installed and available on `PATH`.
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
@@ -35,6 +35,7 @@ svarm .                       # Open the new-agent form with this workspace
 svarm --agent codex .         # Start Codex here
 svarm --agent claude ../repo  # Claude Code in ../repo
 svarm --agent grok .          # Grok Build here
+svarm --agent pi .            # Pi here
 svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions

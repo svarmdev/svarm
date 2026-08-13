@@ -185,6 +185,27 @@ const GROK_RULES: &[Rule] = &[
     },
 ];
 
+const PI_RULES: &[Rule] = &[
+    // Pi has no built-in permission popups. Its native streaming indicator and abort hint are the
+    // only provider-owned working evidence we rely on here; extensions may render arbitrary UI.
+    Rule {
+        id: "pi.active-turn",
+        activity: AgentActivity::Working,
+        rows_from_bottom: STATUS_ROWS,
+        required: &["working..."],
+        any: &[],
+        excluded: &["you:"],
+    },
+    Rule {
+        id: "pi.ready-prompt",
+        activity: AgentActivity::Idle,
+        rows_from_bottom: STATUS_ROWS,
+        required: &[],
+        any: &["enter to send", "enter send"],
+        excluded: &["working", "esc to interrupt", "escape to abort"],
+    },
+];
+
 const OPENCODE_RULES: &[Rule] = &[
     Rule {
         id: "opencode.permission-dialog",
@@ -229,7 +250,7 @@ pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecog
     match kind {
         AgentKind::Codex => recognize_codex_title(title),
         AgentKind::Grok => recognize_grok_title(title),
-        AgentKind::Claude | AgentKind::OpenCode => None,
+        AgentKind::Claude | AgentKind::Pi | AgentKind::OpenCode => None,
     }
 }
 
@@ -434,9 +455,11 @@ impl ConversationIdDetector {
                 AgentKind::Codex if value.starts_with("0;") || value.starts_with("2;") => value
                     .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
                     .find(|value| looks_like_uuid(value)),
+                AgentKind::Codex => None,
                 AgentKind::Claude => value.strip_prefix("777;svarm-conversation="),
+                AgentKind::Pi => None,
+                AgentKind::Grok => None,
                 AgentKind::OpenCode => opencode_session_id(&value),
-                _ => None,
             };
             if let Some(candidate) = candidate.filter(|value| looks_like_uuid(value)) {
                 found = Some(candidate.to_ascii_lowercase());
@@ -482,6 +505,7 @@ pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRec
         AgentKind::Codex => CODEX_RULES,
         AgentKind::Claude => CLAUDE_RULES,
         AgentKind::Grok => GROK_RULES,
+        AgentKind::Pi => PI_RULES,
         AgentKind::OpenCode => OPENCODE_RULES,
     };
     for rule in rules {
@@ -663,6 +687,20 @@ mod tests {
     }
 
     #[test]
+    fn pi_recognizes_only_native_working_and_ready_evidence() {
+        assert_eq!(
+            claim(AgentKind::Pi, &[b"Working...", b"\r\nEsc to interrupt"]),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(AgentKind::Pi, &[b"You:\r\nEnter to send"]),
+            Some(AgentActivity::Idle)
+        );
+        assert_eq!(claim(AgentKind::Pi, &[b"working on a file"]), None);
+        assert_eq!(claim(AgentKind::Pi, &[b"You: working"]), None);
+    }
+
+    #[test]
     fn claude_recognizes_approvals_that_do_not_say_proceed() {
         assert_eq!(
             claim(
@@ -768,6 +806,15 @@ mod tests {
             None
         );
         assert_eq!(opencode.process(b"\x07"), Some(opencode_id.into()));
+    }
+
+    #[test]
+    fn pi_does_not_treat_arbitrary_terminal_titles_as_session_ids() {
+        let mut pi = ConversationIdDetector::new(AgentKind::Pi);
+        assert_eq!(
+            pi.process(b"\x1b]0;Pi - 019ff1d3-375e-7a72-a176-c47497827e49\x07"),
+            None
+        );
     }
 
     #[test]

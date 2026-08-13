@@ -4,7 +4,7 @@
 //! same coding agent the session runs — `claude -p` for a Claude session, `codex exec` for a Codex
 //! one, `grok -p` for a Grok Build session, or `opencode run` for an OpenCode session — for a
 //! shorter name, off the critical path, and hands
-//! the result back through a channel.
+//! the result back through a channel. Pi uses `pi -p` for a Pi session.
 //! Recognition of a usable name is pure and independently testable; only [`TitleNamer`] touches
 //! processes and threads.
 
@@ -46,6 +46,14 @@ const SCRUBBED_ENV: &[&str] = &[
     crate::CLAUDE_SIGNAL_ENV,
     "GROK_SESSION_ID",
     "GROK_HOME",
+    "PI_CODING_AGENT",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "PI_SESSION_ID",
+    "PI_SESSION_FILE",
+    "PI_PROVIDER",
+    "PI_MODEL",
+    "PI_REASONING_LEVEL",
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
     "OPENCODE_CONFIG_CONTENT",
@@ -58,6 +66,7 @@ const fn default_model(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "haiku",
         AgentKind::Codex => "gpt-5.4-mini",
         AgentKind::Grok => "grok-4.6",
+        AgentKind::Pi => "",
         // An empty model lets OpenCode use its configured default. An explicit
         // SVARM_AUTO_TITLE_MODEL is still passed through below.
         AgentKind::OpenCode => "",
@@ -410,6 +419,32 @@ fn generator_command(kind: AgentKind, model: &str, log: &str) -> GeneratorInvoca
                 opencode_json: true,
             }
         }
+        AgentKind::Pi => {
+            command.args([
+                "-p",
+                "--no-session",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "--no-tools",
+                "--system-prompt",
+                SYSTEM_PROMPT,
+                &user_message(log),
+            ]);
+            prepare_generator_environment(&mut command);
+            command.env("PI_OFFLINE", "1");
+            command.env("PI_SKIP_VERSION_CHECK", "1");
+            GeneratorInvocation {
+                command,
+                stdin: None,
+                answer_file: None,
+                cleanup_dir: None,
+                json_text: false,
+                opencode_json: false,
+            }
+        }
     }
 }
 
@@ -748,6 +783,29 @@ mod tests {
         if let Some(directory) = grok.cleanup_dir {
             let _ = std::fs::remove_dir_all(directory);
         }
+
+        let pi = generator_command(AgentKind::Pi, "", "1. do a thing");
+        let pi_args = pi
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(pi.command.get_program(), AgentKind::Pi.command());
+        assert_eq!(pi_args.first().map(String::as_str), Some("-p"));
+        for flag in [
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--no-tools",
+        ] {
+            assert!(pi_args.contains(&flag.to_owned()), "missing {flag}");
+        }
+        assert!(pi_args.last().unwrap().contains("1. do a thing"));
+        assert_eq!(pi.stdin, None);
+        assert_eq!(pi.answer_file, None);
 
         let opencode = generator_command(AgentKind::OpenCode, "", "1. do a thing");
         let opencode_args = opencode
