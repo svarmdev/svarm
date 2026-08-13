@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 mod cwd;
 pub mod framing;
 mod git;
+#[cfg(unix)]
+mod history;
 pub mod input;
 #[cfg(unix)]
 pub mod ipc;
