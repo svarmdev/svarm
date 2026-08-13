@@ -2879,6 +2879,86 @@ mod tests {
     }
 
     #[test]
+    fn external_conversation_switch_uses_its_first_prompt_for_naming() {
+        let directory = temp_dir();
+        let history_home = temp_dir();
+        let marker = directory.join("switch-now");
+        let old_id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let new_id = "129ff1d3-375e-7a72-a176-c47497827e49";
+        let history_path =
+            history_home.join(format!(".codex/sessions/2026/08/13/rollout-{new_id}.jsonl"));
+        fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        fs::write(
+            history_path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"fix the resumed workspace\"}}\n",
+        )
+        .unwrap();
+        let script = format!(
+            "printf '\\033]2;Ready | {old_id}\\a'; while [ ! -f '{}' ]; do sleep 0.01; done; printf '\\033]2;Ready | {new_id}\\a'; sleep 1",
+            marker.display()
+        );
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::with_namer_and_history(
+            state,
+            None,
+            TitleNamer::fixed("printf", &["Generated resumed name\\n"]),
+            ConversationHistory::from_home(&history_home),
+        );
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &script]);
+        runtime
+            .spawn(AgentKind::Codex, &directory, 0, &config)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_id.as_deref() != Some(old_id)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_id.as_deref(),
+            Some(old_id)
+        );
+
+        fs::write(&marker, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let switched = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches!(event, Event::ConversationSwitched { .. }))
+            {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "conversation did not switch");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            switched,
+            Event::ConversationSwitched { agent, .. }
+                if agent.conversation_title.as_deref() == Some("fix the resumed workspace")
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_title.as_deref()
+            != Some("Generated resumed name")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("Generated resumed name")
+        );
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(history_home).unwrap();
+    }
+
+    #[test]
     fn scrollback_is_retained_without_entering_the_continuous_frame_basis() {
         let cwd = std::env::current_dir().unwrap();
         let state = ServerSessionState::new(SessionId(1), 5, 30, None, 0).unwrap();
