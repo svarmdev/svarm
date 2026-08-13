@@ -194,7 +194,6 @@ fn opencode_prompt(value: &Value) -> Option<String> {
                 .and_then(normalize_prompt)
         })
 }
-
 fn text_content(value: &Value) -> Option<&str> {
     if let Some(text) = value.as_str() {
         return Some(text);

@@ -491,7 +491,7 @@ impl SessionRuntime {
         wake: Option<crate::session::OutputNotifier>,
         namer: TitleNamer,
     ) -> Self {
-        Self::with_namer_and_history(state, wake, namer, ConversationHistory::default())
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
     }
 
     fn with_namer_and_history(

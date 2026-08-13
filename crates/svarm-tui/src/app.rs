@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use svarm_agent::SessionSnapshot;
 use svarm_agent::{
@@ -66,7 +67,8 @@ impl NewAgentField {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Checkout {
     #[default]
     Local,
@@ -831,10 +833,21 @@ impl App {
         self.session_id
     }
 
+    #[cfg(test)]
     pub fn open_new_agent(
         &mut self,
         workspace: Option<PathBuf>,
         agent: Option<AgentKind>,
+        workspaces: Vec<WorkspaceChoice>,
+    ) {
+        self.open_new_agent_with_checkout(workspace, agent, Checkout::Local, workspaces);
+    }
+
+    pub fn open_new_agent_with_checkout(
+        &mut self,
+        workspace: Option<PathBuf>,
+        agent: Option<AgentKind>,
+        checkout: Checkout,
         workspaces: Vec<WorkspaceChoice>,
     ) {
         let workspace = workspace.filter(|path| {
@@ -860,16 +873,20 @@ impl App {
                     .position(|candidate| *candidate == kind)
             })
             .unwrap_or(0);
+        let selected_location = Checkout::ALL
+            .iter()
+            .position(|candidate| *candidate == checkout)
+            .unwrap_or(0);
         self.new_agent = Some(NewAgentState {
             draft: NewAgentDraft {
                 workspace,
-                checkout: Checkout::Local,
+                checkout,
                 agent,
                 selected_field,
             },
             workspaces,
             selected_workspace,
-            selected_location: 0,
+            selected_location,
             selected_agent,
             repository_root: None,
             worktree_generation: 0,
@@ -1390,6 +1407,26 @@ mod tests {
                 Checkout::Local
             ))
         );
+    }
+
+    #[test]
+    fn new_agent_form_restores_the_saved_checkout_choice() {
+        let mut app = app();
+        app.open_new_agent_with_checkout(
+            Some(PathBuf::from("/tmp/one")),
+            Some(AgentKind::Claude),
+            Checkout::NewWorktree,
+            vec![WorkspaceChoice {
+                path: PathBuf::from("/tmp/one"),
+                available: true,
+            }],
+        );
+
+        assert_eq!(
+            app.new_agent().unwrap().draft.checkout,
+            Checkout::NewWorktree
+        );
+        assert_eq!(app.new_agent().unwrap().selected_location, 1);
     }
 
     #[test]
