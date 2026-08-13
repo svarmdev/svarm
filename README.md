@@ -4,6 +4,8 @@ Svarm is a terminal workspace for coding agents. It runs the native Codex, Claud
 
 Normal input goes directly to the focused agent, preserving the behavior of the native agent TUI.
 
+![Svarm](assets/svarm.png)
+
 ## Install and run
 
 Codex, Claude Code, and/or Grok Build must already be installed and available on `PATH`.
