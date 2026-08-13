@@ -37,7 +37,7 @@ jobs:
       - name: Check release tag
         shell: bash
         run: |
-          package_version="$(cargo pkgid -p svarm | sed 's/.*@//')"
+          package_version="$(cargo pkgid -p svarm | sed 's/.*[#@]//')"
           tag_version="${GITHUB_REF_NAME#v}"
           test "$tag_version" = "$package_version" || {
             echo "tag $GITHUB_REF_NAME does not match svarm package version $package_version"
