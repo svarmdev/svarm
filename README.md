@@ -10,14 +10,16 @@ Codex, Claude Code, and/or Grok Build must already be installed and available on
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
-```sh
+```bash
 # Install the latest supported GitHub release into ~/.local/bin:
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh
 
 # Install a specific release or choose another directory:
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh -s -- v0.1.0
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh -s -- --dir /usr/local/bin --yes
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- v0.1.0
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- --dir /usr/local/bin --yes
+```
 
+```sh
 # Check for and install a newer release:
 svarm upgrade
 
@@ -43,7 +45,7 @@ after the new release has been downloaded and verified.
 
 The installer places `svarm` in `~/.local/bin`; add that directory to `PATH` if
 needed. To review the script before running it, download it separately and run
-`sh install.sh`.
+`sh scripts/install.sh`.
 
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
