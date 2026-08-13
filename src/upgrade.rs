@@ -4,8 +4,8 @@ use svarm_agent::{Result, paths::RuntimePaths};
 
 use crate::client::{ControlClient, Probe};
 
-const RELEASE_API_URL: &str = "https://api.github.com/repos/williamcr01/svarm/releases/latest";
-const RELEASE_DOWNLOAD_URL: &str = "https://github.com/williamcr01/svarm/releases/download";
+const RELEASE_API_URL: &str = "https://api.github.com/repos/svarmdev/svarm/releases/latest";
+const RELEASE_DOWNLOAD_URL: &str = "https://github.com/svarmdev/svarm/releases/download";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ReleaseVersion {

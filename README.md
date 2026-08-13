@@ -12,16 +12,16 @@ Yazi is optional. When installed, Svarm can use it for browsing directories; oth
 
 ```bash
 # Install the latest supported GitHub release into ~/.local/bin:
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/svarmdev/svarm/main/scripts/install.sh | sh
 
 # Install a specific release or choose another directory:
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- v0.1.0
-curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- --dir /usr/local/bin --yes
+curl -fsSL https://raw.githubusercontent.com/svarmdev/svarm/main/scripts/install.sh | sh -s -- v0.1.0
+curl -fsSL https://raw.githubusercontent.com/svarmdev/svarm/main/scripts/install.sh | sh -s -- --dir /usr/local/bin --yes
 ```
 
 ```sh
 # Clone the repository and install from a checkout:
-git clone https://github.com/williamcr01/svarm.git
+git clone https://github.com/svarmdev/svarm.git
 cd svarm
 cargo install --path .
 ```

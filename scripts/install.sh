@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="williamcr01/svarm"
+REPOSITORY="svarmdev/svarm"
 RELEASE_API="https://api.github.com/repos/$REPOSITORY/releases/latest"
 RELEASE_BASE="https://github.com/$REPOSITORY/releases/download"
 
