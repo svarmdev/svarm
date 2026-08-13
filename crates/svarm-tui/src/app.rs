@@ -35,7 +35,9 @@ pub(crate) enum NewAgentPage {
     #[default]
     Form,
     Workspaces,
+    Locations,
     Agents,
+    CreatingWorktree,
     NativeBrowser,
     EmbeddedBrowser,
 }
@@ -44,21 +46,40 @@ pub(crate) enum NewAgentPage {
 pub(crate) enum NewAgentField {
     #[default]
     Workspace,
+    Location,
     Agent,
     Start,
 }
 
 impl NewAgentField {
+    pub const ALL: [Self; 4] = [Self::Workspace, Self::Location, Self::Agent, Self::Start];
+
     fn cycle(self, delta: isize) -> Self {
         let current = match self {
             Self::Workspace => 0,
-            Self::Agent => 1,
-            Self::Start => 2,
+            Self::Location => 1,
+            Self::Agent => 2,
+            Self::Start => 3,
         };
-        match (current + delta).rem_euclid(3) {
-            0 => Self::Workspace,
-            1 => Self::Agent,
-            _ => Self::Start,
+        let next = (current + delta).rem_euclid(Self::ALL.len() as isize) as usize;
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Checkout {
+    #[default]
+    Local,
+    NewWorktree,
+}
+
+impl Checkout {
+    pub const ALL: [Self; 2] = [Self::Local, Self::NewWorktree];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "Local checkout",
+            Self::NewWorktree => "New worktree",
         }
     }
 }
@@ -95,6 +116,7 @@ pub(crate) enum BrowserAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewAgentDraft {
     pub workspace: Option<PathBuf>,
+    pub checkout: Checkout,
     pub agent: Option<AgentKind>,
     pub selected_field: NewAgentField,
 }
@@ -104,7 +126,10 @@ pub(crate) struct NewAgentState {
     pub draft: NewAgentDraft,
     pub workspaces: Vec<WorkspaceChoice>,
     pub selected_workspace: usize,
+    pub selected_location: usize,
     pub selected_agent: usize,
+    pub repository_root: Option<PathBuf>,
+    pub worktree_generation: u64,
     pub native_browser: Option<NativeBrowserState>,
 }
 
@@ -838,12 +863,16 @@ impl App {
         self.new_agent = Some(NewAgentState {
             draft: NewAgentDraft {
                 workspace,
+                checkout: Checkout::Local,
                 agent,
                 selected_field,
             },
             workspaces,
             selected_workspace,
+            selected_location: 0,
             selected_agent,
+            repository_root: None,
+            worktree_generation: 0,
             native_browser: None,
         });
         self.mode = Mode::NewAgent(NewAgentPage::Form);
@@ -864,6 +893,11 @@ impl App {
             Mode::NewAgent(NewAgentPage::Workspaces) if !state.workspaces.is_empty() => {
                 state.selected_workspace = (state.selected_workspace as isize + delta)
                     .rem_euclid(state.workspaces.len() as isize)
+                    as usize;
+            }
+            Mode::NewAgent(NewAgentPage::Locations) => {
+                state.selected_location = (state.selected_location as isize + delta)
+                    .rem_euclid(Checkout::ALL.len() as isize)
                     as usize;
             }
             Mode::NewAgent(NewAgentPage::Agents) => {
@@ -917,6 +951,77 @@ impl App {
         }
     }
 
+    pub fn open_location_choices(&mut self) {
+        if self.new_agent.is_some() {
+            self.mode = Mode::NewAgent(NewAgentPage::Locations);
+        }
+    }
+
+    pub fn select_location(&mut self, index: usize) {
+        if let Some(state) = &mut self.new_agent
+            && index < Checkout::ALL.len()
+        {
+            state.selected_location = index;
+        }
+    }
+
+    pub fn confirm_location(&mut self) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        let Some(choice) = Checkout::ALL.get(state.selected_location).copied() else {
+            return;
+        };
+        if choice == Checkout::NewWorktree && state.repository_root.is_none() {
+            return;
+        }
+        state.draft.checkout = choice;
+        self.mode = Mode::NewAgent(NewAgentPage::Form);
+    }
+
+    pub fn set_checkout_choice(&mut self, checkout: Checkout) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        if checkout == Checkout::NewWorktree && state.repository_root.is_none() {
+            return;
+        }
+        state.selected_location = Checkout::ALL
+            .iter()
+            .position(|candidate| *candidate == checkout)
+            .unwrap_or(0);
+        state.draft.checkout = checkout;
+        self.mode = Mode::NewAgent(NewAgentPage::Form);
+    }
+
+    pub fn set_workspace_repository(&mut self, repository_root: Option<PathBuf>) {
+        let Some(state) = &mut self.new_agent else {
+            return;
+        };
+        state.repository_root = repository_root;
+        if state.repository_root.is_none() {
+            state.draft.checkout = Checkout::Local;
+            state.selected_location = 0;
+        }
+    }
+
+    pub fn begin_worktree(&mut self, generation: u64) {
+        if let Some(state) = &mut self.new_agent {
+            state.worktree_generation = generation;
+            self.mode = Mode::NewAgent(NewAgentPage::CreatingWorktree);
+        }
+    }
+
+    pub fn cancel_worktree(&mut self) {
+        if self.mode != Mode::NewAgent(NewAgentPage::CreatingWorktree) {
+            return;
+        }
+        if let Some(state) = &mut self.new_agent {
+            state.worktree_generation = state.worktree_generation.saturating_add(1);
+            self.mode = Mode::NewAgent(NewAgentPage::Form);
+        }
+    }
+
     pub fn confirm_workspace(&mut self) {
         let Some(state) = &mut self.new_agent else {
             return;
@@ -959,12 +1064,16 @@ impl App {
         self.mode = Mode::Terminal;
     }
 
-    pub fn new_agent_submission(&self) -> Option<(AgentKind, PathBuf)> {
+    pub fn new_agent_submission(&self) -> Option<(AgentKind, PathBuf, Checkout)> {
         let state = self.new_agent.as_ref()?;
         if state.draft.selected_field != NewAgentField::Start {
             return None;
         }
-        Some((state.draft.agent?, state.draft.workspace.clone()?))
+        Some((
+            state.draft.agent?,
+            state.draft.workspace.clone()?,
+            state.draft.checkout,
+        ))
     }
 
     pub fn finish_new_agent(&mut self) {
@@ -1275,7 +1384,94 @@ mod tests {
         );
         assert_eq!(
             app.new_agent_submission(),
-            Some((AgentKind::Claude, PathBuf::from("/tmp/one")))
+            Some((
+                AgentKind::Claude,
+                PathBuf::from("/tmp/one"),
+                Checkout::Local
+            ))
+        );
+    }
+
+    #[test]
+    fn new_agent_fields_cycle_through_location() {
+        let mut app = app();
+        app.open_new_agent(None, None, Vec::new());
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Workspace
+        );
+        app.move_new_agent_selection(1);
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Location
+        );
+        app.move_new_agent_selection(1);
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Agent
+        );
+        app.move_new_agent_selection(1);
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Start
+        );
+        app.move_new_agent_selection(1);
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Workspace
+        );
+        app.move_new_agent_selection(-1);
+        assert_eq!(
+            app.new_agent().unwrap().draft.selected_field,
+            NewAgentField::Start
+        );
+    }
+
+    #[test]
+    fn a_non_repository_workspace_disables_worktrees_and_forces_local_checkout() {
+        let workspaces = vec![
+            WorkspaceChoice {
+                path: PathBuf::from("/tmp/one"),
+                available: true,
+            },
+            WorkspaceChoice {
+                path: PathBuf::from("/tmp/two"),
+                available: true,
+            },
+        ];
+        let mut app = app();
+        app.open_new_agent(
+            Some(PathBuf::from("/tmp/one")),
+            Some(AgentKind::Claude),
+            workspaces,
+        );
+        app.set_workspace_repository(Some(PathBuf::from("/tmp/one")));
+        app.set_checkout_choice(Checkout::NewWorktree);
+        assert_eq!(
+            app.new_agent().unwrap().draft.checkout,
+            Checkout::NewWorktree
+        );
+
+        app.set_workspace_repository(None);
+        assert_eq!(app.new_agent().unwrap().draft.checkout, Checkout::Local);
+        app.set_checkout_choice(Checkout::NewWorktree);
+        assert_eq!(app.new_agent().unwrap().draft.checkout, Checkout::Local);
+        app.open_location_choices();
+        app.select_location(1);
+        app.confirm_location();
+        assert_eq!(app.mode(), Mode::NewAgent(NewAgentPage::Locations));
+        assert_eq!(app.new_agent().unwrap().draft.checkout, Checkout::Local);
+
+        app.set_workspace_repository(Some(PathBuf::from("/tmp/two")));
+        app.set_checkout_choice(Checkout::NewWorktree);
+        app.select_new_agent_field(NewAgentField::Start);
+        assert_eq!(
+            app.new_agent_submission(),
+            Some((
+                AgentKind::Claude,
+                PathBuf::from("/tmp/one"),
+                Checkout::NewWorktree
+            ))
         );
     }
 

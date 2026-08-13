@@ -23,7 +23,7 @@ use crate::{
         ClientEvent, InitialAgentRequest, InitialSession, RemoteAgents, RemoteUpdate, WheelRouting,
     },
     app::{
-        App, BrowserAction, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage,
+        App, BrowserAction, Checkout, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage,
         WorkspaceChoice,
     },
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
@@ -31,7 +31,10 @@ use crate::{
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled},
     ui::{self, UiModel},
-    workspace::{DirectoryLoader, YaziLaunchError, YaziPicker, YaziResult},
+    workspace::{
+        DirectoryLoader, WorktreeCreateResult, WorktreeCreator, YaziLaunchError, YaziPicker,
+        YaziResult,
+    },
 };
 
 const EVENT_QUEUE: usize = 1_024;
@@ -122,6 +125,7 @@ pub fn run(
     let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
     let embedded_pending = std::sync::Arc::new(AtomicBool::new(false));
+    let worktrees = WorktreeCreator::new(events_tx.clone());
     let mut browser = BrowserRuntime {
         loader: DirectoryLoader::new(events_tx.clone()),
         generation: 0,
@@ -171,6 +175,7 @@ pub fn run(
             default_kind,
             workspace_choices(&settings_value, explicit_workspace.as_ref()),
         );
+        remember_new_agent_repository(&mut app);
     }
 
     let mut terminal = TerminalSession::open()?;
@@ -289,6 +294,7 @@ pub fn run(
                         settings: &mut settings_value,
                         events: &events,
                         browser: &mut browser,
+                        worktrees: &worktrees,
                         host_area,
                     };
                     dirty |= handle_host_event(
@@ -304,6 +310,17 @@ pub fn run(
                 ClientEvent::DirectoryLoaded(result) => {
                     dirty |=
                         app.apply_directory_load(result.generation, result.path, result.result);
+                }
+                ClientEvent::WorktreeCreated(created) => {
+                    apply_worktree_result(
+                        &mut app,
+                        &mut agents,
+                        &settings,
+                        &mut settings_value,
+                        &events,
+                        created,
+                    );
+                    dirty = true;
                 }
                 ClientEvent::EmbeddedToolChanged => {
                     browser.embedded_pending.store(false, Ordering::Release);
@@ -652,11 +669,14 @@ fn handle_management_command(
             }
             app.set_mode(Mode::Terminal);
         }
-        ManagementCommand::ChooseAgent => app.open_new_agent(
-            remembered_workspace(settings),
-            settings.last_agent,
-            workspace_choices(settings, None),
-        ),
+        ManagementCommand::ChooseAgent => {
+            app.open_new_agent(
+                remembered_workspace(settings),
+                settings.last_agent,
+                workspace_choices(settings, None),
+            );
+            remember_new_agent_repository(app);
+        }
         ManagementCommand::CloseAgent if app.selected_agent_id().is_some() => {
             app.set_mode(Mode::ConfirmClose);
         }
@@ -886,7 +906,8 @@ fn apply_click_action(
                 Mode::NewAgent(NewAgentPage::Form) => {
                     activate_new_agent_field(app, agents, resources)
                 }
-                Mode::NewAgent(NewAgentPage::Workspaces) => app.confirm_workspace(),
+                Mode::NewAgent(NewAgentPage::Workspaces) => confirm_new_agent_workspace(app),
+                Mode::NewAgent(NewAgentPage::Locations) => app.confirm_location(),
                 Mode::NewAgent(NewAgentPage::Agents) => app.confirm_agent(),
                 Mode::NewAgent(NewAgentPage::NativeBrowser) => {
                     activate_native_browser(app, resources.browser)
@@ -902,9 +923,10 @@ fn apply_click_action(
         ui::ClickAction::Cancel => {
             match app.mode() {
                 Mode::NewAgent(NewAgentPage::Form) => app.cancel_new_agent(),
-                Mode::NewAgent(NewAgentPage::Workspaces | NewAgentPage::Agents) => {
-                    app.back_to_new_agent_form()
-                }
+                Mode::NewAgent(
+                    NewAgentPage::Workspaces | NewAgentPage::Locations | NewAgentPage::Agents,
+                ) => app.back_to_new_agent_form(),
+                Mode::NewAgent(NewAgentPage::CreatingWorktree) => app.cancel_worktree(),
                 Mode::NewAgent(NewAgentPage::NativeBrowser) => app.close_native_browser(),
                 Mode::ConfirmArchive | Mode::ConfirmResume => app.cancel_confirmation(),
                 Mode::ArchiveUnavailable => app.set_mode(Mode::Terminal),
@@ -922,7 +944,12 @@ fn apply_click_action(
         }
         ui::ClickAction::Workspace(index) => {
             app.select_workspace(index);
-            app.confirm_workspace();
+            confirm_new_agent_workspace(app);
+            Ok((false, true))
+        }
+        ui::ClickAction::Location(index) => {
+            app.select_location(index);
+            app.confirm_location();
             Ok((false, true))
         }
         ui::ClickAction::BrowseWorkspaces => {
@@ -1009,21 +1036,34 @@ fn submit_new_agent(
     agents: &mut RemoteAgents,
     resources: &mut InteractionResources<'_>,
 ) {
-    let Some((kind, launch_directory)) = app.new_agent_submission() else {
+    let Some((kind, launch_directory, checkout)) = app.new_agent_submission() else {
         return;
     };
-    match agents.spawn(kind, launch_directory.clone(), resources.events) {
-        Ok(()) => {
-            resources
-                .settings
-                .record_successful_launch(launch_directory, kind);
-            match resources.settings_store.save(resources.settings) {
-                Ok(()) => app.clear_notice(),
-                Err(error) => app.set_notice(error),
+    match checkout {
+        Checkout::Local => match agents.spawn(kind, launch_directory.clone(), resources.events) {
+            Ok(()) => {
+                resources
+                    .settings
+                    .record_successful_launch(launch_directory, kind);
+                match resources.settings_store.save(resources.settings) {
+                    Ok(()) => app.clear_notice(),
+                    Err(error) => app.set_notice(error),
+                }
+                app.finish_new_agent();
             }
-            app.finish_new_agent();
+            Err(error) => app.set_notice(error.to_string()),
+        },
+        Checkout::NewWorktree => {
+            let generation = app
+                .new_agent()
+                .map(|state| state.worktree_generation.saturating_add(1))
+                .unwrap_or(1);
+            app.begin_worktree(generation);
+            if let Err(error) = resources.worktrees.create(generation, launch_directory) {
+                app.back_to_new_agent_form();
+                app.set_notice(error);
+            }
         }
-        Err(error) => app.set_notice(error.to_string()),
     }
 }
 
@@ -1034,6 +1074,7 @@ fn activate_new_agent_field(
 ) {
     match app.new_agent().map(|state| state.draft.selected_field) {
         Some(NewAgentField::Workspace) => app.open_workspace_choices(),
+        Some(NewAgentField::Location) => app.open_location_choices(),
         Some(NewAgentField::Agent) => app.open_agent_choices(),
         Some(NewAgentField::Start) => submit_new_agent(app, agents, resources),
         None => {}
@@ -1058,7 +1099,7 @@ fn handle_new_agent_key(
         NewAgentPage::Workspaces => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
-            KeyCode::Enter => app.confirm_workspace(),
+            KeyCode::Enter => confirm_new_agent_workspace(app),
             KeyCode::Char('b') => {
                 resources
                     .browser
@@ -1067,6 +1108,20 @@ fn handle_new_agent_key(
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}
         },
+        NewAgentPage::Locations => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
+            KeyCode::Char('l') => app.set_checkout_choice(Checkout::Local),
+            KeyCode::Char('w') => app.set_checkout_choice(Checkout::NewWorktree),
+            KeyCode::Enter => app.confirm_location(),
+            KeyCode::Esc => app.back_to_new_agent_form(),
+            _ => {}
+        },
+        NewAgentPage::CreatingWorktree => {
+            if key.code == KeyCode::Esc {
+                app.cancel_worktree();
+            }
+        }
         NewAgentPage::Agents => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.move_new_agent_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_new_agent_selection(-1),
@@ -1087,6 +1142,7 @@ struct InteractionResources<'a> {
     settings: &'a mut Settings,
     events: &'a mpsc::Receiver<ClientEvent>,
     browser: &'a mut BrowserRuntime,
+    worktrees: &'a WorktreeCreator,
     host_area: Rect,
 }
 
@@ -1123,7 +1179,7 @@ fn open_native_browser_parent(app: &mut App, browser: &mut BrowserRuntime) {
 fn activate_native_browser(app: &mut App, browser: &mut BrowserRuntime) {
     match app.native_browser_action() {
         Some(BrowserAction::Select(path)) => match path.canonicalize() {
-            Ok(path) if path.is_dir() => app.choose_browsed_workspace(path),
+            Ok(path) if path.is_dir() => choose_new_agent_workspace(app, path),
             Ok(_) => app.set_notice("selected workspace is not a directory"),
             Err(error) => app.set_notice(format!("could not select workspace: {error}")),
         },
@@ -1297,7 +1353,7 @@ impl BrowserRuntime {
         }
         let yazi = self.yazi.take().expect("Yazi was present while polled");
         match yazi.finish() {
-            YaziResult::Selected(path) => app.choose_browsed_workspace(path),
+            YaziResult::Selected(path) => choose_new_agent_workspace(app, path),
             YaziResult::Cancelled => app.close_embedded_browser(),
             YaziResult::Failed(error) => {
                 app.set_notice(error);
@@ -1346,6 +1402,113 @@ fn remembered_workspace(settings: &Settings) -> Option<PathBuf> {
         .first()
         .filter(|path| path.is_dir())
         .cloned()
+}
+
+fn remember_new_agent_repository(app: &mut App) {
+    let root = app
+        .new_agent()
+        .and_then(|state| state.draft.workspace.as_ref())
+        .and_then(|path| svarm_agent::worktree::repository_root(path));
+    app.set_workspace_repository(root);
+}
+
+fn confirm_new_agent_workspace(app: &mut App) {
+    app.confirm_workspace();
+    remember_new_agent_repository(app);
+}
+
+fn choose_new_agent_workspace(app: &mut App, path: PathBuf) {
+    app.choose_browsed_workspace(path);
+    remember_new_agent_repository(app);
+}
+
+enum WorktreeApply {
+    Ignored,
+    Failed(String),
+    Ready {
+        kind: AgentKind,
+        spawn: PathBuf,
+        record: PathBuf,
+    },
+}
+
+fn interpret_worktree_result(
+    app: &App,
+    generation: u64,
+    checkout: PathBuf,
+    result: std::result::Result<svarm_agent::worktree::Worktree, String>,
+) -> WorktreeApply {
+    let Some(state) = app.new_agent() else {
+        return WorktreeApply::Ignored;
+    };
+    if state.worktree_generation != generation
+        || app.mode() != Mode::NewAgent(NewAgentPage::CreatingWorktree)
+    {
+        return WorktreeApply::Ignored;
+    }
+    match result {
+        Ok(worktree) => {
+            let Some(kind) = state.draft.agent else {
+                return WorktreeApply::Ignored;
+            };
+            WorktreeApply::Ready {
+                kind,
+                spawn: worktree.path,
+                record: checkout,
+            }
+        }
+        Err(message) => WorktreeApply::Failed(message),
+    }
+}
+
+fn settle_worktree_result(
+    app: &mut App,
+    generation: u64,
+    checkout: PathBuf,
+    result: std::result::Result<svarm_agent::worktree::Worktree, String>,
+) -> Option<(AgentKind, PathBuf, PathBuf)> {
+    match interpret_worktree_result(app, generation, checkout, result) {
+        WorktreeApply::Ignored => None,
+        WorktreeApply::Failed(message) => {
+            app.back_to_new_agent_form();
+            app.set_notice(message);
+            None
+        }
+        WorktreeApply::Ready {
+            kind,
+            spawn,
+            record,
+        } => Some((kind, spawn, record)),
+    }
+}
+
+fn apply_worktree_result(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    settings_store: &SettingsStore,
+    settings: &mut Settings,
+    events: &mpsc::Receiver<ClientEvent>,
+    created: WorktreeCreateResult,
+) {
+    let Some((kind, spawn, record)) =
+        settle_worktree_result(app, created.generation, created.checkout, created.result)
+    else {
+        return;
+    };
+    match agents.spawn(kind, spawn, events) {
+        Ok(()) => {
+            settings.record_successful_launch(record, kind);
+            match settings_store.save(settings) {
+                Ok(()) => app.clear_notice(),
+                Err(error) => app.set_notice(error),
+            }
+            app.finish_new_agent();
+        }
+        Err(error) => {
+            app.back_to_new_agent_form();
+            app.set_notice(error.to_string());
+        }
+    }
 }
 
 fn sync_selection(app: &App, agents: &mut RemoteAgents) -> Result<()> {
@@ -1570,5 +1733,81 @@ mod tests {
         };
 
         assert_eq!(remembered_workspace(&settings), None);
+    }
+
+    fn ready_for_worktree(generation: u64) -> App {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        app.open_new_agent(
+            Some(PathBuf::from("/tmp/project")),
+            Some(AgentKind::Claude),
+            vec![crate::app::WorkspaceChoice {
+                path: PathBuf::from("/tmp/project"),
+                available: true,
+            }],
+        );
+        app.begin_worktree(generation);
+        app
+    }
+
+    fn sample_worktree() -> svarm_agent::worktree::Worktree {
+        svarm_agent::worktree::Worktree {
+            path: PathBuf::from("/tmp/worktrees/project/svarm-deadbeef"),
+            branch: "svarm/deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn stale_worktree_generation_is_discarded() {
+        let mut app = ready_for_worktree(2);
+        assert!(
+            settle_worktree_result(
+                &mut app,
+                1,
+                PathBuf::from("/tmp/project"),
+                Ok(sample_worktree()),
+            )
+            .is_none()
+        );
+        assert_eq!(app.mode(), Mode::NewAgent(NewAgentPage::CreatingWorktree));
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn failed_worktree_creation_returns_to_the_form_with_a_notice() {
+        let mut app = ready_for_worktree(1);
+        assert!(
+            settle_worktree_result(
+                &mut app,
+                1,
+                PathBuf::from("/tmp/project"),
+                Err("git worktree add failed".into()),
+            )
+            .is_none()
+        );
+        assert_eq!(app.mode(), Mode::NewAgent(NewAgentPage::Form));
+        assert_eq!(app.notice(), Some("git worktree add failed"));
+    }
+
+    #[test]
+    fn successful_worktree_launch_records_the_checkout_not_the_worktree() {
+        let checkout = PathBuf::from("/tmp/project");
+        let worktree = sample_worktree();
+        let mut app = ready_for_worktree(1);
+        let (kind, spawn, record) =
+            settle_worktree_result(&mut app, 1, checkout.clone(), Ok(worktree.clone()))
+                .expect("ready launch");
+        assert_eq!(kind, AgentKind::Claude);
+        assert_eq!(spawn, worktree.path);
+        assert_eq!(record, checkout);
+
+        let mut settings = Settings::default();
+        settings.record_successful_launch(record, kind);
+        assert_eq!(settings.workspaces, vec![checkout]);
+        assert!(!settings.workspaces.contains(&worktree.path));
     }
 }
