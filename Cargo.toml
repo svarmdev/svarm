@@ -14,7 +14,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/williamcr01/svarm"
+repository = "https://github.com/svarmdev/svarm"
 
 [profile.dev]
 opt-level = 1
