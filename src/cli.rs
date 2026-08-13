@@ -51,6 +51,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ServerCommand,
     },
+    /// Check for and install a newer GitHub release.
+    Upgrade {
+        /// Skip the confirmation before stopping a running server and its agents.
+        #[arg(long)]
+        yes: bool,
+    },
     #[command(name = "__server", hide = true)]
     InternalServer,
     #[command(name = "__conversation-hook", hide = true)]
@@ -119,6 +125,15 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Stop { yes: true, .. })));
         let cli = Cli::try_parse_from(["svarm", "__server"]).unwrap();
         assert!(matches!(cli.command, Some(Command::InternalServer)));
+    }
+
+    #[test]
+    fn parses_upgrade_confirmation_flag() {
+        let cli = Cli::try_parse_from(["svarm", "upgrade"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Upgrade { yes: false })));
+
+        let cli = Cli::try_parse_from(["svarm", "upgrade", "--yes"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Upgrade { yes: true })));
     }
 
     #[test]
