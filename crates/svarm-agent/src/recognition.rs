@@ -185,11 +185,72 @@ const GROK_RULES: &[Rule] = &[
     },
 ];
 
+const PI_RULES: &[Rule] = &[
+    // Pi has no built-in permission popups. Its native streaming indicator and abort hint are the
+    // only provider-owned working evidence we rely on here; extensions may render arbitrary UI.
+    Rule {
+        id: "pi.active-turn",
+        activity: AgentActivity::Working,
+        rows_from_bottom: STATUS_ROWS,
+        required: &["working..."],
+        any: &[],
+        excluded: &["you:"],
+    },
+    Rule {
+        id: "pi.ready-prompt",
+        activity: AgentActivity::Idle,
+        rows_from_bottom: STATUS_ROWS,
+        required: &[],
+        any: &["enter to send", "enter send"],
+        excluded: &["working", "esc to interrupt", "escape to abort"],
+    },
+];
+
+const OPENCODE_RULES: &[Rule] = &[
+    Rule {
+        id: "opencode.permission-dialog",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &["permission required"],
+        any: &["allow once", "allow always", "reject"],
+        excluded: &["esc interrupt"],
+    },
+    Rule {
+        id: "opencode.question-dialog",
+        activity: AgentActivity::Blocked,
+        rows_from_bottom: DIALOG_ROWS,
+        required: &["enter submit", "esc dismiss"],
+        any: &[],
+        excluded: &[],
+    },
+    Rule {
+        id: "opencode.active-turn",
+        activity: AgentActivity::Working,
+        rows_from_bottom: STATUS_ROWS,
+        required: &["esc interrupt"],
+        any: &[],
+        excluded: &[],
+    },
+    Rule {
+        id: "opencode.ready-prompt",
+        activity: AgentActivity::Idle,
+        rows_from_bottom: STATUS_ROWS,
+        required: &["agents", "commands"],
+        any: &[],
+        excluded: &[
+            "esc interrupt",
+            "permission required",
+            "enter submit",
+            "esc dismiss",
+        ],
+    },
+];
+
 pub(crate) fn recognize_title(kind: AgentKind, title: &str) -> Option<TitleRecognition> {
     match kind {
         AgentKind::Codex => recognize_codex_title(title),
         AgentKind::Grok => recognize_grok_title(title),
-        AgentKind::Claude => None,
+        AgentKind::Claude | AgentKind::Pi | AgentKind::OpenCode => None,
     }
 }
 
@@ -339,6 +400,26 @@ pub(crate) fn looks_like_uuid(value: &str) -> bool {
         })
 }
 
+pub(crate) fn looks_like_opencode_session_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("ses_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn opencode_session_id(value: &str) -> Option<&str> {
+    let title = value
+        .strip_prefix("0;")
+        .or_else(|| value.strip_prefix("2;"))?
+        .strip_prefix("OC | ")?;
+    title
+        .split(|character: char| character == '|' || character.is_ascii_whitespace())
+        .find(|candidate| looks_like_opencode_session_id(candidate))
+}
+
 pub(crate) struct ConversationIdDetector {
     kind: AgentKind,
     pending: Vec<u8>,
@@ -374,11 +455,18 @@ impl ConversationIdDetector {
                 AgentKind::Codex if value.starts_with("0;") || value.starts_with("2;") => value
                     .split(|character: char| !character.is_ascii_hexdigit() && character != '-')
                     .find(|value| looks_like_uuid(value)),
+                AgentKind::Codex => None,
                 AgentKind::Claude => value.strip_prefix("777;svarm-conversation="),
-                _ => None,
+                AgentKind::Pi => None,
+                AgentKind::Grok => None,
+                AgentKind::OpenCode => opencode_session_id(&value),
             };
             if let Some(candidate) = candidate.filter(|value| looks_like_uuid(value)) {
                 found = Some(candidate.to_ascii_lowercase());
+            } else if let Some(candidate) = candidate.filter(|value| {
+                self.kind == AgentKind::OpenCode && looks_like_opencode_session_id(value)
+            }) {
+                found = Some(candidate.to_owned());
             }
             consumed = end + terminator;
         }
@@ -417,6 +505,8 @@ pub(crate) fn recognize(kind: AgentKind, screen: &TerminalSnapshot) -> ScreenRec
         AgentKind::Codex => CODEX_RULES,
         AgentKind::Claude => CLAUDE_RULES,
         AgentKind::Grok => GROK_RULES,
+        AgentKind::Pi => PI_RULES,
+        AgentKind::OpenCode => OPENCODE_RULES,
     };
     for rule in rules {
         if let Some(evidence) = matches(rule, &raw, &normalized) {
@@ -597,6 +687,20 @@ mod tests {
     }
 
     #[test]
+    fn pi_recognizes_only_native_working_and_ready_evidence() {
+        assert_eq!(
+            claim(AgentKind::Pi, &[b"Working...", b"\r\nEsc to interrupt"]),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(AgentKind::Pi, &[b"You:\r\nEnter to send"]),
+            Some(AgentActivity::Idle)
+        );
+        assert_eq!(claim(AgentKind::Pi, &[b"working on a file"]), None);
+        assert_eq!(claim(AgentKind::Pi, &[b"You: working"]), None);
+    }
+
+    #[test]
     fn claude_recognizes_approvals_that_do_not_say_proceed() {
         assert_eq!(
             claim(
@@ -693,6 +797,23 @@ mod tests {
         assert_eq!(
             claude.process(format!("\x1b]777;svarm-conversation={id}\x07").as_bytes()),
             Some(id.into())
+        );
+
+        let opencode_id = "ses_1a84084b5ffezmGnGB55WKQAOM";
+        let mut opencode = ConversationIdDetector::new(AgentKind::OpenCode);
+        assert_eq!(
+            opencode.process(b"\x1b]0;OC | ses_1a84084b5ffezmGnGB55WKQAOM"),
+            None
+        );
+        assert_eq!(opencode.process(b"\x07"), Some(opencode_id.into()));
+    }
+
+    #[test]
+    fn pi_does_not_treat_arbitrary_terminal_titles_as_session_ids() {
+        let mut pi = ConversationIdDetector::new(AgentKind::Pi);
+        assert_eq!(
+            pi.process(b"\x1b]0;Pi - 019ff1d3-375e-7a72-a176-c47497827e49\x07"),
+            None
         );
     }
 
@@ -793,5 +914,51 @@ mod tests {
             None
         );
         assert_eq!(codex.process(b"\x1b]2;Ready | not-a-uuid\x07"), None);
+
+        let mut opencode = ConversationIdDetector::new(AgentKind::OpenCode);
+        assert_eq!(opencode.process(b"\x1b]0;OC | ses_bad-id\x07"), None);
+        assert!(looks_like_opencode_session_id("ses_abc123"));
+        assert!(!looks_like_opencode_session_id("ses_"));
+        assert!(!looks_like_opencode_session_id(
+            "019ff1d3-375e-4a72-a176-c47497827e49"
+        ));
+    }
+
+    #[test]
+    fn opencode_recognizes_working_blocked_and_idle_from_current_footers() {
+        assert_eq!(
+            claim(AgentKind::OpenCode, &[b"esc inter", b"rupt"]),
+            Some(AgentActivity::Working)
+        );
+        assert_eq!(
+            claim(
+                AgentKind::OpenCode,
+                &[b"Permission required\r\nAllow once   Allow always   Reject"]
+            ),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(AgentKind::OpenCode, &[b"enter submit       esc dismiss"]),
+            Some(AgentActivity::Blocked)
+        );
+        assert_eq!(
+            claim(AgentKind::OpenCode, &[b"agents                 commands"]),
+            Some(AgentActivity::Idle)
+        );
+    }
+
+    #[test]
+    fn opencode_status_requires_complete_evidence() {
+        assert_eq!(claim(AgentKind::OpenCode, &[b"esc inter"]), None);
+        assert_eq!(claim(AgentKind::OpenCode, &[b"Permission required"]), None);
+        assert_eq!(claim(AgentKind::OpenCode, &[b"enter submit"]), None);
+        assert_eq!(claim(AgentKind::OpenCode, &[b"agents"]), None);
+        assert_eq!(
+            claim(
+                AgentKind::OpenCode,
+                &[b"Permission required\r\nReject\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11\r\n12\r\nagents commands"]
+            ),
+            Some(AgentActivity::Idle)
+        );
     }
 }

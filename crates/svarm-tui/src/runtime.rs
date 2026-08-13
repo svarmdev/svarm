@@ -166,14 +166,19 @@ pub fn run(
         && let (Some(kind), Some(launch_directory)) = (default_kind, default_workspace.clone())
     {
         agents.spawn(kind, launch_directory.clone(), &events)?;
-        settings_value.record_successful_launch(launch_directory, kind);
+        settings_value.record_successful_launch(
+            launch_directory,
+            kind,
+            settings_value.last_checkout,
+        );
         if let Err(error) = settings.save(&settings_value) {
             app.set_notice(error);
         }
     } else if explicit_kind.is_some() || explicit_workspace.is_some() {
-        app.open_new_agent(
+        app.open_new_agent_with_checkout(
             default_workspace,
             default_kind,
+            settings_value.last_checkout,
             workspace_choices(&settings_value, explicit_workspace.as_ref()),
         );
         remember_new_agent_repository(&mut app);
@@ -677,9 +682,10 @@ fn handle_management_command(
             app.set_mode(Mode::Terminal);
         }
         ManagementCommand::ChooseAgent => {
-            app.open_new_agent(
+            app.open_new_agent_with_checkout(
                 remembered_workspace(settings),
                 settings.last_agent,
+                settings.last_checkout,
                 workspace_choices(settings, None),
             );
             remember_new_agent_repository(app);
@@ -1061,9 +1067,11 @@ fn submit_new_agent(
     match checkout {
         Checkout::Local => match agents.spawn(kind, launch_directory.clone(), resources.events) {
             Ok(()) => {
-                resources
-                    .settings
-                    .record_successful_launch(launch_directory, kind);
+                resources.settings.record_successful_launch(
+                    launch_directory,
+                    kind,
+                    Checkout::Local,
+                );
                 match resources.settings_store.save(resources.settings) {
                     Ok(()) => app.clear_notice(),
                     Err(error) => app.set_notice(error),
@@ -1147,6 +1155,8 @@ fn handle_new_agent_key(
             KeyCode::Char('c') => app.set_agent_choice(AgentKind::Codex),
             KeyCode::Char('a') => app.set_agent_choice(AgentKind::Claude),
             KeyCode::Char('g') => app.set_agent_choice(AgentKind::Grok),
+            KeyCode::Char('p') => app.set_agent_choice(AgentKind::Pi),
+            KeyCode::Char('o') => app.set_agent_choice(AgentKind::OpenCode),
             KeyCode::Enter => app.confirm_agent(),
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}
@@ -1424,11 +1434,13 @@ fn remembered_workspace(settings: &Settings) -> Option<PathBuf> {
 }
 
 fn remember_new_agent_repository(app: &mut App) {
-    let root = app
+    let workspace = app
         .new_agent()
         .and_then(|state| state.draft.workspace.as_ref())
-        .and_then(|path| svarm_agent::worktree::repository_root(path));
-    app.set_workspace_repository(root);
+        .cloned();
+    if let Some(workspace) = workspace {
+        app.set_workspace_repository(svarm_agent::worktree::repository_root(&workspace));
+    }
 }
 
 fn confirm_new_agent_workspace(app: &mut App) {
@@ -1516,7 +1528,7 @@ fn apply_worktree_result(
     };
     match agents.spawn(kind, spawn, events) {
         Ok(()) => {
-            settings.record_successful_launch(record, kind);
+            settings.record_successful_launch(record, kind, Checkout::NewWorktree);
             match settings_store.save(settings) {
                 Ok(()) => app.clear_notice(),
                 Err(error) => app.set_notice(error),
@@ -1825,7 +1837,7 @@ mod tests {
         assert_eq!(record, checkout);
 
         let mut settings = Settings::default();
-        settings.record_successful_launch(record, kind);
+        settings.record_successful_launch(record, kind, Checkout::NewWorktree);
         assert_eq!(settings.workspaces, vec![checkout]);
         assert!(!settings.workspaces.contains(&worktree.path));
     }

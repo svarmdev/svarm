@@ -17,6 +17,7 @@ use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
     framing::{read_frame, write_frame},
     git,
+    history::ConversationHistory,
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
     naming::TitleNamer,
@@ -316,6 +317,7 @@ struct SessionRuntime {
     frame_bases: HashMap<AgentId, FrameBasis>,
     archived: Vec<ArchivedConversation>,
     namer: TitleNamer,
+    history: ConversationHistory,
 }
 
 struct GitProbe {
@@ -360,6 +362,14 @@ impl InputDraft {
     fn named(title: String) -> Self {
         Self {
             generated: Some(title),
+            ..Self::default()
+        }
+    }
+
+    fn from_prompt(prompt: String) -> Self {
+        Self {
+            title: Some(prompt.clone()),
+            prompts: vec![prompt],
             ..Self::default()
         }
     }
@@ -472,13 +482,23 @@ impl SessionRuntime {
         let namer = TitleNamer::disabled();
         #[cfg(not(test))]
         let namer = TitleNamer::from_environment();
-        Self::with_namer(state, wake, namer)
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
     }
 
+    #[cfg(test)]
     fn with_namer(
         state: ServerSessionState,
         wake: Option<crate::session::OutputNotifier>,
         namer: TitleNamer,
+    ) -> Self {
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
+    }
+
+    fn with_namer_and_history(
+        state: ServerSessionState,
+        wake: Option<crate::session::OutputNotifier>,
+        namer: TitleNamer,
+        history: ConversationHistory,
     ) -> Self {
         let (rows, cols) = state.dimensions();
         let agents = AgentManager::new(pty_size(rows, cols), state.terminal_palette(), wake);
@@ -494,6 +514,7 @@ impl SessionRuntime {
             frame_bases: HashMap::new(),
             archived: Vec::new(),
             namer,
+            history,
         }
     }
 
@@ -972,16 +993,20 @@ impl SessionRuntime {
     /// message says what the work is for, and a name that keeps changing under the user is worse
     /// than a slightly stale one.
     fn request_name(&mut self, id: AgentId) {
+        let conversation_id = self
+            .previous
+            .get(&id)
+            .and_then(|observed| observed.session.conversation_id.clone());
+        self.request_name_for(id, conversation_id);
+    }
+
+    fn request_name_for(&mut self, id: AgentId, conversation_id: Option<String>) {
         let Some(draft) = self.input_drafts.get(&id) else {
             return;
         };
         if draft.naming || draft.settled() {
             return;
         }
-        let conversation_id = self
-            .previous
-            .get(&id)
-            .and_then(|observed| observed.session.conversation_id.clone());
         let kind = match self.agents.snapshot(id) {
             Some(snapshot) => snapshot.kind,
             None => return,
@@ -1156,7 +1181,13 @@ impl SessionRuntime {
                     self.input_drafts
                         .insert(snapshot.id, InputDraft::named(reactivated.title));
                 } else {
-                    self.input_drafts.insert(snapshot.id, InputDraft::default());
+                    let draft = self
+                        .history
+                        .first_user_message(snapshot.kind, new_id, &snapshot.launch_directory)
+                        .map(InputDraft::from_prompt)
+                        .unwrap_or_default();
+                    self.input_drafts.insert(snapshot.id, draft);
+                    self.request_name_for(snapshot.id, Some(new_id.to_owned()));
                 }
                 if let Some(old) = previous.as_ref()
                     && let (Some(conversation_id), Some(title)) = (
@@ -2846,6 +2877,86 @@ mod tests {
         );
         runtime.agents.stop_all();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_conversation_switch_uses_its_first_prompt_for_naming() {
+        let directory = temp_dir();
+        let history_home = temp_dir();
+        let marker = directory.join("switch-now");
+        let old_id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let new_id = "129ff1d3-375e-7a72-a176-c47497827e49";
+        let history_path =
+            history_home.join(format!(".codex/sessions/2026/08/13/rollout-{new_id}.jsonl"));
+        fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        fs::write(
+            history_path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"fix the resumed workspace\"}}\n",
+        )
+        .unwrap();
+        let script = format!(
+            "printf '\\033]2;Ready | {old_id}\\a'; while [ ! -f '{}' ]; do sleep 0.01; done; printf '\\033]2;Ready | {new_id}\\a'; sleep 1",
+            marker.display()
+        );
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::with_namer_and_history(
+            state,
+            None,
+            TitleNamer::fixed("printf", &["Generated resumed name\\n"]),
+            ConversationHistory::from_home(&history_home),
+        );
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &script]);
+        runtime
+            .spawn(AgentKind::Codex, &directory, 0, &config)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_id.as_deref() != Some(old_id)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_id.as_deref(),
+            Some(old_id)
+        );
+
+        fs::write(&marker, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let switched = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches!(event, Event::ConversationSwitched { .. }))
+            {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "conversation did not switch");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            switched,
+            Event::ConversationSwitched { agent, .. }
+                if agent.conversation_title.as_deref() == Some("fix the resumed workspace")
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_title.as_deref()
+            != Some("Generated resumed name")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_title.as_deref(),
+            Some("Generated resumed name")
+        );
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(history_home).unwrap();
     }
 
     #[test]

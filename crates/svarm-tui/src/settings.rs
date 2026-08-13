@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use svarm_agent::AgentKind;
 
-use crate::theme::ThemeName;
+use crate::{app::Checkout, theme::ThemeName};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -14,6 +14,7 @@ pub struct Settings {
     pub theme: ThemeName,
     pub workspaces: Vec<PathBuf>,
     pub last_agent: Option<AgentKind>,
+    pub last_checkout: Checkout,
 }
 
 pub(crate) struct SettingsStore {
@@ -51,10 +52,16 @@ impl SettingsStore {
 }
 
 impl Settings {
-    pub fn record_successful_launch(&mut self, workspace: PathBuf, kind: AgentKind) {
+    pub fn record_successful_launch(
+        &mut self,
+        workspace: PathBuf,
+        kind: AgentKind,
+        checkout: Checkout,
+    ) {
         self.workspaces.retain(|saved| saved != &workspace);
         self.workspaces.insert(0, workspace);
         self.last_agent = Some(kind);
+        self.last_checkout = checkout;
     }
 
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -104,6 +111,7 @@ mod tests {
             theme: ThemeName::TokyoNight,
             workspaces: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
             last_agent: Some(AgentKind::Claude),
+            last_checkout: Checkout::NewWorktree,
         };
 
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
@@ -121,6 +129,7 @@ mod tests {
         assert_eq!(settings.theme, ThemeName::Light);
         assert!(settings.workspaces.is_empty());
         assert_eq!(settings.last_agent, None);
+        assert_eq!(settings.last_checkout, Checkout::Local);
     }
 
     #[test]
@@ -131,13 +140,19 @@ mod tests {
                 .map(|index| PathBuf::from(format!("/tmp/workspace-{index}")))
                 .collect(),
             last_agent: Some(AgentKind::Claude),
+            last_checkout: Checkout::Local,
         };
 
-        settings.record_successful_launch(PathBuf::from("/tmp/workspace-7"), AgentKind::Codex);
+        settings.record_successful_launch(
+            PathBuf::from("/tmp/workspace-7"),
+            AgentKind::Codex,
+            Checkout::NewWorktree,
+        );
 
         assert_eq!(settings.theme, ThemeName::Nord);
         assert_eq!(settings.workspaces.len(), 20);
         assert_eq!(settings.workspaces[0], PathBuf::from("/tmp/workspace-7"));
         assert_eq!(settings.last_agent, Some(AgentKind::Codex));
+        assert_eq!(settings.last_checkout, Checkout::NewWorktree);
     }
 }

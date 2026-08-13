@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File},
     io::{self, Read},
@@ -156,6 +157,7 @@ pub struct AgentSession {
     terminal: TerminalProcess,
     conversation_id: Arc<Mutex<Option<String>>>,
     conversation_signal: Option<ConversationSignal>,
+    pi_session_probe: Option<Mutex<PiSessionProbe>>,
     _leader_socket: Option<TempPath>,
 }
 
@@ -204,6 +206,14 @@ impl AgentSession {
             signal,
             leader_socket,
         } = conversation;
+        let pi_session_probe = (kind == AgentKind::Pi)
+            .then(|| PiSessionProbe::new(cwd))
+            .flatten()
+            .map(|mut probe| {
+                probe.current = initial_id.clone();
+                probe
+            })
+            .map(Mutex::new);
         let notify = notify.map(|notify| Arc::new(move || notify(id)) as _);
         let conversation_id = Arc::new(Mutex::new(initial_id));
         let detected_id = conversation_id.clone();
@@ -231,6 +241,7 @@ impl AgentSession {
             )?,
             conversation_id,
             conversation_signal: signal,
+            pi_session_probe,
             _leader_socket: leader_socket,
         })
     }
@@ -274,6 +285,17 @@ impl AgentSession {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
+        if let Some(probe) = &self.pi_session_probe
+            && let Some(id) = probe
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .current_id()
+        {
+            *self
+                .conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+        }
         if let Some(id) = self
             .conversation_signal
             .as_ref()
@@ -304,6 +326,124 @@ impl AgentSession {
         self.terminal.poll()?;
         Ok(self.snapshot())
     }
+}
+
+struct PiSessionProbe {
+    root: PathBuf,
+    cwd: PathBuf,
+    known: HashSet<String>,
+    current: Option<String>,
+    current_modified: Option<std::time::SystemTime>,
+}
+
+impl PiSessionProbe {
+    fn new(cwd: &Path) -> Option<Self> {
+        let root = pi_session_directory()?;
+        let known = session_files(&root, cwd)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        Some(Self {
+            root,
+            cwd: cwd.to_owned(),
+            known,
+            current: None,
+            current_modified: None,
+        })
+    }
+
+    fn current_id(&mut self) -> Option<String> {
+        let candidates = session_files(&self.root, &self.cwd);
+        if let Some(current) = &self.current
+            && let Some((_, modified)) = candidates.iter().find(|(id, _)| id == current)
+        {
+            self.current_modified = Some(*modified);
+        }
+
+        let candidate = if self.current.is_none() {
+            candidates
+                .iter()
+                .filter(|(id, _)| !self.known.contains(id))
+                .max_by_key(|(_, modified)| *modified)
+        } else {
+            candidates
+                .iter()
+                .filter(|(id, modified)| {
+                    Some(id) != self.current.as_ref()
+                        && self
+                            .current_modified
+                            .is_none_or(|current| *modified > current)
+                })
+                .max_by_key(|(_, modified)| *modified)
+        };
+        if let Some((id, modified)) = candidate {
+            self.current = Some(id.clone());
+            self.current_modified = Some(*modified);
+        }
+        self.current.clone()
+    }
+}
+
+fn pi_session_directory() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(path).join("sessions"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".pi/agent/sessions"))
+        })
+}
+
+fn session_files(root: &Path, cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
+    let mut directories = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                && let Some((id, session_cwd)) = session_header(&path)
+                && session_cwd == cwd
+            {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                files.push((id, modified));
+            }
+        }
+    }
+    files
+}
+
+fn session_header(path: &Path) -> Option<(String, PathBuf)> {
+    use std::io::BufRead;
+
+    let line = std::io::BufReader::new(File::open(path).ok()?)
+        .lines()
+        .next()?
+        .ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    (value.get("type")?.as_str()? == "session").then_some(())?;
+    let id = value.get("id")?.as_str()?;
+    let cwd = value.get("cwd")?.as_str()?;
+    crate::recognition::looks_like_uuid(id).then(|| (id.to_ascii_lowercase(), PathBuf::from(cwd)))
 }
 
 pub(crate) fn agent_command(
@@ -338,6 +478,8 @@ pub(crate) fn agent_command(
             }
             command.arg("--fullscreen");
         }
+        AgentKind::Pi => {}
+        AgentKind::OpenCode => {}
     }
     Ok(command)
 }
@@ -351,6 +493,8 @@ pub(crate) fn resume_agent_command(
     match kind {
         AgentKind::Codex => command.args(["resume", conversation_id]),
         AgentKind::Claude | AgentKind::Grok => command.args(["--resume", conversation_id]),
+        AgentKind::Pi => command.args(["--session", conversation_id]),
+        AgentKind::OpenCode => command.args(["--session", conversation_id]),
     }
     Ok(command)
 }
@@ -571,6 +715,83 @@ mod tests {
         assert!(grok_args.windows(2).any(|args| args == ["--resume", id]));
         assert!(grok_args.iter().any(|arg| arg == "--fullscreen"));
         assert!(!grok_args.iter().any(|arg| arg == "--session-id"));
+
+        let pi = resume_agent_command(AgentKind::Pi, &cwd, id).unwrap();
+        assert!(
+            pi.get_argv()
+                .windows(2)
+                .any(|args| args == ["--session", id])
+        );
+        assert_eq!(
+            agent_command(AgentKind::Pi, &cwd, None).unwrap().get_argv(),
+            &[std::ffi::OsString::from("pi")]
+        );
+    }
+
+    #[test]
+    fn pi_session_headers_are_read_only_when_they_are_valid() {
+        let path = std::env::temp_dir().join(format!(
+            "svarm-pi-session-{}-{}.jsonl",
+            std::process::id(),
+            new_uuid().unwrap()
+        ));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"019ff1d3-375e-7a72-a176-c47497827e49\",\"cwd\":\"/tmp/project\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            session_header(&path),
+            Some((
+                "019ff1d3-375e-7a72-a176-c47497827e49".into(),
+                PathBuf::from("/tmp/project")
+            ))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pi_session_probe_finds_a_new_session_for_its_working_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "svarm-pi-probe-{}-{}",
+            std::process::id(),
+            new_uuid().unwrap()
+        ));
+        let path = root.join("--tmp-project--/20260813_019ff1d3-375e-7a72-a176-c47497827e49.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut probe = PiSessionProbe {
+            root: root.clone(),
+            cwd: PathBuf::from("/tmp/project"),
+            known: HashSet::new(),
+            current: None,
+            current_modified: None,
+        };
+        assert_eq!(probe.current_id(), None);
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"019ff1d3-375e-7a72-a176-c47497827e49\",\"cwd\":\"/tmp/project\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            probe.current_id().as_deref(),
+            Some("019ff1d3-375e-7a72-a176-c47497827e49")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_commands_start_and_resume_the_requested_conversation() {
+        let cwd = std::env::current_dir().unwrap();
+        let id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let opencode = agent_command(AgentKind::OpenCode, &cwd, None).unwrap();
+        assert_eq!(opencode.get_argv(), &[std::ffi::OsString::from("opencode")]);
+        let opencode = resume_agent_command(AgentKind::OpenCode, &cwd, id).unwrap();
+        assert!(
+            opencode
+                .get_argv()
+                .windows(2)
+                .any(|args| args == ["--session", id])
+        );
     }
 
     #[test]
