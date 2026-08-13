@@ -43,6 +43,30 @@ pub(crate) enum NewAgentPage {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SettingsTab {
+    #[default]
+    Appearance,
+    Harnesses,
+}
+
+impl SettingsTab {
+    pub const ALL: [Self; 2] = [Self::Appearance, Self::Harnesses];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Harnesses => "Harnesses",
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        let current = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize;
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum NewAgentField {
     #[default]
     Workspace,
@@ -447,12 +471,14 @@ impl AgentState {
 pub(crate) struct App {
     agents: Vec<AgentState>,
     archived: Vec<ArchivedConversation>,
+    available_harnesses: Vec<AgentKind>,
     selected: usize,
     sidebar_scroll: Option<usize>,
     mode: Mode,
     sidebar_visible: bool,
     menu_selected: MenuItem,
     theme: ThemeName,
+    settings_tab: SettingsTab,
     notice: Option<String>,
     exit_intent: ExitIntent,
     session_id: Option<SessionId>,
@@ -471,12 +497,14 @@ impl App {
         Self {
             agents: Vec::new(),
             archived: Vec::new(),
+            available_harnesses: AgentKind::ALL.to_vec(),
             selected: 0,
             sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
             theme,
+            settings_tab: SettingsTab::default(),
             notice,
             exit_intent: ExitIntent::None,
             session_id: None,
@@ -502,18 +530,47 @@ impl App {
                 .map(AgentState::from_remote)
                 .collect(),
             archived: snapshot.archived,
+            available_harnesses: AgentKind::ALL.to_vec(),
             selected,
             sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
             menu_selected: MenuItem::default(),
             theme,
+            settings_tab: SettingsTab::default(),
             notice,
             exit_intent: ExitIntent::None,
             session_id: Some(snapshot.summary.id),
             new_agent: None,
             pending_resume: None,
         }
+    }
+
+    pub fn set_available_harnesses(&mut self, available: Vec<AgentKind>) {
+        self.available_harnesses = AgentKind::ALL
+            .into_iter()
+            .filter(|kind| available.contains(kind))
+            .collect();
+    }
+
+    pub fn available_harnesses(&self) -> &[AgentKind] {
+        &self.available_harnesses
+    }
+
+    pub fn harness_installed(&self, kind: AgentKind) -> bool {
+        self.available_harnesses.contains(&kind)
+    }
+
+    pub const fn settings_tab(&self) -> SettingsTab {
+        self.settings_tab
+    }
+
+    pub fn move_settings_tab(&mut self, delta: isize) {
+        self.settings_tab = self.settings_tab.cycle(delta);
+    }
+
+    pub fn select_settings_tab(&mut self, tab: SettingsTab) {
+        self.settings_tab = tab;
     }
 
     #[cfg(test)]
@@ -837,6 +894,7 @@ impl App {
         agent: Option<AgentKind>,
         workspaces: Vec<WorkspaceChoice>,
     ) {
+        let agent = agent.filter(|kind| self.harness_installed(*kind));
         let workspace = workspace.filter(|path| {
             workspaces
                 .iter()
@@ -855,7 +913,7 @@ impl App {
             .unwrap_or(0);
         let selected_agent = agent
             .and_then(|kind| {
-                AgentKind::ALL
+                self.available_harnesses
                     .iter()
                     .position(|candidate| *candidate == kind)
             })
@@ -901,9 +959,11 @@ impl App {
                     as usize;
             }
             Mode::NewAgent(NewAgentPage::Agents) => {
-                state.selected_agent = (state.selected_agent as isize + delta)
-                    .rem_euclid(AgentKind::ALL.len() as isize)
-                    as usize;
+                if !self.available_harnesses.is_empty() {
+                    state.selected_agent = (state.selected_agent as isize + delta)
+                        .rem_euclid(self.available_harnesses.len() as isize)
+                        as usize;
+                }
             }
             Mode::NewAgent(NewAgentPage::NativeBrowser) => {
                 if let Some(browser) = &mut state.native_browser {
@@ -933,7 +993,7 @@ impl App {
 
     pub fn select_agent_kind(&mut self, index: usize) {
         if let Some(state) = &mut self.new_agent
-            && index < AgentKind::ALL.len()
+            && index < self.available_harnesses.len()
         {
             state.selected_agent = index;
         }
@@ -1038,16 +1098,20 @@ impl App {
         let Some(state) = &mut self.new_agent else {
             return;
         };
-        state.draft.agent = AgentKind::ALL.get(state.selected_agent).copied();
+        state.draft.agent = self.available_harnesses.get(state.selected_agent).copied();
         self.mode = Mode::NewAgent(NewAgentPage::Form);
     }
 
     pub fn set_agent_choice(&mut self, kind: AgentKind) {
+        let Some(index) = self
+            .available_harnesses
+            .iter()
+            .position(|candidate| *candidate == kind)
+        else {
+            return;
+        };
         if let Some(state) = &mut self.new_agent {
-            state.selected_agent = AgentKind::ALL
-                .iter()
-                .position(|candidate| *candidate == kind)
-                .unwrap_or(0);
+            state.selected_agent = index;
             state.draft.agent = Some(kind);
             self.mode = Mode::NewAgent(NewAgentPage::Form);
         }
@@ -1425,6 +1489,22 @@ mod tests {
             app.new_agent().unwrap().draft.selected_field,
             NewAgentField::Start
         );
+    }
+
+    #[test]
+    fn new_agent_choices_only_include_available_harnesses() {
+        let mut app = app();
+        app.set_available_harnesses(vec![AgentKind::Claude]);
+        app.open_new_agent(None, None, Vec::new());
+        app.open_agent_choices();
+
+        app.confirm_agent();
+
+        assert_eq!(
+            app.new_agent().unwrap().draft.agent,
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(app.available_harnesses(), &[AgentKind::Claude]);
     }
 
     #[test]

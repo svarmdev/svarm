@@ -98,7 +98,7 @@ impl RemoteAgents {
         cols: u16,
         palette: Option<TerminalPalette>,
         events: SyncSender<ClientEvent>,
-    ) -> Result<(Self, SvarmSessionSnapshot)> {
+    ) -> Result<(Self, SvarmSessionSnapshot, Vec<AgentKind>)> {
         let mut writer = UnixStream::connect(socket_path).map_err(|error| {
             format!(
                 "could not connect to Svarm server at {}: {error}",
@@ -126,17 +126,17 @@ impl RemoteAgents {
                 }),
             },
         )?;
-        match read_frame::<_, Envelope>(&mut writer)? {
+        let available_harnesses = match read_frame::<_, Envelope>(&mut writer)? {
             Some(Envelope {
-                message: Message::Welcome(_),
+                message: Message::Welcome(welcome),
                 ..
-            }) => {}
+            }) => welcome.capabilities.available_harnesses,
             Some(Envelope {
                 message: Message::Error(error),
                 ..
             }) => return Err(error.actionable_message().into()),
             _ => return Err("Svarm server did not complete the protocol handshake".into()),
-        }
+        };
 
         let request = match target {
             InitialSession::Create => Request::CreateSession {
@@ -227,6 +227,7 @@ impl RemoteAgents {
                 pending_resync: HashSet::new(),
             },
             snapshot,
+            available_harnesses,
         ))
     }
 

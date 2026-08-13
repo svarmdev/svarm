@@ -146,7 +146,7 @@ pub fn run(
             })
         },
     };
-    let (mut agents, snapshot) = RemoteAgents::connect(
+    let (mut agents, snapshot, available_harnesses) = RemoteAgents::connect(
         &socket_path,
         target,
         child_area.height.max(1),
@@ -155,6 +155,7 @@ pub fn run(
         events_tx.clone(),
     )?;
     let mut app = App::hydrate(snapshot, settings_value.theme, settings_notice);
+    app.set_available_harnesses(available_harnesses);
     let explicit_kind = initial_agent.kind;
     let explicit_workspace = initial_agent.workspace;
     let default_kind = explicit_kind.or(settings_value.last_agent);
@@ -617,10 +618,16 @@ fn handle_key(
             }
         }
         Mode::Settings => match key.code {
-            KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Tab => app.move_settings_tab(1),
+            KeyCode::BackTab => app.move_settings_tab(-1),
+            KeyCode::Char('h') | KeyCode::Left
+                if app.settings_tab() == crate::app::SettingsTab::Appearance =>
+            {
                 save_theme(app, resources.settings_store, resources.settings, -1)
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Char('l') | KeyCode::Right
+                if app.settings_tab() == crate::app::SettingsTab::Appearance =>
+            {
                 save_theme(app, resources.settings_store, resources.settings, 1)
             }
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
@@ -978,6 +985,18 @@ fn apply_click_action(
         }
         ui::ClickAction::ThemeNext => {
             save_theme(app, resources.settings_store, resources.settings, 1);
+            Ok((false, true))
+        }
+        ui::ClickAction::SettingsPrevious => {
+            app.move_settings_tab(-1);
+            Ok((false, true))
+        }
+        ui::ClickAction::SettingsNext => {
+            app.move_settings_tab(1);
+            Ok((false, true))
+        }
+        ui::ClickAction::SettingsTab(tab) => {
+            app.select_settings_tab(tab);
             Ok((false, true))
         }
         ui::ClickAction::EmbeddedAccept | ui::ClickAction::EmbeddedCancel => {

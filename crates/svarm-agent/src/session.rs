@@ -1,5 +1,6 @@
 use std::{
-    fs::File,
+    env,
+    fs::{self, File},
     io::{self, Read},
     os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
@@ -17,6 +18,32 @@ use crate::{
 
 /// Called when an agent's terminal changes so its owner can wake immediately.
 pub type OutputNotifier = Arc<dyn Fn(AgentId) + Send + Sync>;
+
+pub(crate) fn available_harnesses() -> Vec<AgentKind> {
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    AgentKind::ALL
+        .into_iter()
+        .filter(|kind| command_available(kind.command(), &path))
+        .collect()
+}
+
+fn command_available(command: &str, path: &std::ffi::OsStr) -> bool {
+    env::split_paths(path).any(|directory| {
+        let candidate = if directory.as_os_str().is_empty() {
+            Path::new(".").join(command)
+        } else {
+            directory.join(command)
+        };
+        fs::metadata(candidate).is_ok_and(|metadata| {
+            metadata.is_file() && {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+        })
+    })
+}
 
 pub(crate) struct ConversationTracking {
     pub(crate) kind: AgentKind,
@@ -425,6 +452,15 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn command_availability_requires_an_executable_file_on_path() {
+        assert!(command_available("sh", OsStr::new("/bin")));
+        assert!(!command_available(
+            "svarm-command-that-does-not-exist",
+            OsStr::new("/bin")
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
