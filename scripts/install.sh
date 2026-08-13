@@ -127,7 +127,7 @@ if [ -n "$REQUESTED_TAG" ]; then
     valid_version "$VERSION" || die "release tag must be a three-part version, for example v0.1.0"
 else
     download "$RELEASE_API" "$TEMP_DIR/release.json"
-    TAG=$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$TEMP_DIR/release.json" | head -n 1)
+    TAG=$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$TEMP_DIR/release.json" | head -n 1)
     [ -n "$TAG" ] || die "GitHub did not return a latest release tag"
     case "$TAG" in
         v*) VERSION=${TAG#v} ;;
