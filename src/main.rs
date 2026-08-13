@@ -15,13 +15,13 @@ use svarm_tui::{InitialAgentRequest, InitialSession, StartupChoice};
 mod cli;
 mod client;
 mod server_start;
+mod upgrade;
 
 use cli::{Cli, Command, ServerCommand};
 use client::{ControlClient, Probe};
 
 const NONINTERACTIVE_CHOICE_ERROR: &str =
     "session choice requires a terminal; use `--attach --session ID` or `--new-session`";
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if matches!(&cli.command, Some(Command::ConversationHook)) {
@@ -49,6 +49,7 @@ fn main() -> Result<()> {
         }) => stop_server(&paths, yes),
         Some(Command::List) => list_sessions(&paths),
         Some(Command::Stop { session, yes }) => stop_session(&paths, session, yes),
+        Some(Command::Upgrade { yes }) => upgrade::run(&paths, yes),
         None => launch(&paths, cli),
     };
     if !internal_server {

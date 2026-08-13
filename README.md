@@ -10,9 +10,24 @@ Codex, Claude Code, and/or Grok Build must already be installed and available on
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
+```bash
+# Install the latest supported GitHub release into ~/.local/bin:
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh
+
+# Install a specific release or choose another directory:
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- v0.1.0
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/install.sh | sh -s -- --dir /usr/local/bin --yes
+```
+
 ```sh
-# From a checkout of this repository:
+# Clone the repository and install from a checkout:
+git clone https://github.com/williamcr01/svarm.git
+cd svarm
 cargo install --path .
+```
+
+```sh
+# Run Svarm:
 svarm                         # Open or create a workspace-neutral session
 svarm .                       # Open the new-agent form with this workspace
 svarm --agent codex .         # Start Codex here
@@ -22,6 +37,23 @@ svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
 ```
+
+```sh
+# Check for and install a newer release:
+svarm upgrade
+```
+
+Releases are published for Linux x86_64 and ARM64, and macOS Intel and Apple
+Silicon. The convenience installer and `svarm upgrade` both verify the release
+archive against `SHA256SUMS` before installing it. They need `curl` or `wget`,
+`tar`, and `sha256sum` or `shasum`; installation stops if no checksum tool is
+available. Pass `svarm upgrade --yes` to skip confirmation. If a Svarm server is
+running during an upgrade, the server and all of its agents are stopped only
+after the new release has been downloaded and verified.
+
+The installer places `svarm` in `~/.local/bin`; add that directory to `PATH` if
+needed. To review the script before running it, download it separately and run
+`sh scripts/install.sh`.
 
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
