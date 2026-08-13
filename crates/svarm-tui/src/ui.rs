@@ -29,6 +29,34 @@ pub const SIDEBAR_WIDTH: u16 = 28;
 const AGENT_CARD_HEIGHT: u16 = 3;
 /// Marks a directory that is a linked git worktree rather than the repository's main checkout.
 const LINKED_WORKTREE: &str = "⑂";
+/// Nerd Font git-branch glyph (Powerline branch symbol), used in place of `LINKED_WORKTREE`
+/// when `nerd_fonts` is enabled. Falls back to the plain glyph otherwise.
+const LINKED_WORKTREE_NERD_FONT: &str = "\u{e0a0}";
+/// Hit-box width for the per-card archive button on a card's title line.
+const ARCHIVE_BUTTON_WIDTH: u16 = 3;
+/// Archive-button glyph and its Nerd Font counterpart (nf-fa-archive), selected by
+/// `nerd_fonts`; the plain glyph is the default, no-dependency fallback.
+const ARCHIVE_BUTTON_TEXT: &str = "⨯";
+const ARCHIVE_BUTTON_TEXT_NERD_FONT: &str = "\u{f187}";
+/// The codepoint svarm asks fontconfig about to decide whether Nerd Font glyphs will
+/// render. It is the rarest glyph svarm draws, so a font covering it covers the rest.
+pub(crate) const NERD_FONT_PROBE_CODEPOINT: &str = "f187";
+
+fn worktree_icon(nerd_fonts: bool) -> &'static str {
+    if nerd_fonts {
+        LINKED_WORKTREE_NERD_FONT
+    } else {
+        LINKED_WORKTREE
+    }
+}
+
+fn archive_icon(nerd_fonts: bool) -> &'static str {
+    if nerd_fonts {
+        ARCHIVE_BUTTON_TEXT_NERD_FONT
+    } else {
+        ARCHIVE_BUTTON_TEXT
+    }
+}
 const MENU_HEIGHT: u16 = MenuItem::ALL.len() as u16 + 2;
 
 #[derive(Clone, Copy)]
@@ -62,6 +90,7 @@ pub(crate) struct UiModel<'a> {
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
     pub colors_enabled: bool,
+    pub nerd_fonts: bool,
     pub pointer: Option<(u16, u16)>,
 }
 
@@ -70,6 +99,7 @@ pub(crate) enum ClickAction {
     Management(ManagementCommand),
     ToggleMenu,
     SidebarItem(usize),
+    ArchiveCard(usize),
     MenuItem(MenuItem),
     Next,
     Previous,
@@ -366,7 +396,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         .and_then(|(column, row)| hover_action(app, area, column, row));
 
     if app.sidebar_visible() {
-        render_sidebar(frame, app, area, theme, model.colors_enabled, hovered);
+        render_sidebar(
+            frame,
+            app,
+            area,
+            theme,
+            model.colors_enabled,
+            model.nerd_fonts,
+            hovered,
+        );
     }
     render_terminal(frame, model, terminal_area(area, app.sidebar_visible()));
     if !app.sidebar_visible()
@@ -656,6 +694,27 @@ pub fn agent_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usi
     (archived_row < app.archived().len()).then_some(app.agents().len() + archived_row)
 }
 
+/// The archive button only appears on an active card's title line (the card's first
+/// row), reserved as a fixed-width hit box at the right edge of the sidebar.
+fn archive_button_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
+    if !app.sidebar_visible() {
+        return None;
+    }
+    let agents = agent_list_area(app, sidebar_area(area));
+    if column < agents.x || column >= agents.right() || row < agents.y || row >= agents.bottom() {
+        return None;
+    }
+    if column < agents.right().saturating_sub(ARCHIVE_BUTTON_WIDTH) {
+        return None;
+    }
+    let content_row = sidebar_row_start(app, agents) + usize::from(row - agents.y);
+    let active_height = app.agents().len() * usize::from(AGENT_CARD_HEIGHT);
+    if content_row >= active_height || !content_row.is_multiple_of(usize::from(AGENT_CARD_HEIGHT)) {
+        return None;
+    }
+    Some(content_row / usize::from(AGENT_CARD_HEIGHT))
+}
+
 pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return None;
@@ -684,6 +743,9 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
 
     match app.mode() {
         Mode::Terminal => {
+            if let Some(index) = archive_button_at(app, area, column, row) {
+                return Some(ClickAction::ArchiveCard(index));
+            }
             if let Some(index) = agent_item_at(app, area, column, row) {
                 return Some(ClickAction::SidebarItem(index));
             }
@@ -1019,6 +1081,7 @@ fn render_sidebar(
     area: Rect,
     theme: Theme,
     colors_enabled: bool,
+    nerd_fonts: bool,
     hovered: Option<ClickAction>,
 ) {
     let sidebar = sidebar_area(area);
@@ -1046,7 +1109,9 @@ fn render_sidebar(
         let number = format!("{} · ", index + 1);
         let title = end_truncate(
             agent.conversation_title().unwrap_or("Unnamed conversation"),
-            usize::from(agents_area.width).saturating_sub(3 + number.chars().count()),
+            usize::from(agents_area.width)
+                .saturating_sub(3 + number.chars().count())
+                .saturating_sub(usize::from(ARCHIVE_BUTTON_WIDTH)),
         );
         let selected_style = if selected {
             text(theme).add_modifier(Modifier::BOLD)
@@ -1065,17 +1130,35 @@ fn render_sidebar(
             .unwrap_or(directory.as_os_str())
             .to_string_lossy();
         let worktree_marker = if agent.git().is_some_and(|git| git.linked) {
-            LINKED_WORKTREE
+            worktree_icon(nerd_fonts)
         } else {
             ""
         };
+        let archive_button_style = if hovered == Some(ClickAction::ArchiveCard(index)) {
+            theme.selected()
+        } else {
+            theme.muted()
+        };
+        let mut title_spans = vec![
+            Span::styled(marker, accent(theme)),
+            Span::styled(format!("{circle} "), status_style),
+            Span::styled(number, theme.muted()),
+            Span::styled(title, selected_style.add_modifier(Modifier::BOLD)),
+        ];
+        let used = u16::try_from(Line::from(title_spans.clone()).width()).unwrap_or(u16::MAX);
+        let pad = agents_area
+            .width
+            .saturating_sub(used)
+            .saturating_sub(ARCHIVE_BUTTON_WIDTH);
+        if pad > 0 {
+            title_spans.push(Span::raw(" ".repeat(usize::from(pad))));
+        }
+        title_spans.push(Span::styled(
+            format!(" {} ", archive_icon(nerd_fonts)),
+            archive_button_style,
+        ));
         let mut lines = vec![
-            Line::from(vec![
-                Span::styled(marker, accent(theme)),
-                Span::styled(format!("{circle} "), status_style),
-                Span::styled(number, theme.muted()),
-                Span::styled(title, selected_style.add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(title_spans),
             Line::from(vec![
                 Span::styled(marker, accent(theme)),
                 Span::raw(" "),
@@ -2009,6 +2092,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 );
@@ -2080,6 +2164,7 @@ mod tests {
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
+                            nerd_fonts: false,
                             pointer: None,
                         },
                     );
@@ -2129,6 +2214,7 @@ mod tests {
                             embedded: None,
                             theme: app.theme().theme(true),
                             colors_enabled: true,
+                            nerd_fonts: false,
                             pointer: None,
                         },
                     );
@@ -2622,6 +2708,144 @@ mod tests {
     }
 
     #[test]
+    fn archive_button_is_a_distinct_hit_region_on_each_active_card() {
+        let area = Rect::new(0, 0, 80, 24);
+        let agent = |id: u64, title: &str| AgentSnapshot {
+            id: svarm_agent::AgentId::new(id),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/plain-directory"),
+            working_directory: None,
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 1,
+            seen_generation: 1,
+            completed_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            conversation_title: Some(title.into()),
+            conversation_id: None,
+            activity: AgentActivity::Idle,
+            recognition: None,
+            git: None,
+        };
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: SessionSummary {
+                    id: SessionId(11),
+                    running_agents: 2,
+                    total_agents: 2,
+                    attachment: None,
+                    last_user_activity_ms: 1,
+                    revision: SessionRevision(1),
+                },
+                selected_agent_id: Some(svarm_agent::AgentId::new(1)),
+                rows: 24,
+                cols: 80,
+                agents: vec![agent(1, "First"), agent(2, "Second")],
+                archived: Vec::new(),
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        let agents_area = agent_list_area(&app, sidebar_area(area));
+        let button_column = agents_area.right() - 1;
+
+        assert_eq!(
+            click_action(&app, area, button_column, agents_area.y),
+            Some(ClickAction::ArchiveCard(0))
+        );
+        assert_eq!(
+            click_action(&app, area, button_column, agents_area.y + AGENT_CARD_HEIGHT),
+            Some(ClickAction::ArchiveCard(1))
+        );
+        // The rest of the title line still selects the card.
+        assert_eq!(
+            click_action(&app, area, agents_area.x + 2, agents_area.y),
+            Some(ClickAction::SidebarItem(0))
+        );
+        // The button only appears on a card's first line.
+        assert_eq!(
+            click_action(&app, area, button_column, agents_area.y + 1),
+            Some(ClickAction::SidebarItem(0))
+        );
+
+        let hovered = draw_app(&app, Some((button_column, agents_area.y)));
+        assert!(
+            hovered.backend().buffer()[(button_column, agents_area.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !hovered.backend().buffer()[(agents_area.x + 2, agents_area.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "hovering just the archive button should not fill the whole card"
+        );
+    }
+
+    #[test]
+    fn nerd_fonts_swap_icons_with_a_plain_unicode_default() {
+        let active = AgentSnapshot {
+            id: svarm_agent::AgentId::new(1),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/plain-directory"),
+            working_directory: None,
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 1,
+            seen_generation: 1,
+            completed_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            conversation_title: Some("Live thread".into()),
+            conversation_id: None,
+            activity: AgentActivity::Idle,
+            recognition: None,
+            git: Some(GitContext {
+                branch: "main".into(),
+                worktree: "/tmp/plain-directory".into(),
+                linked: true,
+                additions: 0,
+                deletions: 0,
+                ahead: None,
+                behind: None,
+            }),
+        };
+        let app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: SessionSummary {
+                    id: SessionId(12),
+                    running_agents: 1,
+                    total_agents: 1,
+                    attachment: None,
+                    last_user_activity_ms: 1,
+                    revision: SessionRevision(1),
+                },
+                selected_agent_id: Some(active.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![active],
+                archived: Vec::new(),
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        let plain = render_app_text_with(&app, false);
+        assert!(plain.contains(ARCHIVE_BUTTON_TEXT));
+        assert!(plain.contains(LINKED_WORKTREE));
+        assert!(!plain.contains(ARCHIVE_BUTTON_TEXT_NERD_FONT));
+        assert!(!plain.contains(LINKED_WORKTREE_NERD_FONT));
+
+        let nerd = render_app_text_with(&app, true);
+        assert!(nerd.contains(ARCHIVE_BUTTON_TEXT_NERD_FONT));
+        assert!(nerd.contains(LINKED_WORKTREE_NERD_FONT));
+        assert!(!nerd.contains(ARCHIVE_BUTTON_TEXT));
+        assert!(!nerd.contains(LINKED_WORKTREE));
+    }
+
+    #[test]
     fn every_session_chooser_hint_and_row_has_a_click_target() {
         let chooser = SessionChooser::new(
             vec![SessionSummary {
@@ -2784,7 +3008,7 @@ mod tests {
             None,
         );
         let rendered = render_app_text(&app);
-        assert!(rendered.contains("● 1 · Unnamed conversation"));
+        assert!(rendered.contains("● 1 · Unnamed conversa…"));
         assert!(rendered.contains("● 2 · Conversation 2"));
         assert!(!rendered.contains("failed"));
         assert!(!rendered.contains("done"));
@@ -2902,6 +3126,7 @@ mod tests {
                         embedded: None,
                         theme,
                         colors_enabled: true,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 )
@@ -3102,6 +3327,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 )
@@ -3144,6 +3370,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                     frame.area(),
@@ -3188,6 +3415,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 )
@@ -3234,6 +3462,7 @@ mod tests {
                         embedded: Some(&snapshot),
                         theme: app.theme().theme(true),
                         colors_enabled: true,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 )
@@ -3270,6 +3499,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        nerd_fonts: false,
                         pointer,
                     },
                 )
@@ -3300,6 +3530,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        nerd_fonts: false,
                         pointer: None,
                     },
                 )
@@ -3319,6 +3550,10 @@ mod tests {
     }
 
     fn render_app_text(app: &App) -> String {
+        render_app_text_with(app, false)
+    }
+
+    fn render_app_text_with(app: &App, nerd_fonts: bool) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -3334,6 +3569,7 @@ mod tests {
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
+                        nerd_fonts,
                         pointer: None,
                     },
                 )

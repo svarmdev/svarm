@@ -486,6 +486,7 @@ pub(crate) struct App {
     session_id: Option<SessionId>,
     new_agent: Option<NewAgentState>,
     pending_resume: Option<String>,
+    archive_target: Option<AgentId>,
 }
 
 impl App {
@@ -512,6 +513,7 @@ impl App {
             session_id: None,
             new_agent: None,
             pending_resume: None,
+            archive_target: None,
         }
         .with_test_new_agent(choose_agent)
     }
@@ -545,6 +547,7 @@ impl App {
             session_id: Some(snapshot.summary.id),
             new_agent: None,
             pending_resume: None,
+            archive_target: None,
         }
     }
 
@@ -818,11 +821,12 @@ impl App {
         self.pending_resume = Some(self.archived[next].conversation_id.clone());
     }
 
-    pub fn request_archive_selected(&mut self) -> bool {
-        let Some(agent) = self.agents.get(self.selected) else {
+    pub fn request_archive(&mut self, index: usize) -> bool {
+        let Some(agent) = self.agents.get(index) else {
             self.mode = Mode::Terminal;
             return false;
         };
+        self.archive_target = Some(agent.id());
         if agent.conversation_title().is_none() || agent.conversation_id().is_none() {
             self.mode = Mode::ArchiveUnavailable;
             return false;
@@ -834,6 +838,10 @@ impl App {
             return false;
         }
         true
+    }
+
+    pub fn take_archive_target(&mut self) -> Option<AgentId> {
+        self.archive_target.take()
     }
 
     pub fn pending_resume(&self) -> Option<&str> {
@@ -850,6 +858,12 @@ impl App {
 
     pub fn cancel_confirmation(&mut self) {
         self.pending_resume = None;
+        self.archive_target = None;
+        self.mode = Mode::Terminal;
+    }
+
+    pub fn dismiss_archive_unavailable(&mut self) {
+        self.archive_target = None;
         self.mode = Mode::Terminal;
     }
 
@@ -1753,7 +1767,7 @@ mod tests {
     fn unnamed_conversations_open_an_archive_unavailable_modal() {
         let mut unnamed = app();
         unnamed.add_agent(snapshot(1, 0));
-        assert!(!unnamed.request_archive_selected());
+        assert!(!unnamed.request_archive(unnamed.selected_index()));
         assert_eq!(unnamed.mode(), Mode::ArchiveUnavailable);
         assert_eq!(unnamed.notice(), None);
 
@@ -1772,7 +1786,7 @@ mod tests {
             ThemeName::Dark,
             None,
         );
-        assert!(!app.request_archive_selected());
+        assert!(!app.request_archive(app.selected_index()));
         assert_eq!(app.mode(), Mode::ConfirmArchive);
 
         active.activity = AgentActivity::Idle;
@@ -1788,7 +1802,49 @@ mod tests {
             ThemeName::Dark,
             None,
         );
-        assert!(app.request_archive_selected());
+        assert!(app.request_archive(app.selected_index()));
+    }
+
+    #[test]
+    fn archiving_a_non_selected_agent_preserves_the_current_selection() {
+        let mut running = remote_agent(1, 0, 0);
+        running.conversation_title = Some("Busy agent".into());
+        running.conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e49".into());
+        let mut idle = remote_agent(2, 0, 0);
+        idle.conversation_title = Some("Idle agent".into());
+        idle.conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e4a".into());
+        idle.activity = AgentActivity::Idle;
+        let mut busy = remote_agent(3, 0, 0);
+        busy.conversation_title = Some("Another busy agent".into());
+        busy.conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e4b".into());
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: summary(7, 20),
+                selected_agent_id: Some(running.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![running, idle, busy],
+                archived: Vec::new(),
+            },
+            ThemeName::Dark,
+            None,
+        );
+        assert_eq!(app.selected_index(), 0);
+
+        // Archiving the second (unselected, idle) agent should not disturb selection.
+        assert!(app.request_archive(1));
+        assert_eq!(app.selected_index(), 0);
+        assert_eq!(app.take_archive_target(), Some(AgentId::new(2)));
+
+        // Same for the confirmation-required path: targeting a different, busy agent
+        // opens the modal without moving the selection off the currently selected one.
+        assert!(!app.request_archive(2));
+        assert_eq!(app.mode(), Mode::ConfirmArchive);
+        assert_eq!(app.selected_index(), 0);
+
+        // Cancelling clears the pending target instead of leaving it stale.
+        app.cancel_confirmation();
+        assert_eq!(app.take_archive_target(), None);
     }
 
     #[test]

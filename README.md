@@ -10,6 +10,8 @@ Codex, Claude Code, Grok Build, and/or Pi must already be installed and availabl
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
+Nerd Font icons are optional and detected automatically. Set `SVARM_NERD_FONT=1` or `SVARM_NERD_FONT=0` to force the choice when the detection is wrong.
+
 ```bash
 # Install the latest supported GitHub release into ~/.local/bin:
 curl -fsSL https://raw.githubusercontent.com/svarmdev/svarm/main/scripts/install.sh | sh
