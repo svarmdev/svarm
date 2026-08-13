@@ -11,26 +11,12 @@ Codex, Claude Code, and/or Grok Build must already be installed and available on
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
 ```sh
-# Download a release from GitHub Releases. Choose the matching TARGET:
-# x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
-# x86_64-apple-darwin, or aarch64-apple-darwin.
-VERSION=0.1.0
-TARGET=x86_64-unknown-linux-gnu
-ARCHIVE="svarm-${VERSION}-${TARGET}.tar.gz"
-BASE="https://github.com/williamcr01/svarm/releases/download/v${VERSION}"
-mkdir -p ~/.local/bin
-curl -fLO "${BASE}/${ARCHIVE}"
-curl -fLO "${BASE}/SHA256SUMS"
+# Install the latest supported GitHub release into ~/.local/bin:
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh
 
-# Linux:
-grep "  ${ARCHIVE}$" SHA256SUMS | sha256sum -c -
-# macOS:
-# grep "  ${ARCHIVE}$" SHA256SUMS | shasum -a 256 -c -
-
-tmp=$(mktemp -d)
-tar -xzf "$ARCHIVE" -C "$tmp"
-install -m 0755 "$tmp/svarm" ~/.local/bin/svarm
-rm -rf "$tmp"
+# Install a specific release or choose another directory:
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh -s -- v0.1.0
+curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/install.sh | sh -s -- --dir /usr/local/bin --yes
 
 # Check for and install a newer release:
 svarm upgrade
@@ -48,15 +34,16 @@ svarm list                    # List live Svarm sessions
 ```
 
 Releases are published for Linux x86_64 and ARM64, and macOS Intel and Apple
-Silicon. `svarm upgrade` checks GitHub Releases and verifies the downloaded
-archive against `SHA256SUMS` before replacing the current binary. It needs
-`curl` or `wget`, `tar`, and `sha256sum` or `shasum`. Pass `svarm upgrade --yes`
-to skip confirmation. If a Svarm server is running during an upgrade, the server
-and all of its agents are stopped only after the new release has been downloaded
-and verified.
+Silicon. The convenience installer and `svarm upgrade` both verify the release
+archive against `SHA256SUMS` before installing it. They need `curl` or `wget`,
+`tar`, and `sha256sum` or `shasum`; installation stops if no checksum tool is
+available. Pass `svarm upgrade --yes` to skip confirmation. If a Svarm server is
+running during an upgrade, the server and all of its agents are stopped only
+after the new release has been downloaded and verified.
 
-The manual installation above places `svarm` in `~/.local/bin`; add that
-directory to `PATH` if needed.
+The installer places `svarm` in `~/.local/bin`; add that directory to `PATH` if
+needed. To review the script before running it, download it separately and run
+`sh install.sh`.
 
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
