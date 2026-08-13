@@ -29,7 +29,7 @@ use crate::{
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     selection::{ScrollDirection, TerminalSelection},
     settings::{Settings, SettingsStore},
-    terminal::{TerminalSession, colors_enabled},
+    terminal::{TerminalSession, colors_enabled, nerd_fonts_enabled},
     ui::{self, UiModel},
     workspace::{
         DirectoryLoader, WorktreeCreateResult, WorktreeCreator, YaziLaunchError, YaziPicker,
@@ -119,6 +119,7 @@ pub fn run(
 ) -> Result<()> {
     let palette = TerminalPalette::detect();
     let colors_enabled = colors_enabled();
+    let nerd_fonts = nerd_fonts_enabled(ui::NERD_FONT_PROBE_CODEPOINT);
     let settings = SettingsStore::discover();
     let (mut settings_value, settings_notice) = settings.load();
     let (width, height) = crossterm::terminal::size()?;
@@ -216,6 +217,7 @@ pub fn run(
                 embedded: embedded.as_ref(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
+                nerd_fonts,
                 pointer,
             };
             let cursor_style = embedded.as_ref().map_or_else(
@@ -586,7 +588,7 @@ fn handle_key(
             _ => {}
         },
         Mode::ArchiveUnavailable => match key.code {
-            KeyCode::Enter | KeyCode::Esc => app.set_mode(Mode::Terminal),
+            KeyCode::Enter | KeyCode::Esc => app.dismiss_archive_unavailable(),
             _ => {}
         },
         Mode::ConfirmResume => match key.code {
@@ -694,7 +696,7 @@ fn handle_management_command(
             app.set_mode(Mode::ConfirmClose);
         }
         ManagementCommand::ArchiveAgent => {
-            if app.request_archive_selected() {
+            if app.request_archive(app.selected_index()) {
                 archive_selected(app, agents)?;
             }
         }
@@ -893,6 +895,12 @@ fn apply_click_action(
             }
             Ok((false, true))
         }
+        ui::ClickAction::ArchiveCard(index) => {
+            if app.request_archive(index) {
+                archive_selected(app, agents)?;
+            }
+            Ok((false, true))
+        }
         ui::ClickAction::MenuItem(item) => {
             app.select_menu_item(item);
             app.open_selected_menu_item();
@@ -942,7 +950,7 @@ fn apply_click_action(
                 Mode::NewAgent(NewAgentPage::CreatingWorktree) => app.cancel_worktree(),
                 Mode::NewAgent(NewAgentPage::NativeBrowser) => app.close_native_browser(),
                 Mode::ConfirmArchive | Mode::ConfirmResume => app.cancel_confirmation(),
-                Mode::ArchiveUnavailable => app.set_mode(Mode::Terminal),
+                Mode::ArchiveUnavailable => app.dismiss_archive_unavailable(),
                 Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
                 Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
                 Mode::Menu => app.set_mode(Mode::Terminal),
@@ -1037,7 +1045,7 @@ fn close_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
 }
 
 fn archive_selected(app: &mut App, agents: &mut RemoteAgents) -> Result<()> {
-    let Some(id) = app.selected_agent_id() else {
+    let Some(id) = app.take_archive_target() else {
         app.cancel_confirmation();
         return Ok(());
     };

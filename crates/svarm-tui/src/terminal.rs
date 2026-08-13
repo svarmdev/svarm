@@ -1,4 +1,4 @@
-use std::{io, thread};
+use std::{ffi::OsStr, io, thread};
 
 use crossterm::{
     clipboard::CopyToClipboard,
@@ -135,9 +135,79 @@ pub(crate) fn colors_enabled() -> bool {
     !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
+/// What the user asked for, before asking the system what it can render.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NerdFontChoice {
+    Always,
+    Never,
+    Detect,
+}
+
+/// Reads `SVARM_NERD_FONT`: unset means "decide by looking at the installed fonts",
+/// `0`/`false`/`off`/empty force the plain glyphs, and anything else forces Nerd Font
+/// glyphs. Separated from the probe so the policy stays testable without a font stack.
+pub(crate) fn nerd_font_choice(value: Option<&OsStr>) -> NerdFontChoice {
+    let Some(value) = value else {
+        return NerdFontChoice::Detect;
+    };
+    let Some(text) = value.to_str() else {
+        return NerdFontChoice::Always;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => NerdFontChoice::Never,
+        _ => NerdFontChoice::Always,
+    }
+}
+
+/// Whether to render Nerd Font glyphs instead of svarm's plain-Unicode icons.
+///
+/// Terminals do not report which font they draw with, so this asks fontconfig whether a
+/// font covering `probe_codepoint` is installed. On Linux that is a good proxy, because
+/// terminals fall back through fontconfig for glyphs their configured font lacks. Where
+/// fontconfig is absent (macOS without it, Windows) the probe simply fails and svarm
+/// keeps its plain-Unicode icons, which render anywhere.
+pub(crate) fn nerd_fonts_enabled(probe_codepoint: &str) -> bool {
+    match nerd_font_choice(std::env::var_os("SVARM_NERD_FONT").as_deref()) {
+        NerdFontChoice::Always => true,
+        NerdFontChoice::Never => false,
+        NerdFontChoice::Detect => nerd_font_installed(probe_codepoint),
+    }
+}
+
+fn nerd_font_installed(probe_codepoint: &str) -> bool {
+    std::process::Command::new("fc-list")
+        .arg(format!(":charset={probe_codepoint}"))
+        .arg("family")
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::{Command, clipboard::CopyToClipboard};
+
+    use super::*;
+
+    #[test]
+    fn nerd_font_environment_overrides_detection_in_both_directions() {
+        assert_eq!(nerd_font_choice(None), NerdFontChoice::Detect);
+
+        for forced_on in ["1", "true", "yes", "on", "Hack Nerd Font"] {
+            assert_eq!(
+                nerd_font_choice(Some(OsStr::new(forced_on))),
+                NerdFontChoice::Always,
+                "{forced_on} should force Nerd Font glyphs"
+            );
+        }
+
+        for forced_off in ["", "0", "false", "off", "no", " OFF "] {
+            assert_eq!(
+                nerd_font_choice(Some(OsStr::new(forced_off))),
+                NerdFontChoice::Never,
+                "{forced_off:?} should force the plain glyphs"
+            );
+        }
+    }
 
     #[test]
     fn clipboard_command_uses_osc_52_clipboard_destination() {
