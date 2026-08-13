@@ -1128,6 +1128,7 @@ fn handle_new_agent_key(
             KeyCode::Char('c') => app.set_agent_choice(AgentKind::Codex),
             KeyCode::Char('a') => app.set_agent_choice(AgentKind::Claude),
             KeyCode::Char('g') => app.set_agent_choice(AgentKind::Grok),
+            KeyCode::Char('p') => app.set_agent_choice(AgentKind::Pi),
             KeyCode::Enter => app.confirm_agent(),
             KeyCode::Esc => app.back_to_new_agent_form(),
             _ => {}

@@ -162,6 +162,9 @@ mod tests {
         assert_eq!(grok.agent, Some(AgentKind::Grok));
         assert_eq!(remembered.path, None);
 
+        let pi = Cli::try_parse_from(["svarm", "--agent", "pi", "/tmp/workspace"]).unwrap();
+        assert_eq!(pi.agent, Some(AgentKind::Pi));
+
         let new = Cli::try_parse_from(["svarm", "--new-session", "/tmp/workspace"]).unwrap();
         assert!(new.new_session);
         assert_eq!(new.path, Some(PathBuf::from("/tmp/workspace")));

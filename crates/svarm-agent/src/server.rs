@@ -17,6 +17,7 @@ use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
     framing::{read_frame, write_frame},
     git,
+    history::ConversationHistory,
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
     naming::TitleNamer,
@@ -316,6 +317,7 @@ struct SessionRuntime {
     frame_bases: HashMap<AgentId, FrameBasis>,
     archived: Vec<ArchivedConversation>,
     namer: TitleNamer,
+    history: ConversationHistory,
 }
 
 struct GitProbe {
@@ -360,6 +362,14 @@ impl InputDraft {
     fn named(title: String) -> Self {
         Self {
             generated: Some(title),
+            ..Self::default()
+        }
+    }
+
+    fn from_prompt(prompt: String) -> Self {
+        Self {
+            title: Some(prompt.clone()),
+            prompts: vec![prompt],
             ..Self::default()
         }
     }
@@ -472,13 +482,23 @@ impl SessionRuntime {
         let namer = TitleNamer::disabled();
         #[cfg(not(test))]
         let namer = TitleNamer::from_environment();
-        Self::with_namer(state, wake, namer)
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
     }
 
+    #[cfg(test)]
     fn with_namer(
         state: ServerSessionState,
         wake: Option<crate::session::OutputNotifier>,
         namer: TitleNamer,
+    ) -> Self {
+        Self::with_namer_and_history(state, wake, namer, ConversationHistory::from_environment())
+    }
+
+    fn with_namer_and_history(
+        state: ServerSessionState,
+        wake: Option<crate::session::OutputNotifier>,
+        namer: TitleNamer,
+        history: ConversationHistory,
     ) -> Self {
         let (rows, cols) = state.dimensions();
         let agents = AgentManager::new(pty_size(rows, cols), state.terminal_palette(), wake);
@@ -494,6 +514,7 @@ impl SessionRuntime {
             frame_bases: HashMap::new(),
             archived: Vec::new(),
             namer,
+            history,
         }
     }
 
@@ -972,16 +993,20 @@ impl SessionRuntime {
     /// message says what the work is for, and a name that keeps changing under the user is worse
     /// than a slightly stale one.
     fn request_name(&mut self, id: AgentId) {
+        let conversation_id = self
+            .previous
+            .get(&id)
+            .and_then(|observed| observed.session.conversation_id.clone());
+        self.request_name_for(id, conversation_id);
+    }
+
+    fn request_name_for(&mut self, id: AgentId, conversation_id: Option<String>) {
         let Some(draft) = self.input_drafts.get(&id) else {
             return;
         };
         if draft.naming || draft.settled() {
             return;
         }
-        let conversation_id = self
-            .previous
-            .get(&id)
-            .and_then(|observed| observed.session.conversation_id.clone());
         let kind = match self.agents.snapshot(id) {
             Some(snapshot) => snapshot.kind,
             None => return,
@@ -1156,7 +1181,13 @@ impl SessionRuntime {
                     self.input_drafts
                         .insert(snapshot.id, InputDraft::named(reactivated.title));
                 } else {
-                    self.input_drafts.insert(snapshot.id, InputDraft::default());
+                    let draft = self
+                        .history
+                        .first_user_message(snapshot.kind, new_id, &snapshot.launch_directory)
+                        .map(InputDraft::from_prompt)
+                        .unwrap_or_default();
+                    self.input_drafts.insert(snapshot.id, draft);
+                    self.request_name_for(snapshot.id, Some(new_id.to_owned()));
                 }
                 if let Some(old) = previous.as_ref()
                     && let (Some(conversation_id), Some(title)) = (
