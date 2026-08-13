@@ -10,7 +10,7 @@ use svarm_agent::terminal_model::TerminalSnapshot;
 use crate::{
     app::{
         AgentDisplayStatus, App, Checkout, MenuItem, Mode, NewAgentField, NewAgentPage,
-        SessionChooser,
+        SessionChooser, SettingsTab,
     },
     input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
@@ -84,6 +84,9 @@ pub(crate) enum ClickAction {
     NativeBrowserParent,
     ThemePrevious,
     ThemeNext,
+    SettingsPrevious,
+    SettingsNext,
+    SettingsTab(SettingsTab),
     EmbeddedAccept,
     EmbeddedCancel,
     EmbeddedForceClose,
@@ -296,6 +299,28 @@ const SETTINGS_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[→/l] next",
         action: ClickAction::ThemeNext,
+    },
+    ActionHint {
+        text: "[Tab] next tab",
+        action: ClickAction::SettingsNext,
+    },
+    ActionHint {
+        text: "[S-Tab] previous tab",
+        action: ClickAction::SettingsPrevious,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
+const HARNESS_SETTINGS_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Tab] next tab",
+        action: ClickAction::SettingsNext,
+    },
+    ActionHint {
+        text: "[S-Tab] previous tab",
+        action: ClickAction::SettingsPrevious,
     },
     ActionHint {
         text: "[Esc] back",
@@ -742,12 +767,12 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             if !contains(inner, column, row) {
                 return None;
             }
-            let count = AgentKind::ALL.len();
+            let count = app.available_harnesses().len();
             let line = usize::from(row - inner.y);
             if (1..=count).contains(&line) {
                 return Some(ClickAction::AgentKind(line - 1));
             }
-            (line == count + 2)
+            (line == if count == 0 { 3 } else { count + 2 })
                 .then(|| hint_at(AGENT_HINTS, inner.x, column))
                 .flatten()
         }
@@ -824,6 +849,13 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             }
             let line = row - inner.y;
             if line == 1 {
+                for tab in SettingsTab::ALL {
+                    if contains(settings_tab_area(tab, inner, row), column, row) {
+                        return Some(ClickAction::SettingsTab(tab));
+                    }
+                }
+            }
+            if app.settings_tab() == SettingsTab::Appearance && line == 3 {
                 let previous = Rect::new(inner.x + 7, row, 17, 1);
                 if contains(previous, column, row) {
                     return Some(ClickAction::ThemePrevious);
@@ -833,8 +865,8 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                     return Some(ClickAction::ThemeNext);
                 }
             }
-            (line == 3)
-                .then(|| hint_at(SETTINGS_HINTS, inner.x, column))
+            (line == settings_hint_line(app.settings_tab()))
+                .then(|| hint_at(settings_hints(app.settings_tab()), inner.x, column))
                 .flatten()
         }
         Mode::Prefix | Mode::ToolPrefix => None,
@@ -1459,20 +1491,32 @@ fn render_agent_choices(
         return;
     };
     let mut lines = vec![Line::from("")];
-    lines.extend(AgentKind::ALL.iter().enumerate().map(|(index, kind)| {
-        let selected = index == state.selected_agent;
-        Line::from(vec![
-            Span::styled(if selected { " > " } else { "   " }, accent(theme)),
-            Span::styled(
-                kind.label(),
-                hover_style(
-                    theme,
-                    !selected && hovered == Some(ClickAction::AgentKind(index)),
-                    text(theme),
-                ),
-            ),
-        ])
-    }));
+    if app.available_harnesses().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No installed harnesses found.",
+            theme.muted(),
+        )));
+    } else {
+        lines.extend(
+            app.available_harnesses()
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    let selected = index == state.selected_agent;
+                    Line::from(vec![
+                        Span::styled(if selected { " > " } else { "   " }, accent(theme)),
+                        Span::styled(
+                            kind.label(),
+                            hover_style(
+                                theme,
+                                !selected && hovered == Some(ClickAction::AgentKind(index)),
+                                text(theme),
+                            ),
+                        ),
+                    ])
+                }),
+        );
+    }
     lines.extend([Line::from(""), hint_line(AGENT_HINTS, theme, hovered)]);
     render_dialog(frame, theme, " Choose agent ", ModalSize::Compact, lines);
 }
@@ -1702,14 +1746,16 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAct
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme, hovered: Option<ClickAction>) {
-    render_dialog(
-        frame,
-        theme,
-        " Settings ",
-        ModalSize::Standard,
-        vec![
-            Line::from(""),
-            Line::from(vec![
+    let tab = app.settings_tab();
+    let inner = dialog_inner(ModalSize::Standard, frame.area());
+    let mut lines = vec![
+        Line::from(""),
+        settings_tabs(app, theme, hovered),
+        Line::from(""),
+    ];
+    match tab {
+        SettingsTab::Appearance => {
+            lines.push(Line::from(vec![
                 Span::styled("  Theme", text(theme).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     "              ‹  ",
@@ -1733,11 +1779,87 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme, hovered: Opti
                         theme.muted(),
                     ),
                 ),
-            ]),
-            Line::from(""),
-            hint_line(SETTINGS_HINTS, theme, hovered),
-        ],
-    );
+            ]));
+            lines.push(Line::from(""));
+        }
+        SettingsTab::Harnesses => {
+            lines.extend(
+                AgentKind::ALL
+                    .iter()
+                    .map(|kind| render_harness_line(*kind, app, theme, inner.width)),
+            );
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(hint_line(settings_hints(tab), theme, hovered));
+    render_dialog(frame, theme, " Settings ", ModalSize::Standard, lines);
+}
+
+fn render_harness_line(kind: AgentKind, app: &App, theme: Theme, width: u16) -> Line<'static> {
+    let installed = app.harness_installed(kind);
+    let status = if installed {
+        "✓ installed"
+    } else {
+        "× not found"
+    };
+    let mut line = Line::from(vec![
+        Span::styled("  ", text(theme)),
+        Span::styled(kind.label(), text(theme)),
+    ]);
+    let gap = usize::from(width)
+        .saturating_sub(line.width())
+        .saturating_sub(Line::from(status).width());
+    line.spans.push(Span::raw(" ".repeat(gap)));
+    line.spans.push(Span::styled(
+        status,
+        if installed {
+            success(theme)
+        } else {
+            warning(theme)
+        },
+    ));
+    line
+}
+
+fn settings_tabs(app: &App, theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for tab in SettingsTab::ALL {
+        let selected = app.settings_tab() == tab;
+        spans.push(Span::styled(
+            format!("  {}  ", tab.label()),
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::SettingsTab(tab)),
+                selected,
+                text(theme),
+            ),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn settings_tab_area(tab: SettingsTab, inner: Rect, row: u16) -> Rect {
+    let x = inner.x
+        + SettingsTab::ALL
+            .iter()
+            .take_while(|candidate| **candidate != tab)
+            .map(|candidate| candidate.label().len() as u16 + 4)
+            .sum::<u16>();
+    Rect::new(x, row, tab.label().len() as u16 + 4, 1)
+}
+
+fn settings_hints(tab: SettingsTab) -> &'static [ActionHint] {
+    match tab {
+        SettingsTab::Appearance => SETTINGS_HINTS,
+        SettingsTab::Harnesses => HARNESS_SETTINGS_HINTS,
+    }
+}
+
+fn settings_hint_line(tab: SettingsTab) -> u16 {
+    match tab {
+        SettingsTab::Appearance => 5,
+        SettingsTab::Harnesses => 3 + AgentKind::ALL.len() as u16 + 1,
+    }
 }
 
 fn hint_line(hints: &[ActionHint], theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
@@ -2182,7 +2304,7 @@ mod tests {
         assert_hint_clicks(&app, area, compact.x, compact.y + 3, WORKSPACE_HINTS);
 
         app.open_agent_choices();
-        for index in 0..AgentKind::ALL.len() {
+        for index in 0..app.available_harnesses().len() {
             assert_eq!(
                 click_action(&app, area, compact.x, compact.y + 1 + index as u16),
                 Some(ClickAction::AgentKind(index))
@@ -2192,7 +2314,7 @@ mod tests {
             &app,
             area,
             compact.x,
-            compact.y + AgentKind::ALL.len() as u16 + 2,
+            compact.y + app.available_harnesses().len() as u16 + 2,
             AGENT_HINTS,
         );
 
@@ -2259,14 +2381,22 @@ mod tests {
         );
 
         app.set_mode(Mode::Settings);
-        assert_hint_clicks(&app, area, standard.x, standard.y + 3, SETTINGS_HINTS);
+        assert_hint_clicks(&app, area, standard.x, standard.y + 5, SETTINGS_HINTS);
         assert_eq!(
-            click_action(&app, area, standard.x + 21, standard.y + 1),
+            click_action(&app, area, standard.x + 2, standard.y + 1),
+            Some(ClickAction::SettingsTab(SettingsTab::Appearance))
+        );
+        assert_eq!(
+            click_action(&app, area, standard.x + 17, standard.y + 1),
+            Some(ClickAction::SettingsTab(SettingsTab::Harnesses))
+        );
+        assert_eq!(
+            click_action(&app, area, standard.x + 21, standard.y + 3),
             Some(ClickAction::ThemePrevious)
         );
         let next_theme = standard.x + 24 + app.theme().label().chars().count() as u16;
         assert_eq!(
-            click_action(&app, area, next_theme, standard.y + 1),
+            click_action(&app, area, next_theme, standard.y + 3),
             Some(ClickAction::ThemeNext)
         );
 
@@ -2317,12 +2447,12 @@ mod tests {
 
         app.set_mode(Mode::Settings);
         assert_eq!(
-            hover_action(&app, area, standard.x + 21, standard.y + 1),
+            hover_action(&app, area, standard.x + 21, standard.y + 3),
             Some(ClickAction::ThemePrevious)
         );
         assert_eq!(hover_action(&app, area, compact.x + 2, compact.y + 5), None);
         assert_eq!(
-            hover_action(&app, area, standard.x + 2, standard.y + 3),
+            hover_action(&app, area, standard.x + 2, standard.y + 5),
             Some(ClickAction::ThemePrevious)
         );
     }
@@ -2360,12 +2490,49 @@ mod tests {
 
         app.set_mode(Mode::Settings);
         let standard = dialog_inner(ModalSize::Standard, area);
-        let hint = draw_app(&app, Some((standard.x + 2, standard.y + 3)));
+        let hint = draw_app(&app, Some((standard.x + 2, standard.y + 5)));
         assert!(
-            hint.backend().buffer()[(standard.x + 2, standard.y + 3)]
+            hint.backend().buffer()[(standard.x + 2, standard.y + 5)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn settings_lists_every_harness_and_filters_the_new_agent_picker() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        app.set_available_harnesses(vec![AgentKind::Codex]);
+        app.set_mode(Mode::Settings);
+        app.select_settings_tab(SettingsTab::Harnesses);
+
+        let settings = render_app_text(&app);
+        assert!(settings.contains("Harnesses"));
+        assert!(settings.contains("Codex"));
+        assert!(settings.contains("✓ installed"));
+        assert!(settings.contains("Claude Code"));
+        assert!(settings.contains("× not found"));
+
+        app.open_new_agent(None, None, Vec::new());
+        app.open_agent_choices();
+        let picker = render_app_text(&app);
+        assert!(picker.contains("Codex"));
+        assert!(!picker.contains("Claude Code"));
+
+        app.set_available_harnesses(Vec::new());
+        app.open_new_agent(None, None, Vec::new());
+        app.open_agent_choices();
+        let area = Rect::new(0, 0, 80, 24);
+        let compact = dialog_inner(ModalSize::Compact, area);
+        assert_eq!(
+            click_action(&app, area, compact.x + 2, compact.y + 3),
+            Some(ClickAction::Confirm)
+        );
+        assert_eq!(click_action(&app, area, compact.x + 2, compact.y + 2), None);
     }
 
     #[test]

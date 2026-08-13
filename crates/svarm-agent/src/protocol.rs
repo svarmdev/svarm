@@ -9,7 +9,7 @@ use crate::{
 
 pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -92,6 +92,7 @@ pub struct HostTerminalCapabilities {
 pub struct ServerCapabilities {
     pub takeover: bool,
     pub terminal_diffs: bool,
+    pub available_harnesses: Vec<crate::AgentKind>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

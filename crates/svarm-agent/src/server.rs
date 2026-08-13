@@ -1485,6 +1485,7 @@ impl Server {
                     capabilities: ServerCapabilities {
                         takeover: true,
                         terminal_diffs: true,
+                        available_harnesses: crate::session::available_harnesses(),
                     },
                     connection_id: id,
                 }),
