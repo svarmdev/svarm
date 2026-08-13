@@ -8,7 +8,10 @@ use ratatui::{
 use svarm_agent::terminal_model::TerminalSnapshot;
 
 use crate::{
-    app::{AgentDisplayStatus, App, MenuItem, Mode, NewAgentField, NewAgentPage, SessionChooser},
+    app::{
+        AgentDisplayStatus, App, Checkout, MenuItem, Mode, NewAgentField, NewAgentPage,
+        SessionChooser,
+    },
     input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
     selection::VisibleSelection,
@@ -74,6 +77,7 @@ pub(crate) enum ClickAction {
     Cancel,
     NewAgentField(NewAgentField),
     Workspace(usize),
+    Location(usize),
     BrowseWorkspaces,
     AgentKind(usize),
     NativeBrowserItem(usize),
@@ -176,6 +180,28 @@ const WORKSPACE_HINTS: &[ActionHint] = &[
         action: ClickAction::Cancel,
     },
 ];
+const LOCATION_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Enter] use",
+        action: ClickAction::Confirm,
+    },
+    ActionHint {
+        text: "[j] next",
+        action: ClickAction::Next,
+    },
+    ActionHint {
+        text: "[k] previous",
+        action: ClickAction::Previous,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
+const CREATING_HINTS: &[ActionHint] = &[ActionHint {
+    text: "[Esc] cancel",
+    action: ClickAction::Cancel,
+}];
 const AGENT_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[Enter] use",
@@ -334,6 +360,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::NewAgent(NewAgentPage::Form) => render_new_agent_form(frame, app, theme, hovered),
         Mode::NewAgent(NewAgentPage::Workspaces) => {
             render_workspace_choices(frame, app, theme, hovered)
+        }
+        Mode::NewAgent(NewAgentPage::Locations) => {
+            render_location_choices(frame, app, theme, hovered)
+        }
+        Mode::NewAgent(NewAgentPage::CreatingWorktree) => {
+            render_creating_worktree(frame, app, theme, hovered)
         }
         Mode::NewAgent(NewAgentPage::Agents) => render_agent_choices(frame, app, theme, hovered),
         Mode::NewAgent(NewAgentPage::NativeBrowser) => {
@@ -654,9 +686,10 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             }
             match row.checked_sub(inner.y)? {
                 1 => Some(ClickAction::NewAgentField(NewAgentField::Workspace)),
-                2 => Some(ClickAction::NewAgentField(NewAgentField::Agent)),
-                3 => Some(ClickAction::NewAgentField(NewAgentField::Start)),
-                5 => hint_at(FORM_HINTS, inner.x, column),
+                2 => Some(ClickAction::NewAgentField(NewAgentField::Location)),
+                3 => Some(ClickAction::NewAgentField(NewAgentField::Agent)),
+                4 => Some(ClickAction::NewAgentField(NewAgentField::Start)),
+                6 => hint_at(FORM_HINTS, inner.x, column),
                 _ => None,
             }
         }
@@ -678,6 +711,30 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             }
             (line == count + 2)
                 .then(|| hint_at(WORKSPACE_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::NewAgent(NewAgentPage::Locations) => {
+            let inner = dialog_inner(ModalSize::Compact, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let count = Checkout::ALL.len();
+            let line = usize::from(row - inner.y);
+            if (1..=count).contains(&line) {
+                return Some(ClickAction::Location(line - 1));
+            }
+            (line == count + 2)
+                .then(|| hint_at(LOCATION_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::NewAgent(NewAgentPage::CreatingWorktree) => {
+            let inner = dialog_inner(ModalSize::Compact, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let line = usize::from(row - inner.y);
+            (line == 4)
+                .then(|| hint_at(CREATING_HINTS, inner.x, column))
                 .flatten()
         }
         Mode::NewAgent(NewAgentPage::Agents) => {
@@ -1207,6 +1264,7 @@ fn render_new_agent_form(
         || "<choose workspace>".into(),
         |path| path.display().to_string(),
     );
+    let location = state.draft.checkout.label().to_string();
     let agent = state.draft.agent.map_or("<choose agent>", AgentKind::label);
     let complete = state.draft.workspace.is_some() && state.draft.agent.is_some();
     let row = |field, label: &str, value: String| {
@@ -1234,6 +1292,7 @@ fn render_new_agent_form(
         vec![
             Line::from(""),
             row(NewAgentField::Workspace, "Workspace", workspace),
+            row(NewAgentField::Location, "Location", location),
             row(NewAgentField::Agent, "Agent", agent.into()),
             Line::from(vec![
                 Span::styled(if start_selected { " > " } else { "   " }, accent(theme)),
@@ -1322,6 +1381,71 @@ fn render_workspace_choices(
         " Choose workspace ",
         ModalSize::Compact,
         lines,
+    );
+}
+
+fn render_location_choices(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
+    let Some(state) = app.new_agent() else {
+        return;
+    };
+    let mut lines = vec![Line::from("")];
+    lines.extend(Checkout::ALL.iter().enumerate().map(|(index, choice)| {
+        let selected = index == state.selected_location;
+        let disabled = *choice == Checkout::NewWorktree && state.repository_root.is_none();
+        let reason = if disabled {
+            "  not a git repository"
+        } else {
+            ""
+        };
+        let style = if disabled && !selected {
+            theme.muted()
+        } else {
+            hover_style(
+                theme,
+                !selected && hovered == Some(ClickAction::Location(index)),
+                text(theme),
+            )
+        };
+        Line::from(vec![
+            Span::styled(if selected { " > " } else { "   " }, accent(theme)),
+            Span::styled(choice.label(), style),
+            Span::styled(reason, warning(theme)),
+        ])
+    }));
+    lines.extend([Line::from(""), hint_line(LOCATION_HINTS, theme, hovered)]);
+    render_dialog(frame, theme, " Choose location ", ModalSize::Compact, lines);
+}
+
+fn render_creating_worktree(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
+    let checkout = app
+        .new_agent()
+        .and_then(|state| state.draft.workspace.as_ref())
+        .map_or_else(|| "…".into(), |path| path.display().to_string());
+    render_dialog(
+        frame,
+        theme,
+        " Creating worktree ",
+        ModalSize::Compact,
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Creating worktree", text(theme))),
+            Line::from(Span::styled(
+                format!("  {}", end_truncate(&checkout, 56)),
+                theme.muted(),
+            )),
+            Line::from(""),
+            hint_line(CREATING_HINTS, theme, hovered),
+        ],
     );
 }
 
@@ -1809,14 +1933,16 @@ mod tests {
 
     #[test]
     fn prepared_ui_model_renders_at_supported_sizes() {
-        let app = App::new(
+        let mut app = App::new(
             "workspace".into(),
             crate::theme::ThemeName::Dark,
             true,
             None,
         );
+        app.open_new_agent(None, None, Vec::new());
+        app.open_location_choices();
 
-        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+        let draw = |app: &App, width, height| {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
@@ -1824,7 +1950,7 @@ mod tests {
                     render(
                         frame,
                         UiModel {
-                            app: &app,
+                            app,
                             screen: None,
                             scrolled: false,
                             selection: None,
@@ -1837,7 +1963,13 @@ mod tests {
                     );
                 })
                 .unwrap();
+        };
+
+        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
+            draw(&app, width, height);
         }
+        app.begin_worktree(1);
+        draw(&app, 80, 24);
     }
 
     #[test]
@@ -2012,15 +2144,35 @@ mod tests {
         );
         for (line, field) in [
             (1, NewAgentField::Workspace),
-            (2, NewAgentField::Agent),
-            (3, NewAgentField::Start),
+            (2, NewAgentField::Location),
+            (3, NewAgentField::Agent),
+            (4, NewAgentField::Start),
         ] {
             assert_eq!(
                 click_action(&app, area, compact.x, compact.y + line),
                 Some(ClickAction::NewAgentField(field))
             );
         }
-        assert_hint_clicks(&app, area, compact.x, compact.y + 5, FORM_HINTS);
+        assert_hint_clicks(&app, area, compact.x, compact.y + 6, FORM_HINTS);
+
+        app.open_location_choices();
+        for index in 0..Checkout::ALL.len() {
+            assert_eq!(
+                click_action(&app, area, compact.x, compact.y + 1 + index as u16),
+                Some(ClickAction::Location(index))
+            );
+        }
+        assert_hint_clicks(
+            &app,
+            area,
+            compact.x,
+            compact.y + Checkout::ALL.len() as u16 + 2,
+            LOCATION_HINTS,
+        );
+
+        app.begin_worktree(1);
+        assert_hint_clicks(&app, area, compact.x, compact.y + 4, CREATING_HINTS);
+        app.cancel_worktree();
 
         app.open_workspace_choices();
         assert_eq!(

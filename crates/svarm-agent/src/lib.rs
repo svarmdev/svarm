@@ -25,6 +25,7 @@ mod terminal;
 mod terminal_backend;
 pub mod terminal_model;
 mod terminal_process;
+pub mod worktree;
 
 pub use manager::{AgentManager, pty_size};
 pub use portable_pty::PtySize;

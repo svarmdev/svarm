@@ -14,7 +14,7 @@ use std::{
 };
 
 use svarm_agent::{
-    PtySize, TerminalNotifier, TerminalPalette, TerminalProcess, TerminalProcessSnapshot,
+    PtySize, TerminalNotifier, TerminalPalette, TerminalProcess, TerminalProcessSnapshot, worktree,
 };
 
 use crate::{agents::ClientEvent, app::DirectoryChoice};
@@ -218,6 +218,44 @@ fn program_not_found(program: &OsStr) -> bool {
         })
     };
     !program_exists
+}
+
+pub(crate) struct WorktreeCreateResult {
+    pub generation: u64,
+    pub checkout: PathBuf,
+    pub result: std::result::Result<worktree::Worktree, String>,
+}
+
+pub(crate) struct WorktreeCreator {
+    requests: Sender<(u64, PathBuf)>,
+}
+
+impl WorktreeCreator {
+    pub fn new(events: SyncSender<ClientEvent>) -> Self {
+        let (requests, receiver) = mpsc::channel::<(u64, PathBuf)>();
+        thread::spawn(move || {
+            while let Ok((generation, checkout)) = receiver.recv() {
+                let result = worktree::create(&checkout);
+                if events
+                    .send(ClientEvent::WorktreeCreated(WorktreeCreateResult {
+                        generation,
+                        checkout,
+                        result,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { requests }
+    }
+
+    pub fn create(&self, generation: u64, checkout: PathBuf) -> Result<(), String> {
+        self.requests
+            .send((generation, checkout))
+            .map_err(|_| "worktree worker stopped".into())
+    }
 }
 
 impl DirectoryLoader {

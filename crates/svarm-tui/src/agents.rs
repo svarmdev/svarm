@@ -55,6 +55,7 @@ pub(crate) enum ClientEvent {
     Host(crossterm::event::Event),
     Remote(Incoming),
     DirectoryLoaded(crate::workspace::DirectoryLoadResult),
+    WorktreeCreated(crate::workspace::WorktreeCreateResult),
     EmbeddedToolChanged,
 }
 
@@ -680,6 +681,7 @@ impl RemoteAgents {
                     ClientEvent::Remote(Incoming::Envelope(_))
                     | ClientEvent::Host(_)
                     | ClientEvent::DirectoryLoaded(_)
+                    | ClientEvent::WorktreeCreated(_)
                     | ClientEvent::EmbeddedToolChanged,
                 ) => {}
                 Ok(ClientEvent::Remote(Incoming::Disconnected(error))) => return Err(error.into()),
