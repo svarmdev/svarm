@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io,
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -785,15 +785,16 @@ impl SessionRuntime {
         };
         debug_assert_eq!(result.directory, probe.directory);
 
-        let cache_key = result.context.as_ref().map_or_else(
-            || probe.directory.clone(),
-            |context| context.worktree.clone(),
-        );
+        // Keyed by the directory that was probed, never by the worktree it resolved to. A linked
+        // worktree can live inside its own repository, so "inside the worktree root" does not
+        // mean "on that worktree's branch" and reusing a context by path prefix would report the
+        // parent checkout for every agent that moved into a nested worktree.
         let cached = CachedGitContext {
             checked_at: now,
             context: result.context,
         };
-        self.git_cache.insert(cache_key, cached.clone());
+        self.git_cache
+            .insert(probe.directory.clone(), cached.clone());
 
         // Do not apply a result to an agent that moved while Git was running. Clearing its last
         // check makes the new directory the next probe rather than showing stale worktree data.
@@ -815,27 +816,46 @@ impl SessionRuntime {
             self.git_checked.remove(&probe.agent_id);
         }
 
-        // A single worktree probe is valid for every agent currently inside that worktree.
-        if let Some(worktree) = cached.context.as_ref().map(|context| &context.worktree) {
-            let shared = self
-                .previous
-                .iter()
-                .filter_map(|(id, observed)| {
-                    let directory = observed
-                        .working_directory
-                        .as_deref()
-                        .unwrap_or(&observed.session.launch_directory);
-                    (*id != probe.agent_id && directory.starts_with(worktree)).then_some(*id)
-                })
-                .collect::<Vec<_>>();
-            for id in shared {
-                let working_directory = self.previous[&id].working_directory.clone();
-                if self.apply_git_observation(id, working_directory, &cached) {
-                    changed.insert(id);
-                }
+        // One probe answers for every agent standing in the same directory, which is the ordinary
+        // case of several agents launched in one checkout.
+        let shared = self
+            .previous
+            .iter()
+            .filter_map(|(id, observed)| {
+                let directory = observed
+                    .working_directory
+                    .as_deref()
+                    .unwrap_or(&observed.session.launch_directory);
+                (*id != probe.agent_id && directory == probe.directory).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in shared {
+            let working_directory = self.previous[&id].working_directory.clone();
+            if self.apply_git_observation(id, working_directory, &cached) {
+                changed.insert(id);
             }
         }
+
+        self.forget_unvisited_git_cache();
+
         changed
+    }
+
+    /// Keying by probed directory means an agent that wanders leaves an entry behind. Keep only
+    /// the directories agents are standing in now.
+    fn forget_unvisited_git_cache(&mut self) {
+        let visited = self
+            .previous
+            .values()
+            .map(|observed| {
+                observed
+                    .working_directory
+                    .clone()
+                    .unwrap_or_else(|| observed.session.launch_directory.clone())
+            })
+            .collect::<HashSet<_>>();
+        self.git_cache
+            .retain(|directory, _| visited.contains(directory));
     }
 
     fn schedule_git_refresh(&mut self, now: Instant) -> BTreeSet<AgentId> {
@@ -853,20 +873,25 @@ impl SessionRuntime {
         }
         for id in candidates {
             let interval = git_refresh_interval(selected == Some(id));
-            if self
-                .git_checked
-                .get(&id)
-                .is_some_and(|checked| now.duration_since(*checked) < interval)
-            {
-                continue;
-            }
             let Some(observed) = self.previous.get(&id) else {
                 continue;
             };
+            // Read the live directory before the interval gate: the `readlink` behind it costs
+            // far less than the Git probe it decides on, and an agent that just moved into
+            // another checkout should not keep showing the old branch until the interval lapses.
             let working_directory = self.agents.working_directory(id);
             let directory = working_directory
                 .clone()
                 .unwrap_or_else(|| observed.session.launch_directory.clone());
+            let moved = working_directory != observed.working_directory;
+            if !moved
+                && self
+                    .git_checked
+                    .get(&id)
+                    .is_some_and(|checked| now.duration_since(*checked) < interval)
+            {
+                continue;
+            }
 
             if let Some(cached) = self.cached_git_context(&directory, interval, now) {
                 if self.apply_git_observation(id, working_directory, &cached) {
@@ -892,15 +917,8 @@ impl SessionRuntime {
         interval: Duration,
         now: Instant,
     ) -> Option<CachedGitContext> {
-        self.git_cache.iter().find_map(|(key, cached)| {
-            let fresh = now.duration_since(cached.checked_at) < interval;
-            let contains = key == directory
-                || cached
-                    .context
-                    .as_ref()
-                    .is_some_and(|context| directory.starts_with(&context.worktree));
-            (fresh && contains).then(|| cached.clone())
-        })
+        let cached = self.git_cache.get(directory)?;
+        (now.duration_since(cached.checked_at) < interval).then(|| cached.clone())
     }
 
     fn apply_git_observation(
@@ -2442,32 +2460,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_git_context_is_shared_with_directories_inside_the_worktree() {
-        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
-        let mut runtime = SessionRuntime::new(state, None);
-        let now = Instant::now();
-        let worktree = PathBuf::from("/repo");
-        let context = GitContext {
-            branch: "main".into(),
-            worktree: worktree.clone(),
-            linked: false,
-            additions: 0,
-            deletions: 0,
-            ahead: None,
-            behind: None,
-        };
-        runtime.git_cache.insert(
-            worktree,
-            CachedGitContext {
-                checked_at: now,
-                context: Some(context.clone()),
-            },
-        );
+    fn fresh_git_context_is_shared_only_with_the_same_directory() {
+        let (runtime, now, context) = runtime_with_cached_repository_context();
 
         assert_eq!(
             runtime
                 .cached_git_context(
-                    Path::new("/repo/crates/svarm"),
+                    Path::new("/repo"),
                     SELECTED_GIT_REFRESH_INTERVAL,
                     now + Duration::from_millis(999),
                 )
@@ -2477,12 +2476,61 @@ mod tests {
         assert!(
             runtime
                 .cached_git_context(
-                    Path::new("/repo/crates/svarm"),
+                    Path::new("/repo"),
                     SELECTED_GIT_REFRESH_INTERVAL,
                     now + SELECTED_GIT_REFRESH_INTERVAL,
                 )
                 .is_none()
         );
+        // A subdirectory is probed on its own rather than borrowing the checkout root's answer,
+        // because a directory inside a repository can belong to a different worktree.
+        assert!(
+            runtime
+                .cached_git_context(
+                    Path::new("/repo/crates/svarm"),
+                    SELECTED_GIT_REFRESH_INTERVAL,
+                    now,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_nested_worktree_does_not_inherit_the_parent_repository_context() {
+        let (runtime, now, _) = runtime_with_cached_repository_context();
+
+        assert!(
+            runtime
+                .cached_git_context(
+                    Path::new("/repo/.claude/worktrees/feature"),
+                    SELECTED_GIT_REFRESH_INTERVAL,
+                    now,
+                )
+                .is_none()
+        );
+    }
+
+    fn runtime_with_cached_repository_context() -> (SessionRuntime, Instant, GitContext) {
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let now = Instant::now();
+        let context = GitContext {
+            branch: "main".into(),
+            worktree: PathBuf::from("/repo"),
+            linked: false,
+            additions: 0,
+            deletions: 0,
+            ahead: None,
+            behind: None,
+        };
+        runtime.git_cache.insert(
+            PathBuf::from("/repo"),
+            CachedGitContext {
+                checked_at: now,
+                context: Some(context.clone()),
+            },
+        );
+        (runtime, now, context)
     }
 
     #[test]
@@ -3025,6 +3073,84 @@ mod tests {
             observed.working_directory,
             Some(linked.canonicalize().unwrap())
         );
+
+        runtime.agents.stop_all();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worktree_nested_in_the_repository_is_not_reported_as_the_main_checkout() {
+        let directory = temp_dir();
+        // Coding agents create their worktrees inside the repository they came from, so the
+        // nested path sits under the main checkout's root and must still be probed on its own.
+        let nested = directory.join(".claude").join("worktrees").join("nested");
+        run_git(&directory, &["init", "-q", "-b", "main"]);
+        run_git(
+            &directory,
+            &[
+                "-c",
+                "user.name=Svarm Test",
+                "-c",
+                "user.email=svarm@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        run_git(
+            &directory,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "nested-branch",
+                nested.to_str().unwrap(),
+            ],
+        );
+
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let enter = format!("cd '{}' && exec sleep 60", nested.display());
+        let mover = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &enter]);
+        let spawned = runtime
+            .spawn(AgentKind::Codex, &directory, 0, &mover)
+            .unwrap();
+
+        // Spawned second so it is the selected agent and is therefore probed first: the main
+        // checkout's context reaches the cache before the agent that left it is ever looked at.
+        let resident = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "exec sleep 60"]);
+        runtime
+            .spawn(AgentKind::Codex, &directory, 0, &resident)
+            .unwrap();
+
+        // Shorter than the background refresh interval on purpose. Borrowing the main checkout's
+        // context corrected itself once that entry went stale, which hid the defect; the nested
+        // worktree has to be reported without waiting for an expiry.
+        let deadline = Instant::now() + BACKGROUND_GIT_REFRESH_INTERVAL / 2;
+        let observed = loop {
+            let _ = runtime.poll_events();
+            let agent = runtime
+                .snapshot()
+                .agents
+                .into_iter()
+                .find(|agent| agent.id == spawned.id)
+                .expect("moved agent");
+            if agent.git.as_ref().is_some_and(|git| git.linked) || Instant::now() >= deadline {
+                break agent;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let git = observed.git.expect("git context");
+        assert_eq!(git.branch, "nested-branch");
+        assert_eq!(git.worktree, nested.canonicalize().unwrap());
+        assert!(git.linked);
 
         runtime.agents.stop_all();
         fs::remove_dir_all(directory).unwrap();
