@@ -20,11 +20,14 @@ curl -fsSL https://raw.githubusercontent.com/williamcr01/svarm/main/scripts/inst
 ```
 
 ```sh
-# Check for and install a newer release:
-svarm upgrade
-
-# From a checkout of this repository:
+# Clone the repository and install from a checkout:
+git clone https://github.com/williamcr01/svarm.git
+cd svarm
 cargo install --path .
+```
+
+```sh
+# Run Svarm:
 svarm                         # Open or create a workspace-neutral session
 svarm .                       # Open the new-agent form with this workspace
 svarm --agent codex .         # Start Codex here
@@ -33,6 +36,11 @@ svarm --agent grok .          # Grok Build here
 svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
+```
+
+```sh
+# Check for and install a newer release:
+svarm upgrade
 ```
 
 Releases are published for Linux x86_64 and ARM64, and macOS Intel and Apple
