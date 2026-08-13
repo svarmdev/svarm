@@ -1,14 +1,16 @@
 //! Best-effort access to provider-owned conversation history.
 //!
 //! Providers persist their resumable conversations outside svarm. This adapter only reads the
-//! first real user message, so a `/resume` inside a running agent can use the same naming flow as a
-//! new conversation without making the provider transcript part of the application model.
+//! first real user message, so a conversation switched inside a running agent can use the same
+//! naming flow as a new conversation without making provider transcripts part of the application
+//! model.
 
 use std::{
     env,
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use serde_json::Value;
@@ -99,6 +101,7 @@ impl ConversationHistory {
                 .as_deref()
                 .and_then(|root| find_file(root, |name| name.contains(conversation_id)))
                 .and_then(|path| first_line(&path, pi_prompt)),
+            AgentKind::OpenCode => export_opencode_prompt(conversation_id, working_directory),
         }
     }
 }
@@ -182,6 +185,37 @@ fn pi_prompt(value: &Value) -> Option<String> {
     normalize_prompt(text_content(value.get("message")?.get("content")?)?)
 }
 
+fn export_opencode_prompt(conversation_id: &str, working_directory: &Path) -> Option<String> {
+    let output = Command::new("opencode")
+        .args(["export", conversation_id])
+        .current_dir(working_directory)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let export = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    let messages = export.get("messages")?.as_array()?;
+    messages.iter().find_map(opencode_prompt)
+}
+
+fn opencode_prompt(value: &Value) -> Option<String> {
+    if value.get("info")?.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    value
+        .get("parts")?
+        .as_array()?
+        .iter()
+        .filter(|part| part.get("synthetic").and_then(Value::as_bool) != Some(true))
+        .filter(|part| part.get("ignored").and_then(Value::as_bool) != Some(true))
+        .find_map(|part| {
+            (part.get("type")?.as_str()? == "text")
+                .then(|| part.get("text")?.as_str())
+                .flatten()
+                .and_then(normalize_prompt)
+        })
+}
 fn text_content(value: &Value) -> Option<&str> {
     if let Some(text) = value.as_str() {
         return Some(text);
@@ -305,6 +339,32 @@ mod tests {
             Some("fix the Pi adapter".into())
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn parses_open_code_export_messages_and_skips_synthetic_parts() {
+        let export = serde_json::json!({
+            "messages": [
+                {
+                    "info": {"role": "user"},
+                    "parts": [{"type": "text", "synthetic": true, "text": "/init"}]
+                },
+                {
+                    "info": {"role": "user"},
+                    "parts": [{"type": "text", "text": "resume   the release work"}]
+                }
+            ]
+        });
+        assert_eq!(
+            export
+                .get("messages")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(opencode_prompt),
+            Some("resume the release work".into())
+        );
     }
 
     #[test]

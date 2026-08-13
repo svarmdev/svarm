@@ -164,6 +164,8 @@ mod tests {
 
         let pi = Cli::try_parse_from(["svarm", "--agent", "pi", "/tmp/workspace"]).unwrap();
         assert_eq!(pi.agent, Some(AgentKind::Pi));
+        let opencode = Cli::try_parse_from(["svarm", "--agent", "opencode"]).unwrap();
+        assert_eq!(opencode.agent, Some(AgentKind::OpenCode));
 
         let new = Cli::try_parse_from(["svarm", "--new-session", "/tmp/workspace"]).unwrap();
         assert!(new.new_session);

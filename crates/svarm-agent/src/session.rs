@@ -452,6 +452,7 @@ pub(crate) fn agent_command(
             command.arg("--fullscreen");
         }
         AgentKind::Pi => {}
+        AgentKind::OpenCode => {}
     }
     Ok(command)
 }
@@ -466,6 +467,7 @@ pub(crate) fn resume_agent_command(
         AgentKind::Codex => command.args(["resume", conversation_id]),
         AgentKind::Claude | AgentKind::Grok => command.args(["--resume", conversation_id]),
         AgentKind::Pi => command.args(["--session", conversation_id]),
+        AgentKind::OpenCode => command.args(["--session", conversation_id]),
     }
     Ok(command)
 }
@@ -739,6 +741,21 @@ mod tests {
             Some("019ff1d3-375e-7a72-a176-c47497827e49")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_commands_start_and_resume_the_requested_conversation() {
+        let cwd = std::env::current_dir().unwrap();
+        let id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let opencode = agent_command(AgentKind::OpenCode, &cwd, None).unwrap();
+        assert_eq!(opencode.get_argv(), &[std::ffi::OsString::from("opencode")]);
+        let opencode = resume_agent_command(AgentKind::OpenCode, &cwd, id).unwrap();
+        assert!(
+            opencode
+                .get_argv()
+                .windows(2)
+                .any(|args| args == ["--session", id])
+        );
     }
 
     #[test]

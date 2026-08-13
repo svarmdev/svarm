@@ -60,10 +60,17 @@ pub enum AgentKind {
     Claude,
     Grok,
     Pi,
+    OpenCode,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Grok, Self::Pi];
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::Claude,
+        Self::Grok,
+        Self::Pi,
+        Self::OpenCode,
+    ];
 
     pub const fn command(self) -> &'static str {
         match self {
@@ -71,6 +78,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Grok => "grok",
             Self::Pi => "pi",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -80,6 +88,7 @@ impl AgentKind {
             Self::Claude => "Claude Code",
             Self::Grok => "Grok Build",
             Self::Pi => "Pi",
+            Self::OpenCode => "OpenCode",
         }
     }
 
@@ -104,8 +113,9 @@ impl FromStr for AgentKind {
             "claude" | "claude-code" => Ok(Self::Claude),
             "grok" | "grok-build" => Ok(Self::Grok),
             "pi" => Ok(Self::Pi),
+            "opencode" | "open-code" => Ok(Self::OpenCode),
             _ => Err(format!(
-                "unsupported agent {value:?}; use codex, claude, grok, or pi"
+                "unsupported agent {value:?}; use codex, claude, grok, pi, or opencode"
             )),
         }
     }
@@ -152,7 +162,8 @@ mod tests {
         assert_eq!("grok".parse(), Ok(AgentKind::Grok));
         assert_eq!("grok-build".parse(), Ok(AgentKind::Grok));
         assert_eq!("pi".parse(), Ok(AgentKind::Pi));
-        assert!("opencode".parse::<AgentKind>().is_err());
+        assert_eq!("opencode".parse(), Ok(AgentKind::OpenCode));
+        assert_eq!("open-code".parse(), Ok(AgentKind::OpenCode));
     }
 
     #[test]
