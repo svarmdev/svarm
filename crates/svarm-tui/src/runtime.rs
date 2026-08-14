@@ -215,6 +215,7 @@ pub fn run(
                     .as_ref()
                     .map(|toast| toast.message.as_str()),
                 embedded: embedded.as_ref(),
+                now_ms: crate::startup::unix_time_ms(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
                 nerd_fonts,
@@ -492,6 +493,9 @@ fn apply_remote_update(
                 app.set_notice(notice.message);
                 dirty = true;
             }
+            ServerEvent::UsageChanged(usage) => {
+                dirty |= app.set_usage(usage);
+            }
             ServerEvent::LeaseRevoked { reason } => {
                 *connection_failure = Some(reason);
             }
@@ -640,6 +644,14 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
             _ => {}
         },
+        // Opened from the sidebar rather than the menu, so leaving returns to the terminal.
+        Mode::Usage => match key.code {
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.move_usage_tab(1),
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.move_usage_tab(-1),
+            KeyCode::Char('r') => agents.request_usage(true)?,
+            KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Terminal),
+            _ => {}
+        },
     }
     Ok((false, redraw))
 }
@@ -720,6 +732,11 @@ fn handle_management_command(
             app.set_mode(Mode::Menu);
         }
         ManagementCommand::OpenKeybinds => app.set_mode(Mode::Keybinds),
+        ManagementCommand::OpenUsage => {
+            app.open_usage();
+            // Show whatever is cached immediately and re-probe behind it.
+            agents.request_usage(true)?;
+        }
         ManagementCommand::SelectAgent(index) => {
             if app.select_sidebar_index(index) {
                 sync_selection(app, agents)?;
@@ -953,6 +970,7 @@ fn apply_click_action(
                 Mode::ArchiveUnavailable => app.dismiss_archive_unavailable(),
                 Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
                 Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
+                Mode::Usage => app.set_mode(Mode::Terminal),
                 Mode::Menu => app.set_mode(Mode::Terminal),
                 _ => {}
             }
@@ -1011,6 +1029,18 @@ fn apply_click_action(
         }
         ui::ClickAction::SettingsTab(tab) => {
             app.select_settings_tab(tab);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageTab(kind) => {
+            app.select_usage_tab(kind);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageNext => {
+            app.move_usage_tab(1);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageRefresh => {
+            agents.request_usage(true)?;
             Ok((false, true))
         }
         ui::ClickAction::EmbeddedAccept | ui::ClickAction::EmbeddedCancel => {
@@ -1718,7 +1748,8 @@ mod tests {
             },
             area,
         ));
-        assert_eq!(app.sidebar_scroll(), Some(3));
+        // The sidebar reserves a third button row, so one more row of cards sits below the fold.
+        assert_eq!(app.sidebar_scroll(), Some(4));
     }
 
     #[test]
