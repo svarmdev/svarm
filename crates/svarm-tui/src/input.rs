@@ -20,6 +20,8 @@ pub(crate) enum ManagementCommand {
     Detach,
     ConfirmQuit,
     ToggleSidebar,
+    NarrowSidebar,
+    WidenSidebar,
     OpenMenu,
     OpenKeybinds,
     SelectAgent(usize),
@@ -85,6 +87,11 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
         command: ManagementCommand::ToggleSidebar,
     },
     Keybinding {
+        keys: "Ctrl+B, h/l",
+        action: "narrow/widen sidebar",
+        command: ManagementCommand::NarrowSidebar,
+    },
+    Keybinding {
         keys: "Ctrl+B, m",
         action: "open menu",
         command: ManagementCommand::OpenMenu,
@@ -121,6 +128,8 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         HostKeyCode::Char('d') => ManagementCommand::Detach,
         HostKeyCode::Char('q') => ManagementCommand::ConfirmQuit,
         HostKeyCode::Char('b') => ManagementCommand::ToggleSidebar,
+        HostKeyCode::Char('h') | HostKeyCode::Left => ManagementCommand::NarrowSidebar,
+        HostKeyCode::Char('l') | HostKeyCode::Right => ManagementCommand::WidenSidebar,
         HostKeyCode::Char('m') => ManagementCommand::OpenMenu,
         HostKeyCode::Char('?') => ManagementCommand::OpenKeybinds,
         HostKeyCode::Char(digit @ '1'..='9') => {
@@ -220,6 +229,14 @@ mod tests {
         assert_eq!(
             management_command(key(HostKeyCode::PageUp, KeyModifiers::NONE)),
             ManagementCommand::ScrollTerminalUp
+        );
+        assert_eq!(
+            management_command(key(HostKeyCode::Char('h'), KeyModifiers::NONE)),
+            ManagementCommand::NarrowSidebar
+        );
+        assert_eq!(
+            management_command(key(HostKeyCode::Char('l'), KeyModifiers::NONE)),
+            ManagementCommand::WidenSidebar
         );
         assert_eq!(
             management_command(key(HostKeyCode::Char('a'), KeyModifiers::NONE)),

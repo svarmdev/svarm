@@ -9,8 +9,8 @@ use svarm_agent::terminal_model::TerminalSnapshot;
 
 use crate::{
     app::{
-        AgentDisplayStatus, App, Checkout, MenuItem, Mode, NewAgentField, NewAgentPage,
-        SessionChooser, SettingsTab,
+        AgentDisplayStatus, AgentState, App, Checkout, MenuItem, Mode, NewAgentField, NewAgentPage,
+        SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SessionChooser, SettingsTab,
     },
     input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
@@ -25,8 +25,9 @@ const COMPACT_MODAL_WIDTH: u16 = 64;
 const COMPACT_MODAL_HEIGHT: u16 = 12;
 const STANDARD_MODAL_WIDTH: u16 = 72;
 const STANDARD_MODAL_HEIGHT: u16 = 18;
-pub const SIDEBAR_WIDTH: u16 = 28;
+pub const SIDEBAR_WIDTH: u16 = SIDEBAR_DEFAULT_WIDTH;
 const AGENT_CARD_HEIGHT: u16 = 3;
+const COLLAPSED_CARD_HEIGHT: u16 = 1;
 /// Marks a directory that is a linked git worktree rather than the repository's main checkout.
 const LINKED_WORKTREE: &str = "⑂";
 /// Nerd Font git-branch glyph (Powerline branch symbol), used in place of `LINKED_WORKTREE`
@@ -98,6 +99,7 @@ pub(crate) struct UiModel<'a> {
 pub(crate) enum ClickAction {
     Management(ManagementCommand),
     ToggleMenu,
+    ResizeSidebar,
     SidebarItem(usize),
     ArchiveCard(usize),
     MenuItem(MenuItem),
@@ -406,9 +408,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
             hovered,
         );
     }
-    render_terminal(frame, model, terminal_area(area, app.sidebar_visible()));
+    render_terminal(
+        frame,
+        model,
+        terminal_area(area, layout_sidebar_width(app, area)),
+    );
     if !app.sidebar_visible()
-        && let Some(button) = menu_button_area(area, false)
+        && let Some(button) = menu_button_area(area, 0)
     {
         let style = chrome_style(
             theme,
@@ -615,12 +621,34 @@ fn format_age(age_ms: u64) -> String {
     }
 }
 
-pub fn terminal_area(area: Rect, sidebar_visible: bool) -> Rect {
-    let sidebar_width = if sidebar_visible {
-        SIDEBAR_WIDTH.min(area.width.saturating_sub(1))
+pub fn clamp_sidebar_width(width: u16, terminal_width: u16) -> u16 {
+    let max = SIDEBAR_MAX_WIDTH
+        .min(terminal_width.saturating_sub(1) / 2)
+        .max(SIDEBAR_MIN_WIDTH);
+    width.clamp(SIDEBAR_MIN_WIDTH, max)
+}
+
+pub fn layout_sidebar_width(app: &App, area: Rect) -> u16 {
+    if app.sidebar_visible() {
+        clamp_sidebar_width(app.sidebar_width(), area.width)
     } else {
         0
-    };
+    }
+}
+
+pub fn sidebar_collapsed(width: u16) -> bool {
+    width > 0 && width <= SIDEBAR_MIN_WIDTH
+}
+
+pub fn sidebar_card_height(width: u16) -> u16 {
+    if sidebar_collapsed(width) {
+        COLLAPSED_CARD_HEIGHT
+    } else {
+        AGENT_CARD_HEIGHT
+    }
+}
+
+pub fn terminal_area(area: Rect, sidebar_width: u16) -> Rect {
     Rect::new(
         area.x.saturating_add(sidebar_width),
         area.y,
@@ -629,20 +657,29 @@ pub fn terminal_area(area: Rect, sidebar_visible: bool) -> Rect {
     )
 }
 
-pub fn sidebar_area(area: Rect) -> Rect {
-    Rect::new(
-        area.x,
-        area.y,
-        SIDEBAR_WIDTH.min(area.width.saturating_sub(1)),
-        area.height,
-    )
+pub fn sidebar_area(area: Rect, sidebar_width: u16) -> Rect {
+    Rect::new(area.x, area.y, sidebar_width, area.height)
 }
 
-pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
+pub fn resize_handle_area(app: &App, area: Rect) -> Option<Rect> {
+    let width = layout_sidebar_width(app, area);
+    if width == 0 {
+        return None;
+    }
+    let sidebar = sidebar_area(area, width);
+    Some(Rect::new(
+        sidebar.right().saturating_sub(1),
+        sidebar.y,
+        1,
+        sidebar.height,
+    ))
+}
+
+pub fn menu_button_area(area: Rect, sidebar_width: u16) -> Option<Rect> {
     if area.height == 0 {
         return None;
     }
-    if !sidebar_visible {
+    if sidebar_width == 0 {
         return Some(Rect::new(
             area.x,
             area.bottom().saturating_sub(1),
@@ -650,7 +687,7 @@ pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
             1,
         ));
     }
-    let sidebar = sidebar_area(area);
+    let sidebar = sidebar_area(area, sidebar_width);
     Some(Rect::new(
         sidebar.x,
         sidebar.bottom().saturating_sub(1),
@@ -659,16 +696,16 @@ pub fn menu_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
     ))
 }
 
-pub fn new_agent_button_area(area: Rect, sidebar_visible: bool) -> Option<Rect> {
-    if !sidebar_visible {
+pub fn new_agent_button_area(area: Rect, sidebar_width: u16) -> Option<Rect> {
+    if sidebar_width == 0 {
         return None;
     }
-    let menu = menu_button_area(area, sidebar_visible)?;
+    let menu = menu_button_area(area, sidebar_width)?;
     (menu.y > area.y).then_some(Rect::new(menu.x, menu.y - 1, menu.width, 1))
 }
 
-pub fn menu_item_at(area: Rect, column: u16, row: u16) -> Option<MenuItem> {
-    let button = menu_button_area(area, true)?;
+pub fn menu_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<MenuItem> {
+    let button = menu_button_area(area, layout_sidebar_width(app, area))?;
     let popup = menu_popup_area(button);
     if column <= popup.x || column >= popup.right().saturating_sub(1) {
         return None;
@@ -678,41 +715,46 @@ pub fn menu_item_at(area: Rect, column: u16, row: u16) -> Option<MenuItem> {
 }
 
 pub fn agent_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
-    if !app.sidebar_visible() {
+    let width = layout_sidebar_width(app, area);
+    if width == 0 {
         return None;
     }
-    let agents = agent_list_area(app, sidebar_area(area));
+    let agents = agent_list_area(app, sidebar_area(area, width), width);
     if column < agents.x || column >= agents.right() || row < agents.y || row >= agents.bottom() {
         return None;
     }
-    let content_row = sidebar_row_start(app, agents) + usize::from(row - agents.y);
-    let active_height = app.agents().len() * usize::from(AGENT_CARD_HEIGHT);
+    let card_height = usize::from(sidebar_card_height(width));
+    let content_row = sidebar_row_start(app, agents, card_height) + usize::from(row - agents.y);
+    let active_height = app.agents().len() * card_height;
     if content_row < active_height {
-        return Some(content_row / usize::from(AGENT_CARD_HEIGHT));
+        return Some(content_row / card_height);
     }
-    let archived_row = content_row.checked_sub(active_height + 1)?;
+    let header = usize::from(!sidebar_collapsed(width));
+    let archived_row = content_row.checked_sub(active_height + header)?;
     (archived_row < app.archived().len()).then_some(app.agents().len() + archived_row)
 }
 
 /// The archive button only appears on an active card's title line (the card's first
 /// row), reserved as a fixed-width hit box at the right edge of the sidebar.
 fn archive_button_at(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
-    if !app.sidebar_visible() {
+    let width = layout_sidebar_width(app, area);
+    if width == 0 || sidebar_collapsed(width) {
         return None;
     }
-    let agents = agent_list_area(app, sidebar_area(area));
+    let agents = agent_list_area(app, sidebar_area(area, width), width);
     if column < agents.x || column >= agents.right() || row < agents.y || row >= agents.bottom() {
         return None;
     }
     if column < agents.right().saturating_sub(ARCHIVE_BUTTON_WIDTH) {
         return None;
     }
-    let content_row = sidebar_row_start(app, agents) + usize::from(row - agents.y);
-    let active_height = app.agents().len() * usize::from(AGENT_CARD_HEIGHT);
-    if content_row >= active_height || !content_row.is_multiple_of(usize::from(AGENT_CARD_HEIGHT)) {
+    let card_height = usize::from(AGENT_CARD_HEIGHT);
+    let content_row = sidebar_row_start(app, agents, card_height) + usize::from(row - agents.y);
+    let active_height = app.agents().len() * card_height;
+    if content_row >= active_height || !content_row.is_multiple_of(card_height) {
         return None;
     }
-    Some(content_row / usize::from(AGENT_CARD_HEIGHT))
+    Some(content_row / card_height)
 }
 
 pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
@@ -720,18 +762,21 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
         return None;
     }
 
+    let sidebar_width = layout_sidebar_width(app, area);
     if matches!(
         app.mode(),
         Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
     ) {
+        if resize_handle_area(app, area).is_some_and(|handle| contains(handle, column, row)) {
+            return Some(ClickAction::ResizeSidebar);
+        }
         if app.mode() != Mode::Menu
-            && new_agent_button_area(area, app.sidebar_visible())
+            && new_agent_button_area(area, sidebar_width)
                 .is_some_and(|button| contains(button, column, row))
         {
             return Some(ClickAction::Management(ManagementCommand::ChooseAgent));
         }
-        if menu_button_area(area, app.sidebar_visible())
-            .is_some_and(|button| contains(button, column, row))
+        if menu_button_area(area, sidebar_width).is_some_and(|button| contains(button, column, row))
         {
             return Some(if app.sidebar_visible() {
                 ClickAction::ToggleMenu
@@ -749,20 +794,19 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             if let Some(index) = agent_item_at(app, area, column, row) {
                 return Some(ClickAction::SidebarItem(index));
             }
-            if app.agents().is_empty()
-                && contains(terminal_area(area, app.sidebar_visible()), column, row)
+            if app.agents().is_empty() && contains(terminal_area(area, sidebar_width), column, row)
             {
                 return Some(ClickAction::Management(ManagementCommand::ChooseAgent));
             }
             None
         }
         Mode::Menu => {
-            if let Some(item) = menu_item_at(area, column, row) {
+            if let Some(item) = menu_item_at(app, area, column, row) {
                 return Some(ClickAction::MenuItem(item));
             }
             // A click anywhere outside the popover dismisses the menu; one inside it
             // that missed an entry (a border or gap) is ignored.
-            let inside_popover = menu_button_area(area, true)
+            let inside_popover = menu_button_area(area, sidebar_width)
                 .is_some_and(|button| contains(menu_popup_area(button), column, row));
             (!inside_popover).then_some(ClickAction::Cancel)
         }
@@ -900,7 +944,7 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             {
                 return Some(ClickAction::Management(binding.command));
             }
-            (line == MANAGEMENT_KEYBINDINGS.len() + 2)
+            (line == MANAGEMENT_KEYBINDINGS.len() + 1)
                 .then(|| hint_at(BACK_HINTS, inner.x, column))
                 .flatten()
         }
@@ -939,7 +983,7 @@ pub(crate) fn hover_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
     match click_action(app, area, column, row)? {
         ClickAction::Cancel if app.mode() == Mode::Menu => None,
         ClickAction::Management(ManagementCommand::ChooseAgent) => {
-            new_agent_button_area(area, app.sidebar_visible())
+            new_agent_button_area(area, layout_sidebar_width(app, area))
                 .filter(|button| contains(*button, column, row))
                 .map(|_| ClickAction::Management(ManagementCommand::ChooseAgent))
         }
@@ -1031,7 +1075,7 @@ fn menu_popup_area(button: Rect) -> Rect {
     Rect::new(
         button.x,
         button.y.saturating_sub(MENU_HEIGHT),
-        button.width,
+        button.width.max(SIDEBAR_WIDTH.saturating_sub(1)),
         MENU_HEIGHT,
     )
 }
@@ -1042,11 +1086,13 @@ fn trailing_shortcut(label: Span<'static>, shortcut: Span<'static>, width: u16) 
     Line::from(vec![label, Span::raw(" ".repeat(gap)), shortcut])
 }
 
-fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
-    let inner = Block::new()
-        .borders(Borders::TOP | Borders::RIGHT)
-        .inner(sidebar);
-    let popup_height = if app.mode() == Mode::Menu {
+fn sidebar_inner(sidebar: Rect) -> Rect {
+    Block::new().borders(Borders::RIGHT).inner(sidebar)
+}
+
+fn agent_list_area(app: &App, sidebar: Rect, sidebar_width: u16) -> Rect {
+    let inner = sidebar_inner(sidebar);
+    let popup_height = if app.mode() == Mode::Menu && !sidebar_collapsed(sidebar_width) {
         MENU_HEIGHT
     } else {
         0
@@ -1060,19 +1106,26 @@ fn agent_list_area(app: &App, sidebar: Rect) -> Rect {
     )
 }
 
-fn sidebar_row_start(app: &App, area: Rect) -> usize {
+fn sidebar_row_start(app: &App, area: Rect, card_height: usize) -> usize {
     let visible = usize::from(area.height.max(1));
-    let max = app.sidebar_content_height().saturating_sub(visible);
+    let max = app
+        .sidebar_content_height(card_height)
+        .saturating_sub(visible);
     app.sidebar_scroll()
         .unwrap_or_else(|| {
-            (app.selected_index() * usize::from(AGENT_CARD_HEIGHT))
-                .saturating_sub(visible.saturating_sub(usize::from(AGENT_CARD_HEIGHT)))
+            (app.selected_index() * card_height)
+                .saturating_sub(visible.saturating_sub(card_height.max(1)))
         })
         .min(max)
 }
 
 pub fn agent_list_page_size(app: &App, area: Rect) -> usize {
-    usize::from(agent_list_area(app, sidebar_area(area)).height).max(1)
+    let width = layout_sidebar_width(app, area);
+    usize::from(agent_list_area(app, sidebar_area(area, width), width).height).max(1)
+}
+
+pub fn sidebar_list_card_height(app: &App, area: Rect) -> usize {
+    usize::from(sidebar_card_height(layout_sidebar_width(app, area)))
 }
 
 fn render_sidebar(
@@ -1084,130 +1137,47 @@ fn render_sidebar(
     nerd_fonts: bool,
     hovered: Option<ClickAction>,
 ) {
-    let sidebar = sidebar_area(area);
-    let title = Span::styled(" svarm ", accent(theme).add_modifier(Modifier::BOLD));
+    let width = layout_sidebar_width(app, area);
+    let sidebar = sidebar_area(area, width);
+    let collapsed = sidebar_collapsed(width);
+    let card_height = usize::from(sidebar_card_height(width));
+    let resizing = hovered == Some(ClickAction::ResizeSidebar);
     let block = Block::new()
-        .title(title)
-        .borders(Borders::TOP | Borders::RIGHT)
-        .border_style(border(theme))
+        .borders(Borders::RIGHT)
+        .border_style(if resizing {
+            accent(theme)
+        } else {
+            border(theme)
+        })
         .style(Style::default().bg(Color::Reset));
     let inner = block.inner(sidebar);
     frame.render_widget(block, sidebar);
 
     let new_button =
-        new_agent_button_area(area, true).expect("visible sidebar has a new-agent button");
-    let button = menu_button_area(area, true).expect("visible sidebar has a menu button");
-    let agents_area = agent_list_area(app, sidebar);
+        new_agent_button_area(area, width).expect("visible sidebar has a new-agent button");
+    let button = menu_button_area(area, width).expect("visible sidebar has a menu button");
+    let agents_area = agent_list_area(app, sidebar, width);
 
     let mut rows = Vec::new();
     for (index, agent) in app.agents().iter().enumerate() {
         let selected = index == app.selected_index();
-        let marker = if selected { "▌" } else { " " };
         let status = agent.display_status();
         let (circle, status_style) = status_display(status, colors_enabled);
-        let content_width = usize::from(agents_area.width.saturating_sub(2));
-        let number = format!("{} · ", index + 1);
-        let title = end_truncate(
-            agent.conversation_title().unwrap_or("Unnamed conversation"),
-            usize::from(agents_area.width)
-                .saturating_sub(3 + number.chars().count())
-                .saturating_sub(usize::from(ARCHIVE_BUTTON_WIDTH)),
-        );
-        let selected_style = if selected {
-            text(theme).add_modifier(Modifier::BOLD)
+        let mut lines = if collapsed {
+            vec![collapsed_status_line(circle, status_style, selected, theme)]
         } else {
-            text(theme)
+            expanded_agent_card(
+                agent,
+                index,
+                selected,
+                circle,
+                status_style,
+                agents_area.width,
+                nerd_fonts,
+                hovered,
+                theme,
+            )
         };
-        // Where the agent is now, preferring the checkout root over a directory inside it, and
-        // falling back to where it was launched only while the live directory is unknown.
-        let directory = agent
-            .git()
-            .map(|git| git.worktree.as_path())
-            .or_else(|| agent.working_directory())
-            .unwrap_or_else(|| agent.launch_directory());
-        let directory = directory
-            .file_name()
-            .unwrap_or(directory.as_os_str())
-            .to_string_lossy();
-        let worktree_marker = if agent.git().is_some_and(|git| git.linked) {
-            worktree_icon(nerd_fonts)
-        } else {
-            ""
-        };
-        let archive_button_style = if hovered == Some(ClickAction::ArchiveCard(index)) {
-            theme.selected()
-        } else {
-            theme.muted()
-        };
-        let mut title_spans = vec![
-            Span::styled(marker, accent(theme)),
-            Span::styled(format!("{circle} "), status_style),
-            Span::styled(number, theme.muted()),
-            Span::styled(title, selected_style.add_modifier(Modifier::BOLD)),
-        ];
-        let used = u16::try_from(Line::from(title_spans.clone()).width()).unwrap_or(u16::MAX);
-        let pad = agents_area
-            .width
-            .saturating_sub(used)
-            .saturating_sub(ARCHIVE_BUTTON_WIDTH);
-        if pad > 0 {
-            title_spans.push(Span::raw(" ".repeat(usize::from(pad))));
-        }
-        title_spans.push(Span::styled(
-            format!(" {} ", archive_icon(nerd_fonts)),
-            archive_button_style,
-        ));
-        let mut lines = vec![
-            Line::from(title_spans),
-            Line::from(vec![
-                Span::styled(marker, accent(theme)),
-                Span::raw(" "),
-                Span::styled(agent.kind().label(), text(theme)),
-                Span::styled(" · ", theme.muted()),
-                Span::styled(worktree_marker, theme.muted()),
-                Span::styled(
-                    end_truncate(
-                        &directory,
-                        content_width
-                            .saturating_sub(agent.kind().label().chars().count() + 5)
-                            .saturating_sub(worktree_marker.chars().count()),
-                    ),
-                    text(theme),
-                ),
-            ]),
-        ];
-        if let Some(git) = agent.git() {
-            let tracking = git
-                .ahead
-                .zip(git.behind)
-                .filter(|(ahead, behind)| *ahead != 0 || *behind != 0)
-                .map_or_else(String::new, |(ahead, behind)| {
-                    format!(" ↑{ahead} ↓{behind}")
-                });
-            let (additions, deletions) = if git.additions == 0 && git.deletions == 0 {
-                (String::new(), String::new())
-            } else {
-                (
-                    format!(" +{}", git.additions),
-                    format!(" -{}", git.deletions),
-                )
-            };
-            let branch_width = content_width
-                .saturating_sub(2)
-                .saturating_sub(additions.chars().count())
-                .saturating_sub(deletions.chars().count())
-                .saturating_sub(tracking.chars().count());
-            lines.push(Line::from(vec![
-                Span::styled(marker, accent(theme)),
-                Span::raw(" "),
-                Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
-                Span::styled(additions, success(theme)),
-                Span::styled(deletions, Style::default().fg(theme.error)),
-                Span::styled(tracking, theme.muted()),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(marker, accent(theme))));
-        }
         if hovered == Some(ClickAction::SidebarItem(index)) {
             lines = lines
                 .into_iter()
@@ -1217,24 +1187,30 @@ fn render_sidebar(
         rows.append(&mut lines);
     }
     if !app.archived().is_empty() {
-        rows.push(Line::from(Span::styled(
-            " Archived",
-            theme.muted().add_modifier(Modifier::BOLD),
-        )));
+        if !collapsed {
+            rows.push(Line::from(Span::styled(
+                " Archived",
+                theme.muted().add_modifier(Modifier::BOLD),
+            )));
+        }
         rows.extend(
             app.archived()
                 .iter()
                 .enumerate()
                 .map(|(index, conversation)| {
-                    let number = format!("  {} · ", app.agents().len() + index + 1);
-                    let title = end_truncate(
-                        &conversation.title,
-                        usize::from(agents_area.width).saturating_sub(number.chars().count()),
-                    );
-                    let line = Line::from(vec![
-                        Span::styled(number, theme.muted()),
-                        Span::styled(title, text(theme)),
-                    ]);
+                    let line = if collapsed {
+                        collapsed_status_line("○", theme.muted(), false, theme)
+                    } else {
+                        let number = format!("  {} · ", app.agents().len() + index + 1);
+                        let title = end_truncate(
+                            &conversation.title,
+                            usize::from(agents_area.width).saturating_sub(number.chars().count()),
+                        );
+                        Line::from(vec![
+                            Span::styled(number, theme.muted()),
+                            Span::styled(title, text(theme)),
+                        ])
+                    };
                     if hovered == Some(ClickAction::SidebarItem(app.agents().len() + index)) {
                         fill_card_line(line, agents_area.width, theme.hover_fill())
                     } else {
@@ -1243,13 +1219,19 @@ fn render_sidebar(
                 }),
         );
     }
-    let scroll = u16::try_from(sidebar_row_start(app, agents_area)).unwrap_or(u16::MAX);
+    let scroll =
+        u16::try_from(sidebar_row_start(app, agents_area, card_height)).unwrap_or(u16::MAX);
     frame.render_widget(Paragraph::new(rows).scroll((scroll, 0)), agents_area);
 
     if let Some(notice) = app.notice() {
         let y = agents_area.bottom();
+        let message = if collapsed {
+            " !".to_string()
+        } else {
+            format!(" ! {notice}")
+        };
         frame.render_widget(
-            Paragraph::new(format!(" ! {notice}")).style(warning(theme)),
+            Paragraph::new(message).style(warning(theme)),
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
@@ -1261,13 +1243,14 @@ fn render_sidebar(
         text(theme),
     );
     frame.render_widget(
-        Paragraph::new(trailing_shortcut(
-            Span::styled(
-                " + New agent",
-                new_button_style.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("^B n", new_button_style),
+        Paragraph::new(sidebar_button_label(
+            " +",
+            " + New agent",
+            "^B n",
+            new_button_style.add_modifier(Modifier::BOLD),
+            new_button_style,
             new_button.width,
+            collapsed,
         ))
         .style(new_button_style),
         new_button,
@@ -1279,14 +1262,169 @@ fn render_sidebar(
 
     let button_style = hover_style(theme, hovered == Some(ClickAction::ToggleMenu), text(theme));
     frame.render_widget(
-        Paragraph::new(trailing_shortcut(
-            Span::styled(" ≡ Menu", button_style.add_modifier(Modifier::BOLD)),
-            Span::styled("^B m", button_style),
+        Paragraph::new(sidebar_button_label(
+            " ≡",
+            " ≡ Menu",
+            "^B m",
+            button_style.add_modifier(Modifier::BOLD),
+            button_style,
             button.width,
+            collapsed,
         ))
         .style(button_style),
         button,
     );
+}
+
+fn collapsed_status_line(
+    circle: &'static str,
+    status_style: Style,
+    selected: bool,
+    theme: Theme,
+) -> Line<'static> {
+    let marker = if selected { "▌" } else { " " };
+    Line::from(vec![
+        Span::styled(marker, accent(theme)),
+        Span::styled(circle, status_style),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expanded_agent_card(
+    agent: &AgentState,
+    index: usize,
+    selected: bool,
+    circle: &'static str,
+    status_style: Style,
+    width: u16,
+    nerd_fonts: bool,
+    hovered: Option<ClickAction>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let marker = if selected { "▌" } else { " " };
+    let content_width = usize::from(width.saturating_sub(2));
+    let number = format!("{} · ", index + 1);
+    let title = end_truncate(
+        agent.conversation_title().unwrap_or("Unnamed conversation"),
+        usize::from(width)
+            .saturating_sub(3 + number.chars().count())
+            .saturating_sub(usize::from(ARCHIVE_BUTTON_WIDTH)),
+    );
+    let selected_style = if selected {
+        text(theme).add_modifier(Modifier::BOLD)
+    } else {
+        text(theme)
+    };
+    // Where the agent is now, preferring the checkout root over a directory inside it, and
+    // falling back to where it was launched only while the live directory is unknown.
+    let directory = agent
+        .git()
+        .map(|git| git.worktree.as_path())
+        .or_else(|| agent.working_directory())
+        .unwrap_or_else(|| agent.launch_directory());
+    let directory = directory
+        .file_name()
+        .unwrap_or(directory.as_os_str())
+        .to_string_lossy();
+    let worktree_marker = if agent.git().is_some_and(|git| git.linked) {
+        worktree_icon(nerd_fonts)
+    } else {
+        ""
+    };
+    let archive_button_style = if hovered == Some(ClickAction::ArchiveCard(index)) {
+        theme.selected()
+    } else {
+        theme.muted()
+    };
+    let mut title_spans = vec![
+        Span::styled(marker, accent(theme)),
+        Span::styled(format!("{circle} "), status_style),
+        Span::styled(number, theme.muted()),
+        Span::styled(title, selected_style.add_modifier(Modifier::BOLD)),
+    ];
+    let used = u16::try_from(Line::from(title_spans.clone()).width()).unwrap_or(u16::MAX);
+    let pad = width
+        .saturating_sub(used)
+        .saturating_sub(ARCHIVE_BUTTON_WIDTH);
+    if pad > 0 {
+        title_spans.push(Span::raw(" ".repeat(usize::from(pad))));
+    }
+    title_spans.push(Span::styled(
+        format!(" {} ", archive_icon(nerd_fonts)),
+        archive_button_style,
+    ));
+    let mut lines = vec![
+        Line::from(title_spans),
+        Line::from(vec![
+            Span::styled(marker, accent(theme)),
+            Span::raw(" "),
+            Span::styled(agent.kind().label(), text(theme)),
+            Span::styled(" · ", theme.muted()),
+            Span::styled(worktree_marker, theme.muted()),
+            Span::styled(
+                end_truncate(
+                    &directory,
+                    content_width
+                        .saturating_sub(agent.kind().label().chars().count() + 5)
+                        .saturating_sub(worktree_marker.chars().count()),
+                ),
+                text(theme),
+            ),
+        ]),
+    ];
+    if let Some(git) = agent.git() {
+        let tracking = git
+            .ahead
+            .zip(git.behind)
+            .filter(|(ahead, behind)| *ahead != 0 || *behind != 0)
+            .map_or_else(String::new, |(ahead, behind)| {
+                format!(" ↑{ahead} ↓{behind}")
+            });
+        let (additions, deletions) = if git.additions == 0 && git.deletions == 0 {
+            (String::new(), String::new())
+        } else {
+            (
+                format!(" +{}", git.additions),
+                format!(" -{}", git.deletions),
+            )
+        };
+        let branch_width = content_width
+            .saturating_sub(2)
+            .saturating_sub(additions.chars().count())
+            .saturating_sub(deletions.chars().count())
+            .saturating_sub(tracking.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(marker, accent(theme)),
+            Span::raw(" "),
+            Span::styled(end_truncate(&git.branch, branch_width), text(theme)),
+            Span::styled(additions, success(theme)),
+            Span::styled(deletions, Style::default().fg(theme.error)),
+            Span::styled(tracking, theme.muted()),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(marker, accent(theme))));
+    }
+    lines
+}
+
+fn sidebar_button_label(
+    compact: &'static str,
+    label: &'static str,
+    shortcut: &'static str,
+    label_style: Style,
+    shortcut_style: Style,
+    width: u16,
+    collapsed: bool,
+) -> Line<'static> {
+    if collapsed {
+        Line::from(Span::styled(compact, label_style))
+    } else {
+        trailing_shortcut(
+            Span::styled(label, label_style),
+            Span::styled(shortcut, shortcut_style),
+            width,
+        )
+    }
 }
 
 fn end_truncate(value: &str, width: usize) -> String {
@@ -1824,7 +1962,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAct
             ),
         ))
     }));
-    lines.extend([Line::from(""), hint_line(BACK_HINTS, theme, hovered)]);
+    lines.push(hint_line(BACK_HINTS, theme, hovered));
     render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
 }
 
@@ -2046,28 +2184,119 @@ mod tests {
     #[test]
     fn terminal_area_only_reserves_the_sidebar() {
         assert_eq!(
-            terminal_area(Rect::new(0, 0, 120, 40), true),
+            terminal_area(Rect::new(0, 0, 120, 40), SIDEBAR_WIDTH),
             Rect::new(SIDEBAR_WIDTH, 0, 120 - SIDEBAR_WIDTH, 40)
         );
         assert_eq!(
-            terminal_area(Rect::new(0, 0, 120, 40), false),
+            terminal_area(Rect::new(0, 0, 120, 40), 0),
             Rect::new(0, 0, 120, 40)
+        );
+        assert_eq!(clamp_sidebar_width(1, 80), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(99, 80), 39);
+        assert_eq!(clamp_sidebar_width(28, 200), 28);
+    }
+
+    #[test]
+    fn sidebar_has_no_top_bar_and_collapses_to_status_circles() {
+        let agent = AgentSnapshot {
+            id: svarm_agent::AgentId::new(1),
+            kind: svarm_agent::AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/plain-directory"),
+            working_directory: None,
+            status: SessionStatus::Running,
+            exit: None,
+            output_generation: 1,
+            seen_generation: 1,
+            completed_generation: 0,
+            terminal_sequence: TerminalSequence(0),
+            read_error: None,
+            conversation_title: Some("Live thread".into()),
+            conversation_id: None,
+            activity: AgentActivity::Idle,
+            recognition: None,
+            git: None,
+        };
+        let mut app = App::hydrate(
+            SvarmSessionSnapshot {
+                summary: SessionSummary {
+                    id: SessionId(21),
+                    running_agents: 1,
+                    total_agents: 1,
+                    attachment: None,
+                    last_user_activity_ms: 1,
+                    revision: SessionRevision(1),
+                },
+                selected_agent_id: Some(agent.id),
+                rows: 24,
+                cols: 80,
+                agents: vec![agent],
+                archived: vec![ArchivedConversation {
+                    conversation_id: "archived-id".into(),
+                    title: "Hidden archive title".into(),
+                    kind: svarm_agent::AgentKind::Claude,
+                    launch_directory: "/tmp/hidden-archive-directory".into(),
+                }],
+            },
+            crate::theme::ThemeName::Monochrome,
+            None,
+        );
+
+        let expanded = render_app_text(&app);
+        assert!(expanded.contains("Live thread"));
+        assert!(expanded.contains("Hidden archive title"));
+        assert!(expanded.contains("Archived"));
+        assert!(!expanded.contains(" svarm "));
+        let top_left = expanded
+            .chars()
+            .take(SIDEBAR_WIDTH as usize)
+            .collect::<String>();
+        assert!(
+            !top_left.contains('─'),
+            "sidebar should not draw a top bar: {top_left:?}"
+        );
+
+        app.set_sidebar_width(SIDEBAR_MIN_WIDTH);
+        let collapsed = render_app_text(&app);
+        assert!(collapsed.contains('●'));
+        assert!(!collapsed.contains("Live thread"));
+        assert!(!collapsed.contains("Hidden archive title"));
+        assert!(!collapsed.contains("Archived"));
+        assert!(!collapsed.contains("New agent"));
+        assert!(!collapsed.contains("Menu"));
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 1, 0), Some(0));
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 1, 1), Some(1));
+        assert_eq!(
+            click_action(&app, Rect::new(0, 0, 80, 24), 0, 0),
+            Some(ClickAction::SidebarItem(0))
+        );
+        assert_eq!(
+            click_action(&app, Rect::new(0, 0, 80, 24), SIDEBAR_MIN_WIDTH - 1, 0),
+            Some(ClickAction::ResizeSidebar)
         );
     }
 
     #[test]
     fn menu_hit_areas_stay_at_the_bottom_of_the_sidebar() {
         let area = Rect::new(0, 0, 120, 40);
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
         assert_eq!(
-            new_agent_button_area(area, true),
+            new_agent_button_area(area, SIDEBAR_WIDTH),
             Some(Rect::new(0, 38, 27, 1))
         );
-        assert_eq!(menu_button_area(area, true), Some(Rect::new(0, 39, 27, 1)));
-        let popup = menu_popup_area(menu_button_area(area, true).unwrap());
+        assert_eq!(
+            menu_button_area(area, SIDEBAR_WIDTH),
+            Some(Rect::new(0, 39, 27, 1))
+        );
+        let popup = menu_popup_area(menu_button_area(area, SIDEBAR_WIDTH).unwrap());
         assert_eq!(popup, Rect::new(0, 33, 27, 6));
-        assert_eq!(menu_item_at(area, 2, 36), Some(MenuItem::Keybinds));
-        assert_eq!(menu_item_at(area, 2, 37), Some(MenuItem::Settings));
-        assert_eq!(menu_item_at(area, 50, 36), None);
+        assert_eq!(menu_item_at(&app, area, 2, 36), Some(MenuItem::Keybinds));
+        assert_eq!(menu_item_at(&app, area, 2, 37), Some(MenuItem::Settings));
+        assert_eq!(menu_item_at(&app, area, 50, 36), None);
     }
 
     #[test]
@@ -2106,8 +2335,8 @@ mod tests {
                 .map(|x| buffer[(x, button.y)].symbol())
                 .collect::<String>()
         };
-        let new_button = row(new_agent_button_area(area, true).unwrap());
-        let menu_button = row(menu_button_area(area, true).unwrap());
+        let new_button = row(new_agent_button_area(area, SIDEBAR_WIDTH).unwrap());
+        let menu_button = row(menu_button_area(area, SIDEBAR_WIDTH).unwrap());
         assert!(new_button.starts_with(" + New agent"));
         assert!(new_button.ends_with("^B n"));
         assert!(menu_button.starts_with(" ≡ Menu"));
@@ -2295,18 +2524,23 @@ mod tests {
             None,
         );
 
-        let new_button = new_agent_button_area(area, true).unwrap();
+        let new_button = new_agent_button_area(area, SIDEBAR_WIDTH).unwrap();
         assert_eq!(
             click_action(&app, area, new_button.x, new_button.y),
             Some(ClickAction::Management(ManagementCommand::ChooseAgent))
         );
-        let menu_button = menu_button_area(area, true).unwrap();
+        let menu_button = menu_button_area(area, SIDEBAR_WIDTH).unwrap();
         assert_eq!(
             click_action(&app, area, menu_button.x, menu_button.y),
             Some(ClickAction::ToggleMenu)
         );
+        let handle = resize_handle_area(&app, area).unwrap();
+        assert_eq!(
+            click_action(&app, area, handle.x, handle.y + 4),
+            Some(ClickAction::ResizeSidebar)
+        );
         app.toggle_sidebar();
-        let collapsed_menu = menu_button_area(area, false).unwrap();
+        let collapsed_menu = menu_button_area(area, 0).unwrap();
         assert_eq!(
             click_action(&app, area, collapsed_menu.x, collapsed_menu.y),
             Some(ClickAction::Management(ManagementCommand::OpenMenu))
@@ -2462,7 +2696,7 @@ mod tests {
             &app,
             area,
             standard.x,
-            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16 + 2,
+            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16 + 1,
             BACK_HINTS,
         );
 
@@ -2503,8 +2737,8 @@ mod tests {
             None,
         );
 
-        let new_button = new_agent_button_area(area, true).unwrap();
-        let menu_button = menu_button_area(area, true).unwrap();
+        let new_button = new_agent_button_area(area, SIDEBAR_WIDTH).unwrap();
+        let menu_button = menu_button_area(area, SIDEBAR_WIDTH).unwrap();
         assert_eq!(
             hover_action(&app, area, new_button.x, new_button.y),
             Some(ClickAction::Management(ManagementCommand::ChooseAgent))
@@ -2552,8 +2786,8 @@ mod tests {
             false,
             None,
         );
-        let menu = menu_button_area(area, true).unwrap();
-        let new_button = new_agent_button_area(area, true).unwrap();
+        let menu = menu_button_area(area, SIDEBAR_WIDTH).unwrap();
+        let new_button = new_agent_button_area(area, SIDEBAR_WIDTH).unwrap();
 
         let hovered = draw_app(&app, Some((menu.x + 1, menu.y)));
         assert!(
@@ -2668,17 +2902,17 @@ mod tests {
         );
 
         assert_eq!(
-            hover_action(&app, area, 2, 1),
+            hover_action(&app, area, 2, 0),
             Some(ClickAction::SidebarItem(0))
         );
         assert_eq!(
-            hover_action(&app, area, 2, 5),
+            hover_action(&app, area, 2, 4),
             Some(ClickAction::SidebarItem(1))
         );
 
-        let edge = sidebar_area(area).width.saturating_sub(2);
-        let hovered_card = draw_app(&app, Some((2, 1)));
-        for row in 1..4 {
+        let edge = sidebar_area(area, SIDEBAR_WIDTH).width.saturating_sub(2);
+        let hovered_card = draw_app(&app, Some((2, 0)));
+        for row in 0..3 {
             assert!(
                 hovered_card.backend().buffer()[(edge, row)]
                     .modifier
@@ -2687,20 +2921,20 @@ mod tests {
             );
         }
         assert!(
-            !hovered_card.backend().buffer()[(edge, 5)]
+            !hovered_card.backend().buffer()[(edge, 4)]
                 .modifier
                 .contains(Modifier::REVERSED),
             "archived row should stay unfilled while another card is hovered"
         );
 
-        let hovered_archived = draw_app(&app, Some((2, 5)));
+        let hovered_archived = draw_app(&app, Some((2, 4)));
         assert!(
-            hovered_archived.backend().buffer()[(edge, 5)]
+            hovered_archived.backend().buffer()[(edge, 4)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
         assert!(
-            !hovered_archived.backend().buffer()[(edge, 4)]
+            !hovered_archived.backend().buffer()[(edge, 3)]
                 .modifier
                 .contains(Modifier::REVERSED),
             "the Archived header is not a card"
@@ -2748,7 +2982,7 @@ mod tests {
             None,
         );
 
-        let agents_area = agent_list_area(&app, sidebar_area(area));
+        let agents_area = agent_list_area(&app, sidebar_area(area, SIDEBAR_WIDTH), SIDEBAR_WIDTH);
         let button_column = agents_area.right() - 1;
 
         assert_eq!(
@@ -3203,8 +3437,8 @@ mod tests {
         assert!(rendered.contains("2 · Archived title"));
         assert!(!rendered.contains("Claude Code"));
         assert!(!rendered.contains("hidden-archive-directory"));
-        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 4), None);
-        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 5), Some(1));
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 3), None);
+        assert_eq!(agent_item_at(&app, Rect::new(0, 0, 80, 24), 2, 4), Some(1));
     }
 
     #[test]
@@ -3295,11 +3529,11 @@ mod tests {
         assert_eq!(agent_item_at(&app, area, 2, 22), None);
         assert_eq!(agent_item_at(&app, area, 40, 19), None);
 
-        app.scroll_sidebar(-1, agent_list_page_size(&app, area));
+        app.scroll_sidebar(-1, agent_list_page_size(&app, area), 3);
         assert_eq!(agent_item_at(&app, area, 2, 1), Some(0));
         let rendered = render_app_text(&app);
         assert!(rendered.contains("1 · Conversation 1"));
-        assert!(!rendered.contains("8 · Conversation 8"));
+        assert_eq!(agent_item_at(&app, area, 2, 0), Some(0));
     }
 
     #[test]

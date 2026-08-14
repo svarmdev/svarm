@@ -52,6 +52,7 @@ struct InteractionState {
     selection: Option<TerminalSelection>,
     selection_scroll_at: Option<Instant>,
     toast: Option<Toast>,
+    resizing_sidebar: bool,
 }
 
 impl InteractionState {
@@ -123,7 +124,10 @@ pub fn run(
     let settings = SettingsStore::discover();
     let (mut settings_value, settings_notice) = settings.load();
     let (width, height) = crossterm::terminal::size()?;
-    let child_area = ui::terminal_area(Rect::new(0, 0, width, height), true);
+    let child_area = ui::terminal_area(
+        Rect::new(0, 0, width, height),
+        ui::clamp_sidebar_width(settings_value.sidebar_width, width),
+    );
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
     let embedded_pending = std::sync::Arc::new(AtomicBool::new(false));
     let worktrees = WorktreeCreator::new(events_tx.clone());
@@ -156,6 +160,7 @@ pub fn run(
         events_tx.clone(),
     )?;
     let mut app = App::hydrate(snapshot, settings_value.theme, settings_notice);
+    app.set_sidebar_width(settings_value.sidebar_width);
     app.set_available_harnesses(available_harnesses);
     let explicit_kind = initial_agent.kind;
     let explicit_workspace = initial_agent.workspace;
@@ -546,13 +551,7 @@ fn handle_key(
             }
         }
         Mode::Prefix => {
-            return handle_management_command(
-                app,
-                agents,
-                resources.settings,
-                resources.host_area,
-                management_command(key),
-            );
+            return handle_management_command(app, agents, resources, management_command(key));
         }
         Mode::NewAgent(NewAgentPage::EmbeddedBrowser) if is_management_prefix(key) => {
             app.set_mode(Mode::ToolPrefix);
@@ -647,10 +646,10 @@ fn handle_key(
 fn handle_management_command(
     app: &mut App,
     agents: &mut RemoteAgents,
-    settings: &Settings,
-    area: Rect,
+    resources: &mut InteractionResources<'_>,
     command: ManagementCommand,
 ) -> Result<(bool, bool)> {
+    let area = resources.host_area;
     let mut resize = false;
     match command {
         ManagementCommand::LiteralPrefix => {
@@ -672,8 +671,10 @@ fn handle_management_command(
         }
         ManagementCommand::ScrollTerminalUp | ManagementCommand::ScrollTerminalDown => {
             if let Some(id) = app.selected_agent_id() {
-                let page = isize::try_from(ui::terminal_area(area, app.sidebar_visible()).height)
-                    .unwrap_or(isize::MAX);
+                let page = isize::try_from(
+                    ui::terminal_area(area, ui::layout_sidebar_width(app, area)).height,
+                )
+                .unwrap_or(isize::MAX);
                 let rows = if command == ManagementCommand::ScrollTerminalUp {
                     page
                 } else {
@@ -685,10 +686,10 @@ fn handle_management_command(
         }
         ManagementCommand::ChooseAgent => {
             app.open_new_agent_with_checkout(
-                remembered_workspace(settings),
-                settings.last_agent,
-                settings.last_checkout,
-                workspace_choices(settings, None),
+                remembered_workspace(resources.settings),
+                resources.settings.last_agent,
+                resources.settings.last_checkout,
+                workspace_choices(resources.settings, None),
             );
             remember_new_agent_repository(app);
         }
@@ -711,6 +712,24 @@ fn handle_management_command(
             app.toggle_sidebar();
             app.set_mode(Mode::Terminal);
             resize = true;
+        }
+        ManagementCommand::NarrowSidebar | ManagementCommand::WidenSidebar => {
+            if !app.sidebar_visible() {
+                app.show_sidebar();
+            }
+            let current = ui::layout_sidebar_width(app, area);
+            let delta: i16 = if command == ManagementCommand::NarrowSidebar {
+                -1
+            } else {
+                1
+            };
+            let next = ui::clamp_sidebar_width(current.saturating_add_signed(delta), area.width);
+            if next != current {
+                app.set_sidebar_width(next);
+                save_sidebar_width(app, resources.settings_store, resources.settings);
+                resize = true;
+            }
+            app.set_mode(Mode::Terminal);
         }
         ManagementCommand::OpenMenu => {
             if !app.sidebar_visible() {
@@ -743,7 +762,11 @@ fn handle_mouse(
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<(bool, bool)> {
-    let child_area = ui::terminal_area(area, app.sidebar_visible());
+    if let Some(result) = handle_sidebar_resize(app, resources, interaction, mouse, area) {
+        return Ok(result);
+    }
+
+    let child_area = ui::terminal_area(area, ui::layout_sidebar_width(app, area));
     if let Some(agent_id) = interaction
         .selection
         .as_ref()
@@ -874,13 +897,14 @@ fn apply_click_action(
     app: &mut App,
     agents: &mut RemoteAgents,
     resources: &mut InteractionResources<'_>,
-    area: Rect,
+    _area: Rect,
     action: ui::ClickAction,
 ) -> Result<(bool, bool)> {
     match action {
         ui::ClickAction::Management(command) => {
-            handle_management_command(app, agents, resources.settings, area, command)
+            handle_management_command(app, agents, resources, command)
         }
+        ui::ClickAction::ResizeSidebar => Ok((false, true)),
         ui::ClickAction::ToggleMenu => {
             app.set_mode(if app.mode() == Mode::Menu {
                 Mode::Terminal
@@ -1571,8 +1595,16 @@ fn save_theme(
     }
 }
 
+fn save_sidebar_width(app: &mut App, settings_store: &SettingsStore, settings: &mut Settings) {
+    settings.sidebar_width = app.sidebar_width();
+    match settings_store.save(settings) {
+        Ok(()) => app.clear_notice(),
+        Err(error) => app.set_notice(error),
+    }
+}
+
 fn resize_agents(agents: &mut RemoteAgents, app: &App, area: Rect) -> Result<()> {
-    let child = ui::terminal_area(area, app.sidebar_visible());
+    let child = ui::terminal_area(area, ui::layout_sidebar_width(app, area));
     agents.resize(child.height.max(1), child.width.max(1))
 }
 
@@ -1603,11 +1635,59 @@ fn handle_sidebar_wheel(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     let Some(steps) = wheel_steps(mouse.kind) else {
         return false;
     };
-    if !app.sidebar_visible() || !contains(ui::sidebar_area(area), mouse.column, mouse.row) {
+    let width = ui::layout_sidebar_width(app, area);
+    if width == 0 || !contains(ui::sidebar_area(area, width), mouse.column, mouse.row) {
         return false;
     }
-    app.scroll_sidebar(steps, ui::agent_list_page_size(app, area));
+    app.scroll_sidebar(
+        steps,
+        ui::agent_list_page_size(app, area),
+        ui::sidebar_list_card_height(app, area),
+    );
     true
+}
+
+fn handle_sidebar_resize(
+    app: &mut App,
+    resources: &mut InteractionResources<'_>,
+    interaction: &mut InteractionState,
+    mouse: MouseEvent,
+    area: Rect,
+) -> Option<(bool, bool)> {
+    if interaction.resizing_sidebar {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                apply_sidebar_drag(app, area, mouse.column);
+                return Some((true, true));
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                apply_sidebar_drag(app, area, mouse.column);
+                interaction.resizing_sidebar = false;
+                save_sidebar_width(app, resources.settings_store, resources.settings);
+                return Some((true, true));
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        app.mode(),
+        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
+    ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && ui::resize_handle_area(app, area)
+            .is_some_and(|handle| contains(handle, mouse.column, mouse.row))
+    {
+        interaction.resizing_sidebar = true;
+        return Some((false, true));
+    }
+    None
+}
+
+fn apply_sidebar_drag(app: &mut App, area: Rect, column: u16) {
+    if !app.sidebar_visible() {
+        app.show_sidebar();
+    }
+    let requested = column.saturating_add(1).saturating_sub(area.x);
+    app.set_sidebar_width(ui::clamp_sidebar_width(requested, area.width));
 }
 
 fn connection_failure_message(reason: &str, session_id: u64) -> String {
@@ -1718,7 +1798,25 @@ mod tests {
             },
             area,
         ));
-        assert_eq!(app.sidebar_scroll(), Some(3));
+        assert_eq!(app.sidebar_scroll(), Some(2));
+    }
+
+    #[test]
+    fn dragging_the_sidebar_edge_clamps_to_the_icon_rail_and_half_the_terminal() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        let area = Rect::new(0, 0, 80, 24);
+        apply_sidebar_drag(&mut app, area, 0);
+        assert_eq!(app.sidebar_width(), crate::app::SIDEBAR_MIN_WIDTH);
+        assert!(ui::sidebar_collapsed(app.sidebar_width()));
+        apply_sidebar_drag(&mut app, area, 60);
+        assert_eq!(app.sidebar_width(), 39);
+        apply_sidebar_drag(&mut app, area, 15);
+        assert_eq!(app.sidebar_width(), 16);
     }
 
     #[test]
