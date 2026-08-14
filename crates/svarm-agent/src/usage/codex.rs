@@ -318,7 +318,6 @@ fn read_window(window: &RateLimitWindow) -> Option<UsageWindow> {
     let used = window.used_percent?;
     let mut usage = UsageWindow::from_percent(window_label(window.window_duration_mins), used);
     usage.resets_at_ms = window.resets_at.as_ref().and_then(Timestamp::to_unix_ms);
-    usage.detail = window.window_duration_mins.map(window_detail);
     Some(usage)
 }
 
@@ -336,16 +335,6 @@ fn window_label(minutes: Option<i64>) -> String {
         Some(minutes) if minutes > 0 && minutes % 60 == 0 => format!("{}-hour", minutes / 60),
         Some(minutes) if minutes > 0 => format!("{minutes}-minute"),
         _ => "Limit".to_owned(),
-    }
-}
-
-fn window_detail(minutes: i64) -> String {
-    match minutes {
-        m if m > 0 && m % 10_080 == 0 => format!("{}d window", m / 1_440),
-        m if m > 0 && m % 1_440 == 0 => format!("{}d window", m / 1_440),
-        m if m > 0 && m % 60 == 0 => format!("{}h window", m / 60),
-        m if m > 0 => format!("{m}m window"),
-        _ => String::new(),
     }
 }
 
@@ -467,7 +456,7 @@ mod tests {
         assert_eq!(window.used_tenths, 80);
         assert_eq!(window.whole_percent(), 8);
         assert_eq!(window.resets_at_ms, Some(1_787_201_323_000));
-        assert_eq!(window.detail.as_deref(), Some("7d window"));
+        assert_eq!(window.detail, None);
         assert_eq!(evidence.notes, ["Credits: 402.32"]);
     }
 
@@ -483,7 +472,12 @@ mod tests {
         };
         let labels: Vec<_> = evidence.windows.iter().map(|w| w.label.as_str()).collect();
         assert_eq!(labels, ["5-hour", "Weekly"]);
-        assert_eq!(evidence.windows[0].detail.as_deref(), Some("5h window"));
+        assert!(
+            evidence
+                .windows
+                .iter()
+                .all(|window| window.detail.is_none())
+        );
     }
 
     #[test]
