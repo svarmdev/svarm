@@ -21,7 +21,7 @@ use crate::{
     history::ConversationHistory,
     input::{encode_key, encode_mouse, encode_paste},
     ipc::unix::UnixListenerGuard,
-    naming::TitleNamer,
+    naming::{self, TitleNamer},
     protocol::{
         AgentActivity, AgentSnapshot, ArchivedConversation, ConnectionId, ConnectionRole, Envelope,
         ErrorCode, Event, GitContext, KeyCode, KeyInput, LeaseToken, Message, ProtocolError,
@@ -363,6 +363,8 @@ struct InputDraft {
     generated: Option<String>,
     /// A generator is running for this conversation, so no second one is started.
     naming: bool,
+    /// The user submitted `/quit` or `/exit`. Archive the conversation if the process then exits.
+    quit_requested: bool,
 }
 
 impl InputDraft {
@@ -382,11 +384,8 @@ impl InputDraft {
         }
     }
 
-    /// Records a key and reports whether it submitted a message.
+    /// Records a key and reports whether it submitted a naming prompt.
     fn apply_key(&mut self, input: &KeyInput) -> bool {
-        if self.settled() {
-            return false;
-        }
         let control = input.modifiers.control;
         let alt = input.modifiers.alt;
         match &input.code {
@@ -418,11 +417,8 @@ impl InputDraft {
         false
     }
 
-    /// Records pasted text and reports whether it submitted a message.
+    /// Records pasted text and reports whether it submitted a naming prompt.
     fn apply_paste(&mut self, text: &str) -> bool {
-        if self.settled() {
-            return false;
-        }
         for character in text.chars() {
             self.insert(character);
         }
@@ -438,13 +434,21 @@ impl InputDraft {
     }
 
     fn submit(&mut self) -> bool {
-        let message = self.chars.iter().collect::<String>();
-        let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        let raw = self.chars.iter().collect::<String>();
         self.chars.clear();
         self.cursor = 0;
-        if message.is_empty() || message.starts_with('/') {
+        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if is_exit_command(&collapsed) {
+            self.quit_requested = true;
+        } else if !collapsed.is_empty() {
+            self.quit_requested = false;
+        }
+        if self.settled() {
             return false;
         }
+        let Some(message) = naming::naming_prompt(&raw) else {
+            return false;
+        };
         if self.title.is_none() {
             self.title = Some(message.clone());
         }
@@ -466,6 +470,11 @@ impl InputDraft {
     fn title(&self) -> Option<&str> {
         self.generated.as_deref().or(self.title.as_deref())
     }
+}
+
+fn is_exit_command(line: &str) -> bool {
+    let command = line.split_whitespace().next().unwrap_or("");
+    command.eq_ignore_ascii_case("/quit") || command.eq_ignore_ascii_case("/exit")
 }
 
 struct FrameBasis {
@@ -597,6 +606,21 @@ impl SessionRuntime {
         self.archived.insert(0, conversation.clone());
         self.state.metadata_changed();
         Ok(conversation)
+    }
+
+    /// Archive a conversation the user quit from, or drop the dead card when it cannot be resumed.
+    fn archive_after_quit(
+        &mut self,
+        id: AgentId,
+        now_ms: u64,
+    ) -> Result<ArchivedConversation, ProtocolError> {
+        match self.archive(id, now_ms) {
+            Ok(conversation) => Ok(conversation),
+            Err(error) => {
+                self.close(id, now_ms).map_err(internal_error)?;
+                Err(error)
+            }
+        }
     }
 
     fn resume_archived(
@@ -1196,15 +1220,34 @@ impl SessionRuntime {
         let dirty = self.agents.drain_dirty();
         let attached = self.state.attachment().is_some();
         let now = Instant::now();
+        let now_ms = self.state.last_user_activity_ms();
         let mut changed = self.apply_git_result(now);
         let mut switched = Vec::new();
         let mut switched_ids = BTreeSet::new();
         let mut terminals = Vec::new();
+        let mut quit_archived = Vec::new();
+        let mut quit_removed = Vec::new();
         for result in self.agents.poll() {
             let Ok(snapshot) = result else {
                 continue;
             };
             let previous = self.previous.get(&snapshot.id).cloned();
+            let just_exited = snapshot.status == SessionStatus::Exited
+                && previous
+                    .as_ref()
+                    .is_none_or(|old| old.session.status != SessionStatus::Exited);
+            if just_exited
+                && self
+                    .input_drafts
+                    .get(&snapshot.id)
+                    .is_some_and(|draft| draft.quit_requested)
+            {
+                match self.archive_after_quit(snapshot.id, now_ms) {
+                    Ok(conversation) => quit_archived.push((snapshot.id, conversation)),
+                    Err(_) => quit_removed.push(snapshot.id),
+                }
+                continue;
+            }
             let id_changed = previous.as_ref().is_some_and(|old| {
                 old.session.conversation_id.is_some()
                     && snapshot.conversation_id.is_some()
@@ -1290,6 +1333,18 @@ impl SessionRuntime {
                 agent: Box::new(self.agent_snapshot(snapshot)),
             })
             .collect::<Vec<_>>();
+        events.extend(quit_archived.into_iter().map(|(agent_id, conversation)| {
+            Event::AgentArchived {
+                revision,
+                agent_id,
+                conversation,
+            }
+        }));
+        events.extend(
+            quit_removed
+                .into_iter()
+                .map(|agent_id| Event::AgentRemoved { revision, agent_id }),
+        );
         events.extend(
             switched
                 .into_iter()
@@ -2773,6 +2828,46 @@ mod tests {
     }
 
     #[test]
+    fn model_and_effort_commands_wait_for_the_next_real_prompt() {
+        let mut draft = InputDraft::default();
+        assert!(!draft.apply_paste("/model opus\n"));
+        assert!(!draft.apply_paste("/effort high\n"));
+        assert_eq!(draft.title(), None);
+        assert!(draft.prompts.is_empty());
+
+        assert!(draft.apply_paste("implement the sidebar\n"));
+        assert_eq!(draft.title(), Some("implement the sidebar"));
+        assert_eq!(draft.prompts, vec!["implement the sidebar"]);
+    }
+
+    #[test]
+    fn a_goal_command_names_the_thread_from_the_first_submission() {
+        let mut draft = InputDraft::default();
+        assert!(draft.apply_paste("/goal implement the sidebar\n"));
+        assert_eq!(draft.title(), Some("/goal implement the sidebar"));
+        assert_eq!(draft.prompts, vec!["/goal implement the sidebar"]);
+    }
+
+    #[test]
+    fn quit_and_exit_commands_are_remembered_after_the_thread_is_named() {
+        let mut draft = InputDraft::named("Sidebar work".into());
+        assert!(!draft.apply_paste("/quit\n"));
+        assert!(draft.quit_requested);
+        assert!(!draft.apply_paste("keep going\n"));
+        assert!(!draft.quit_requested);
+        assert_eq!(draft.title(), Some("Sidebar work"));
+
+        let mut draft = InputDraft::default();
+        assert!(draft.apply_paste("implement the sidebar\n"));
+        assert!(!draft.apply_paste("/exit\n"));
+        assert!(draft.quit_requested);
+        assert_eq!(draft.title(), Some("implement the sidebar"));
+
+        assert!(draft.apply_paste("keep going\n"));
+        assert!(!draft.quit_requested);
+    }
+
+    #[test]
     fn submissions_are_collected_until_a_name_is_generated() {
         let mut draft = InputDraft::default();
         assert!(draft.apply_paste("first task\n"));
@@ -2932,6 +3027,49 @@ mod tests {
     }
 
     #[test]
+    fn grok_title_chrome_does_not_complete_a_working_turn() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let mut session = SessionSnapshot {
+            id: AgentId(1),
+            kind: AgentKind::Grok,
+            launch_directory: cwd,
+            status: SessionStatus::Running,
+            output_generation: 1,
+            read_error: None,
+            exit: None,
+            conversation_id: None,
+        };
+
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process(
+            "\x1b]2;Thinking - Refactor sidebar - grok\x07\x1b[20;1HWaiting for response"
+                .as_bytes(),
+        );
+        let working = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let observed = runtime.observe_with_terminal(session.clone(), Some(&working));
+        assert_eq!(observed.activity, AgentActivity::Working);
+        assert_eq!(observed.completed_generation, 0);
+        runtime.previous.insert(session.id, observed);
+
+        session.output_generation = 2;
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process("\x1b]2;Refactor sidebar - grok\x07\x1b[20;1HType a message...".as_bytes());
+        let flickered = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let observed = runtime.observe_with_terminal(session, Some(&flickered));
+        assert_eq!(observed.activity, AgentActivity::Unknown);
+        assert_eq!(
+            observed.completed_generation, 0,
+            "default grok title chrome must not stamp a Working → Idle completion"
+        );
+        assert_eq!(
+            observed.last_affirmative_activity,
+            Some(AgentActivity::Working)
+        );
+    }
+
+    #[test]
     fn runtime_archives_and_resumes_only_compact_conversation_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
@@ -3061,6 +3199,128 @@ mod tests {
             vec![expected]
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn quitting_a_named_agent_archives_the_conversation() {
+        let cwd = std::env::current_dir().unwrap();
+        let conversation_id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let script = format!("printf '\\033]2;Ready | {conversation_id}\\a'; sleep 0.25");
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &script]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_id.as_deref() != Some(conversation_id)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        assert_eq!(
+            runtime.snapshot().agents[0].conversation_id.as_deref(),
+            Some(conversation_id)
+        );
+        runtime.record_paste(snapshot.id, "implement the sidebar\n");
+        runtime.poll_events();
+        runtime.record_paste(snapshot.id, "/quit\n");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let archived = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches!(event, Event::AgentArchived { .. }))
+            {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "quit did not archive the agent");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(matches!(
+            archived,
+            Event::AgentArchived {
+                conversation: ArchivedConversation {
+                    conversation_id: id,
+                    title,
+                    ..
+                },
+                ..
+            } if id == conversation_id && title == "implement the sidebar"
+        ));
+        assert!(runtime.snapshot().agents.is_empty());
+        assert_eq!(runtime.snapshot().archived.len(), 1);
+        assert_eq!(
+            runtime.snapshot().archived[0].conversation_id,
+            conversation_id
+        );
+    }
+
+    #[test]
+    fn an_agent_that_exits_without_quit_stays_on_the_active_list() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 0.05"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+        runtime.record_paste(snapshot.id, "implement the sidebar\n");
+        runtime.poll_events();
+        runtime
+            .previous
+            .get_mut(&snapshot.id)
+            .unwrap()
+            .session
+            .conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e49".into());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].status != SessionStatus::Exited
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+
+        assert_eq!(runtime.snapshot().agents[0].status, SessionStatus::Exited);
+        assert!(runtime.snapshot().archived.is_empty());
+        runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn quitting_an_unnamed_agent_removes_the_dead_card() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 0.15"]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+        runtime.record_paste(snapshot.id, "/exit\n");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let removed = loop {
+            let events = runtime.poll_events();
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches!(event, Event::AgentRemoved { .. }))
+            {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "quit did not remove the unnamed agent"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(matches!(
+            removed,
+            Event::AgentRemoved { agent_id, .. } if agent_id == snapshot.id
+        ));
+        assert!(runtime.snapshot().agents.is_empty());
+        assert!(runtime.snapshot().archived.is_empty());
     }
 
     #[test]
