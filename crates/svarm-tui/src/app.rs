@@ -7,7 +7,7 @@ use svarm_agent::{
     AgentId, AgentKind, ProcessExit, SessionStatus,
     protocol::{
         AgentActivity, AgentSnapshot, ArchivedConversation, GitContext, RecognitionEvidence,
-        SessionId, SessionSummary, SvarmSessionSnapshot,
+        SessionId, SessionSummary, SvarmSessionSnapshot, UsageOverview, UsageProviderReport,
     },
     server_session::sort_session_summaries,
 };
@@ -29,6 +29,7 @@ pub(crate) enum Mode {
     Menu,
     Keybinds,
     Settings,
+    Usage,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -487,6 +488,8 @@ pub(crate) struct App {
     new_agent: Option<NewAgentState>,
     pending_resume: Option<String>,
     archive_target: Option<AgentId>,
+    usage: UsageOverview,
+    usage_tab: Option<AgentKind>,
 }
 
 impl App {
@@ -514,6 +517,8 @@ impl App {
             new_agent: None,
             pending_resume: None,
             archive_target: None,
+            usage: UsageOverview::default(),
+            usage_tab: None,
         }
         .with_test_new_agent(choose_agent)
     }
@@ -548,6 +553,8 @@ impl App {
             new_agent: None,
             pending_resume: None,
             archive_target: None,
+            usage: UsageOverview::default(),
+            usage_tab: None,
         }
     }
 
@@ -576,6 +583,72 @@ impl App {
 
     pub fn select_settings_tab(&mut self, tab: SettingsTab) {
         self.settings_tab = tab;
+    }
+
+    pub fn open_usage(&mut self) {
+        self.mode = Mode::Usage;
+    }
+
+    pub const fn usage(&self) -> &UsageOverview {
+        &self.usage
+    }
+
+    /// Apply a fresh overview. Returns whether anything the interface shows changed.
+    ///
+    /// The selected tab survives as long as its provider is still reported, so a refresh landing
+    /// while the modal is open cannot move the user to another provider's numbers.
+    pub fn set_usage(&mut self, usage: UsageOverview) -> bool {
+        if self.usage == usage {
+            return false;
+        }
+        self.usage = usage;
+        self.clamp_usage_tab();
+        true
+    }
+
+    fn clamp_usage_tab(&mut self) {
+        let first = self.usage.providers.first().map(|provider| provider.kind);
+        match self.usage_tab {
+            Some(kind) if self.usage_provider(kind).is_some() => {}
+            _ => self.usage_tab = first,
+        }
+    }
+
+    pub fn usage_provider(&self, kind: AgentKind) -> Option<&UsageProviderReport> {
+        self.usage
+            .providers
+            .iter()
+            .find(|provider| provider.kind == kind)
+    }
+
+    /// The provider whose tab is showing, defaulting to the first when none was chosen.
+    pub fn selected_usage(&self) -> Option<&UsageProviderReport> {
+        match self.usage_tab {
+            Some(kind) => self.usage_provider(kind),
+            None => self.usage.providers.first(),
+        }
+    }
+
+    pub fn move_usage_tab(&mut self, delta: isize) {
+        let providers = &self.usage.providers;
+        if providers.is_empty() {
+            self.usage_tab = None;
+            return;
+        }
+        let current = self
+            .usage_tab
+            .and_then(|kind| providers.iter().position(|provider| provider.kind == kind))
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(providers.len() as isize) as usize;
+        self.usage_tab = Some(providers[next].kind);
+    }
+
+    /// Select a provider's tab. Selecting one that is not reported is ignored, so a stale click
+    /// cannot leave the modal pointing at nothing.
+    pub fn select_usage_tab(&mut self, kind: AgentKind) {
+        if self.usage_provider(kind).is_some() {
+            self.usage_tab = Some(kind);
+        }
     }
 
     #[cfg(test)]
@@ -1417,6 +1490,99 @@ mod tests {
         assert_eq!(app.menu_selected(), MenuItem::Settings);
         app.select_next_menu_item();
         assert_eq!(app.menu_selected(), MenuItem::Detach);
+    }
+
+    fn selected_tab(app: &App) -> Option<AgentKind> {
+        app.selected_usage().map(|provider| provider.kind)
+    }
+
+    fn usage_report(kind: AgentKind) -> UsageProviderReport {
+        UsageProviderReport {
+            kind,
+            report: svarm_agent::protocol::UsageReport::NotProbed,
+            observed_at_ms: None,
+            refreshing: false,
+        }
+    }
+
+    fn overview(kinds: &[AgentKind]) -> UsageOverview {
+        UsageOverview {
+            providers: kinds.iter().copied().map(usage_report).collect(),
+        }
+    }
+
+    #[test]
+    fn usage_opens_and_defaults_to_the_first_reported_provider() {
+        let mut app = app();
+        app.set_usage(overview(&[AgentKind::Codex, AgentKind::Claude]));
+        app.open_usage();
+
+        assert_eq!(app.mode(), Mode::Usage);
+        assert_eq!(selected_tab(&app), Some(AgentKind::Codex));
+        assert_eq!(selected_tab(&app), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn usage_tabs_cycle_over_reported_providers_in_both_directions() {
+        let mut app = app();
+        app.set_usage(overview(&[AgentKind::Codex, AgentKind::Claude]));
+
+        app.move_usage_tab(1);
+        assert_eq!(selected_tab(&app), Some(AgentKind::Claude));
+        app.move_usage_tab(1);
+        assert_eq!(selected_tab(&app), Some(AgentKind::Codex), "cycles round");
+        app.move_usage_tab(-1);
+        assert_eq!(selected_tab(&app), Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn selecting_a_provider_that_is_not_reported_is_ignored() {
+        let mut app = app();
+        app.set_usage(overview(&[AgentKind::Codex]));
+
+        app.select_usage_tab(AgentKind::Grok);
+        assert_eq!(selected_tab(&app), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn a_refreshed_overview_keeps_the_selected_tab_but_clamps_when_it_disappears() {
+        let mut app = app();
+        app.set_usage(overview(&[AgentKind::Codex, AgentKind::Claude]));
+        app.select_usage_tab(AgentKind::Claude);
+
+        // A provider still present keeps the selection put.
+        assert!(app.set_usage(UsageOverview {
+            providers: vec![
+                usage_report(AgentKind::Codex),
+                UsageProviderReport {
+                    refreshing: true,
+                    ..usage_report(AgentKind::Claude)
+                },
+            ],
+        }));
+        assert_eq!(selected_tab(&app), Some(AgentKind::Claude));
+
+        // When it disappears the selection falls back rather than pointing at nothing.
+        app.set_usage(overview(&[AgentKind::Codex]));
+        assert_eq!(selected_tab(&app), Some(AgentKind::Codex));
+
+        app.set_usage(overview(&[]));
+        assert_eq!(selected_tab(&app), None);
+        assert!(app.selected_usage().is_none());
+    }
+
+    #[test]
+    fn an_unchanged_overview_reports_no_redraw() {
+        let mut app = app();
+        assert!(app.set_usage(overview(&[AgentKind::Codex])));
+        assert!(!app.set_usage(overview(&[AgentKind::Codex])));
+    }
+
+    #[test]
+    fn moving_tabs_without_any_provider_is_harmless() {
+        let mut app = app();
+        app.move_usage_tab(1);
+        assert_eq!(selected_tab(&app), None);
     }
 
     #[test]
