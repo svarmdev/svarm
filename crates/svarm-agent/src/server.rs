@@ -1282,6 +1282,11 @@ impl Outcome {
             disconnect: Vec::new(),
         }
     }
+
+    fn with_event(mut self, id: ConnectionId, event: Event) -> Self {
+        self.events.push((id, event));
+        self
+    }
 }
 
 struct Server {
@@ -1300,6 +1305,7 @@ struct Server {
     output_wake: Arc<OutputWake>,
     stopping: bool,
     empty_since: Option<Instant>,
+    usage: crate::usage::UsageCache,
 }
 
 impl Server {
@@ -1327,10 +1333,50 @@ impl Server {
             output_wake,
             stopping: false,
             empty_since: Some(Instant::now()),
+            usage: crate::usage::UsageCache::from_environment(),
         })
     }
 
+    /// Providers the interface can offer usage for, recomputed rather than cached because a
+    /// coding agent can be installed while the server is running.
+    fn usage_providers(&self) -> Vec<AgentKind> {
+        crate::usage::usage_providers(&crate::session::available_harnesses())
+    }
+
+    fn usage_overview(&self) -> Event {
+        Event::UsageChanged(self.usage.overview(&crate::session::available_harnesses()))
+    }
+
+    /// Deliver finished probes. Every interactive client sees the same overview, so a second
+    /// window does not have to probe again to catch up.
+    fn poll_usage(&mut self) {
+        let mut changed = false;
+        while let Some(result) = self.usage.try_result() {
+            let now = self.now_ms();
+            changed |= self.usage.absorb(result, now);
+        }
+        if changed {
+            self.broadcast_interactive(self.usage_overview());
+        }
+    }
+
+    fn broadcast_interactive(&mut self, event: Event) {
+        let recipients: Vec<ConnectionId> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.role == Some(ConnectionRole::Interactive))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in recipients {
+            self.send_event(id, event.clone());
+        }
+    }
+
     fn run(mut self) -> AgentResult<()> {
+        // Probe once at startup so the first client to ask already has numbers to show.
+        let providers = self.usage_providers();
+        self.usage.refresh(&providers);
+
         let mut next_session_poll = Instant::now();
         while !self.stopping {
             if self.config.handle_signals && SHUTDOWN_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -1355,6 +1401,7 @@ impl Server {
                 // polling lets output that arrives during the poll schedule the following frame.
                 self.output_wake.clear();
                 self.poll_sessions();
+                self.poll_usage();
             }
             self.update_lifetime();
         }
@@ -1714,6 +1761,15 @@ impl Server {
                     .acknowledge(agent_id, sequence)?;
                 Ok(Outcome::new(Response::Ok))
             }
+            Request::ReadUsage { refresh } => {
+                if refresh {
+                    let providers = self.usage_providers();
+                    self.usage.refresh(&providers);
+                }
+                // The overview is built after scheduling, so it already carries `refreshing` for
+                // anything just queued: one round trip shows cached numbers and the indicator.
+                Ok(Outcome::new(Response::Ok).with_event(id, self.usage_overview()))
+            }
             Request::ServerStatus => Ok(Outcome::new(Response::ServerStatus(self.status()))),
             Request::ListSessions => {
                 let mut sessions = self
@@ -1872,7 +1928,16 @@ impl Server {
             },
             events,
             disconnect: Vec::new(),
-        })
+        }
+        .with_event(id, self.refreshed_usage_overview(now)))
+    }
+
+    /// Re-probe anything that has gone stale and return the overview to hand a client that has
+    /// just attached, so it renders usage without waiting for a probe to finish.
+    fn refreshed_usage_overview(&mut self, now_ms: u64) -> Event {
+        let providers = self.usage_providers();
+        self.usage.refresh_stale(&providers, now_ms);
+        self.usage_overview()
     }
 
     fn attach_session(
@@ -1940,6 +2005,8 @@ impl Server {
             ));
             outcome.disconnect.push(old);
         }
+        let usage = self.refreshed_usage_overview(now);
+        outcome.events.push((id, usage));
         Ok(outcome)
     }
 
