@@ -153,7 +153,7 @@ impl TerminalSelection {
         }
         if self.pointer_row == 0 && self.scrollback < self.retained_rows {
             Some(ScrollDirection::Older)
-        } else if self.pointer_row == self.viewport_rows - 1 && self.scrollback > 0 {
+        } else if self.pointer_row >= self.viewport_rows.saturating_sub(1) && self.scrollback > 0 {
             Some(ScrollDirection::Newer)
         } else {
             None
@@ -329,6 +329,26 @@ mod tests {
             Some("two!!\nthree\nfour!\nfive!")
         );
         assert_eq!(selection.scroll_direction(), Some(ScrollDirection::Older));
+    }
+
+    #[test]
+    fn scroll_direction_follows_the_pointer_at_either_viewport_edge() {
+        let live = screen(&["one!!", "two!!", "three"], &[false; 3], 0);
+        let mut older = TerminalSelection::begin(AgentId::new(1), 0, 1, mouse(0, 1), false, &live);
+        older.drag(0, 0, &live);
+        assert_eq!(older.scroll_direction(), Some(ScrollDirection::Older));
+
+        older.drag(2, 1, &live);
+        assert_eq!(older.scroll_direction(), None);
+
+        let history = screen(&["one!!", "two!!", "three"], &[false; 3], 4);
+        let mut newer =
+            TerminalSelection::begin(AgentId::new(1), 0, 1, mouse(0, 1), false, &history);
+        newer.drag(0, 2, &history);
+        assert_eq!(newer.scroll_direction(), Some(ScrollDirection::Newer));
+
+        newer.drag(0, 1, &history);
+        assert_eq!(newer.scroll_direction(), None);
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub(crate) enum ManagementCommand {
     WidenSidebar,
     OpenMenu,
     OpenKeybinds,
+    OpenUsage,
     SelectAgent(usize),
     Cancel,
     Unknown,
@@ -97,6 +98,11 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
         command: ManagementCommand::OpenMenu,
     },
     Keybinding {
+        keys: "Ctrl+B, u",
+        action: "show subscription usage",
+        command: ManagementCommand::OpenUsage,
+    },
+    Keybinding {
         keys: "Ctrl+B, ?",
         action: "open keybinds",
         command: ManagementCommand::OpenKeybinds,
@@ -132,6 +138,7 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         HostKeyCode::Char('l') | HostKeyCode::Right => ManagementCommand::WidenSidebar,
         HostKeyCode::Char('m') => ManagementCommand::OpenMenu,
         HostKeyCode::Char('?') => ManagementCommand::OpenKeybinds,
+        HostKeyCode::Char('u') => ManagementCommand::OpenUsage,
         HostKeyCode::Char(digit @ '1'..='9') => {
             ManagementCommand::SelectAgent(digit as usize - '1' as usize)
         }
@@ -246,11 +253,36 @@ mod tests {
             management_command(key(HostKeyCode::Char('r'), KeyModifiers::NONE)),
             ManagementCommand::ResumeArchived
         );
+        assert_eq!(
+            management_command(key(HostKeyCode::Char('u'), KeyModifiers::NONE)),
+            ManagementCommand::OpenUsage
+        );
         assert!(
             MANAGEMENT_KEYBINDINGS
                 .iter()
                 .any(|binding| binding.keys == "Ctrl+B, d" && binding.action == "detach")
         );
+    }
+
+    /// Every command reachable by key must also be listed, because the keybinds modal renders
+    /// that table and each row doubles as the click target for its command.
+    #[test]
+    fn every_documented_binding_is_reachable_by_its_own_key() {
+        for binding in MANAGEMENT_KEYBINDINGS {
+            let Some(letter) = binding
+                .keys
+                .strip_prefix("Ctrl+B, ")
+                .filter(|rest| rest.chars().count() == 1)
+                .and_then(|rest| rest.chars().next())
+            else {
+                continue;
+            };
+            assert_eq!(
+                management_command(key(HostKeyCode::Char(letter), KeyModifiers::NONE)),
+                binding.command,
+                "Ctrl+B, {letter} should invoke the command it is documented under"
+            );
+        }
     }
 
     #[test]

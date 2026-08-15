@@ -65,11 +65,20 @@ impl InteractionState {
     }
 
     fn schedule_selection_scroll(&mut self, now: Instant) {
-        self.selection_scroll_at = self
+        if self
             .selection
             .as_ref()
             .and_then(TerminalSelection::scroll_direction)
-            .map(|_| now + SELECTION_SCROLL_INTERVAL);
+            .is_none()
+        {
+            self.selection_scroll_at = None;
+            return;
+        }
+        // Keep an already-running interval. Drag events arrive faster than the
+        // scroll period, so resetting here would postpone scrolling forever.
+        if self.selection_scroll_at.is_none() {
+            self.selection_scroll_at = Some(now);
+        }
     }
 
     fn show_copied(&mut self, characters: usize, now: Instant) {
@@ -197,6 +206,9 @@ pub fn run(
     let mut connection_failure = None;
     let mut interaction = InteractionState::default();
     'runtime: while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
+        // Tick before drawing so an in-progress selection can scroll even when
+        // drag events keep arriving faster than the scroll interval.
+        dirty |= interaction.tick(&mut agents, Instant::now())?;
         if dirty {
             if let Some((id, generation)) = app.mark_selected_seen() {
                 agents.mark_seen(id, generation)?;
@@ -220,6 +232,7 @@ pub fn run(
                     .as_ref()
                     .map(|toast| toast.message.as_str()),
                 embedded: embedded.as_ref(),
+                now_ms: crate::startup::unix_time_ms(),
                 theme: app.theme().theme(colors_enabled),
                 colors_enabled,
                 nerd_fonts,
@@ -243,10 +256,7 @@ pub fn run(
         let first = if let Some(timeout) = interaction.next_timeout(Instant::now()) {
             match events.recv_timeout(timeout) {
                 Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => {
-                    dirty |= interaction.tick(&mut agents, Instant::now())?;
-                    continue;
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break 'runtime,
             }
         } else {
@@ -497,6 +507,9 @@ fn apply_remote_update(
                 app.set_notice(notice.message);
                 dirty = true;
             }
+            ServerEvent::UsageChanged(usage) => {
+                dirty |= app.set_usage(usage);
+            }
             ServerEvent::LeaseRevoked { reason } => {
                 *connection_failure = Some(reason);
             }
@@ -639,6 +652,14 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
             _ => {}
         },
+        // Opened from the sidebar rather than the menu, so leaving returns to the terminal.
+        Mode::Usage => match key.code {
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => app.move_usage_tab(1),
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => app.move_usage_tab(-1),
+            KeyCode::Char('r') => agents.request_usage(true)?,
+            KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Terminal),
+            _ => {}
+        },
     }
     Ok((false, redraw))
 }
@@ -739,6 +760,11 @@ fn handle_management_command(
             app.set_mode(Mode::Menu);
         }
         ManagementCommand::OpenKeybinds => app.set_mode(Mode::Keybinds),
+        ManagementCommand::OpenUsage => {
+            app.open_usage();
+            // Show whatever is cached immediately and re-probe behind it.
+            agents.request_usage(true)?;
+        }
         ManagementCommand::SelectAgent(index) => {
             if app.select_sidebar_index(index) {
                 sync_selection(app, agents)?;
@@ -977,6 +1003,7 @@ fn apply_click_action(
                 Mode::ArchiveUnavailable => app.dismiss_archive_unavailable(),
                 Mode::ConfirmClose | Mode::ConfirmQuit => app.set_mode(Mode::Terminal),
                 Mode::Keybinds | Mode::Settings => app.set_mode(Mode::Menu),
+                Mode::Usage => app.set_mode(Mode::Terminal),
                 Mode::Menu => app.set_mode(Mode::Terminal),
                 _ => {}
             }
@@ -1035,6 +1062,18 @@ fn apply_click_action(
         }
         ui::ClickAction::SettingsTab(tab) => {
             app.select_settings_tab(tab);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageTab(kind) => {
+            app.select_usage_tab(kind);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageNext => {
+            app.move_usage_tab(1);
+            Ok((false, true))
+        }
+        ui::ClickAction::UsageRefresh => {
+            agents.request_usage(true)?;
             Ok((false, true))
         }
         ui::ClickAction::EmbeddedAccept | ui::ClickAction::EmbeddedCancel => {
@@ -1798,7 +1837,8 @@ mod tests {
             },
             area,
         ));
-        assert_eq!(app.sidebar_scroll(), Some(2));
+        // The sidebar reserves three button rows, leaving 21 rows for seven full cards.
+        assert_eq!(app.sidebar_scroll(), Some(3));
     }
 
     #[test]
@@ -1817,6 +1857,45 @@ mod tests {
         assert_eq!(app.sidebar_width(), 39);
         apply_sidebar_drag(&mut app, area, 15);
         assert_eq!(app.sidebar_width(), 16);
+    }
+
+    #[test]
+    fn selection_edge_scroll_starts_immediately_and_is_not_postponed_by_later_drags() {
+        let live = selection_screen(3, 0, 20);
+        let mut interaction = InteractionState {
+            selection: Some(TerminalSelection::begin(
+                AgentId::new(1),
+                0,
+                1,
+                selection_mouse(0, 1),
+                false,
+                &live,
+            )),
+            ..InteractionState::default()
+        };
+        if let Some(selection) = interaction.selection.as_mut() {
+            selection.drag(0, 0, &live);
+        }
+
+        let t0 = Instant::now();
+        interaction.schedule_selection_scroll(t0);
+        assert_eq!(interaction.selection_scroll_at, Some(t0));
+
+        interaction.schedule_selection_scroll(t0 + Duration::from_millis(10));
+        assert_eq!(interaction.selection_scroll_at, Some(t0));
+
+        if let Some(selection) = interaction.selection.as_mut() {
+            selection.drag(0, 1, &live);
+        }
+        interaction.schedule_selection_scroll(t0 + Duration::from_millis(20));
+        assert_eq!(interaction.selection_scroll_at, None);
+
+        if let Some(selection) = interaction.selection.as_mut() {
+            selection.drag(0, 0, &live);
+        }
+        let t1 = t0 + Duration::from_millis(30);
+        interaction.schedule_selection_scroll(t1);
+        assert_eq!(interaction.selection_scroll_at, Some(t1));
     }
 
     #[test]
@@ -1870,6 +1949,28 @@ mod tests {
         };
 
         assert_eq!(remembered_workspace(&settings), None);
+    }
+
+    fn selection_mouse(column: u16, row: u16) -> svarm_agent::protocol::MouseInput {
+        svarm_agent::protocol::MouseInput {
+            kind: svarm_agent::protocol::MouseKind::Down(svarm_agent::protocol::MouseButton::Left),
+            column,
+            row,
+            modifiers: InputModifiers::default(),
+        }
+    }
+
+    fn selection_screen(
+        rows: u16,
+        scrollback: usize,
+        retained: usize,
+    ) -> svarm_agent::terminal_model::TerminalSnapshot {
+        let mut screen = svarm_agent::terminal_model::TerminalSnapshot::blank(
+            svarm_agent::terminal_model::TerminalSize::new(rows, 8),
+        );
+        screen.state.scrollback.position = scrollback;
+        screen.state.scrollback.retained_rows = retained;
+        screen
     }
 
     fn ready_for_worktree(generation: u64) -> App {

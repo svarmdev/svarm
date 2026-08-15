@@ -363,6 +363,12 @@ impl RemoteAgents {
         })
     }
 
+    /// Ask for the usage overview. The answer arrives as a `UsageChanged` event, and a refreshed
+    /// probe lands as a second one once it finishes.
+    pub fn request_usage(&mut self, refresh: bool) -> Result<()> {
+        self.send(Request::ReadUsage { refresh })
+    }
+
     pub fn show_live(&mut self, agent_id: AgentId) -> bool {
         let Some(terminal) = self.terminals.get_mut(&agent_id) else {
             return false;

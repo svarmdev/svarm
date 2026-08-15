@@ -9,7 +9,7 @@ use crate::{
 
 pub use crate::terminal_model::{MouseEncoding, MouseProtocol, TerminalModes};
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
@@ -201,6 +201,11 @@ pub enum Request {
         agent_id: AgentId,
         sequence: TerminalSequence,
     },
+    /// Ask for the cached usage overview. `refresh` also schedules a fresh probe, whose result
+    /// arrives later as a separate `Event::UsageChanged`.
+    ReadUsage {
+        refresh: bool,
+    },
     ServerStatus,
     ListSessions,
     GetSession {
@@ -277,6 +282,7 @@ pub enum Event {
     LeaseRevoked {
         reason: String,
     },
+    UsageChanged(UsageOverview),
     ServerStopping,
 }
 
@@ -378,6 +384,93 @@ pub enum AgentActivity {
     Idle,
     Working,
     Blocked,
+}
+
+/// One provider's subscription limits as last observed.
+///
+/// Providers publish limits through private interfaces that change without notice, so a report
+/// either carries windows a provider affirmatively returned or explains why it carries none. No
+/// code path invents a percentage from a timeout, a missing field, or an unrecognised payload.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageOverview {
+    /// Ordered by `AgentKind::ALL`; only providers whose command is installed appear.
+    pub providers: Vec<UsageProviderReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageProviderReport {
+    pub kind: AgentKind,
+    pub report: UsageReport,
+    /// When `report` was observed. `None` until the first probe finishes.
+    pub observed_at_ms: Option<u64>,
+    /// A probe is in flight; `report` is the previous observation, not a fresh one.
+    pub refreshing: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "report", rename_all = "snake_case")]
+pub enum UsageReport {
+    #[default]
+    NotProbed,
+    Available(UsageEvidence),
+    Unavailable(UsageUnavailable),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageEvidence {
+    /// The provider's own name for the plan, when it reports one.
+    pub plan: Option<String>,
+    pub windows: Vec<UsageWindow>,
+    /// Secondary facts worth showing, such as a credit balance.
+    pub notes: Vec<String>,
+    /// What was queried, kept with the report so a number can be traced if needed.
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageWindow {
+    /// How the provider names the window: "5-hour", "Weekly", "Primary".
+    pub label: String,
+    /// Tenths of a percent, 0..=1000. Integer because `Event` derives `Eq`.
+    pub used_tenths: u16,
+    /// `None` when the provider did not report a reset for this window.
+    pub resets_at_ms: Option<u64>,
+    pub detail: Option<String>,
+}
+
+impl UsageWindow {
+    /// Build a window from a percentage the provider reported, clamped to a sane range.
+    pub fn from_percent(label: impl Into<String>, percent: f64) -> Self {
+        Self {
+            label: label.into(),
+            used_tenths: (percent * 10.0).round().clamp(0.0, 1000.0) as u16,
+            resets_at_ms: None,
+            detail: None,
+        }
+    }
+
+    pub fn whole_percent(&self) -> u16 {
+        self.used_tenths / 10
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageUnavailable {
+    pub reason: UsageUnavailableReason,
+    /// What the user can do about it: "Not signed in — run `grok login`".
+    pub message: String,
+    /// What was actually observed, so the claim can be checked.
+    pub evidence: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageUnavailableReason {
+    NotSignedIn,
+    Expired,
+    /// Reached the provider, but it publishes no subscription limits for this account.
+    Unsupported,
+    ProbeFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

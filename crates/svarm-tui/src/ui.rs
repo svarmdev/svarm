@@ -17,7 +17,10 @@ use crate::{
     selection::VisibleSelection,
     theme::Theme,
 };
-use svarm_agent::{AgentKind, SessionStatus, TerminalProcessSnapshot};
+use svarm_agent::{
+    AgentKind, SessionStatus, TerminalProcessSnapshot,
+    protocol::{UsageProviderReport, UsageReport, UsageWindow},
+};
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
@@ -93,6 +96,8 @@ pub(crate) struct UiModel<'a> {
     pub colors_enabled: bool,
     pub nerd_fonts: bool,
     pub pointer: Option<(u16, u16)>,
+    /// Read by the runtime, not by rendering, so countdowns stay a pure function of the frame.
+    pub now_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +124,9 @@ pub(crate) enum ClickAction {
     SettingsPrevious,
     SettingsNext,
     SettingsTab(SettingsTab),
+    UsageNext,
+    UsageRefresh,
+    UsageTab(AgentKind),
     EmbeddedAccept,
     EmbeddedCancel,
     EmbeddedForceClose,
@@ -359,6 +367,20 @@ const HARNESS_SETTINGS_HINTS: &[ActionHint] = &[
         action: ClickAction::Cancel,
     },
 ];
+const USAGE_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[Tab] next tab",
+        action: ClickAction::UsageNext,
+    },
+    ActionHint {
+        text: "[r] refresh",
+        action: ClickAction::UsageRefresh,
+    },
+    ActionHint {
+        text: "[Esc] back",
+        action: ClickAction::Cancel,
+    },
+];
 const EMBEDDED_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[q] use current directory",
@@ -458,6 +480,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::ConfirmQuit => render_stop_confirmation(frame, app, theme, hovered),
         Mode::Keybinds => render_keybinds(frame, theme, hovered),
         Mode::Settings => render_settings(frame, app, theme, hovered),
+        Mode::Usage => render_usage(frame, app, theme, hovered, model.now_ms),
         _ => {}
     }
     if let Some(toast) = model.toast {
@@ -704,6 +727,11 @@ pub fn new_agent_button_area(area: Rect, sidebar_width: u16) -> Option<Rect> {
     (menu.y > area.y).then_some(Rect::new(menu.x, menu.y - 1, menu.width, 1))
 }
 
+pub fn usage_button_area(area: Rect, sidebar_width: u16) -> Option<Rect> {
+    let new_agent = new_agent_button_area(area, sidebar_width)?;
+    (new_agent.y > area.y).then_some(Rect::new(new_agent.x, new_agent.y - 1, new_agent.width, 1))
+}
+
 pub fn menu_item_at(app: &App, area: Rect, column: u16, row: u16) -> Option<MenuItem> {
     let button = menu_button_area(area, layout_sidebar_width(app, area))?;
     let popup = menu_popup_area(button);
@@ -765,10 +793,16 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
     let sidebar_width = layout_sidebar_width(app, area);
     if matches!(
         app.mode(),
-        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings
+        Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings | Mode::Usage
     ) {
         if resize_handle_area(app, area).is_some_and(|handle| contains(handle, column, row)) {
             return Some(ClickAction::ResizeSidebar);
+        }
+        if app.mode() != Mode::Menu
+            && usage_button_area(area, sidebar_width)
+                .is_some_and(|button| contains(button, column, row))
+        {
+            return Some(ClickAction::Management(ManagementCommand::OpenUsage));
         }
         if app.mode() != Mode::Menu
             && new_agent_button_area(area, sidebar_width)
@@ -938,14 +972,28 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 return None;
             }
             let line = usize::from(row - inner.y);
-            if let Some(binding) = line
-                .checked_sub(1)
-                .and_then(|index| MANAGEMENT_KEYBINDINGS.get(index))
-            {
+            if let Some(binding) = MANAGEMENT_KEYBINDINGS.get(line) {
                 return Some(ClickAction::Management(binding.command));
             }
-            (line == MANAGEMENT_KEYBINDINGS.len() + 1)
+            (line == MANAGEMENT_KEYBINDINGS.len())
                 .then(|| hint_at(BACK_HINTS, inner.x, column))
+                .flatten()
+        }
+        Mode::Usage => {
+            let inner = dialog_inner(ModalSize::Standard, area);
+            if !contains(inner, column, row) {
+                return None;
+            }
+            let line = row - inner.y;
+            if line == 1 {
+                for provider in &app.usage().providers {
+                    if contains(usage_tab_area(provider.kind, app, inner, row), column, row) {
+                        return Some(ClickAction::UsageTab(provider.kind));
+                    }
+                }
+            }
+            (line == USAGE_HINT_LINE)
+                .then(|| hint_at(USAGE_HINTS, inner.x, column))
                 .flatten()
         }
         Mode::Settings => {
@@ -1097,7 +1145,8 @@ fn agent_list_area(app: &App, sidebar: Rect, sidebar_width: u16) -> Rect {
     } else {
         0
     };
-    let reserved = 2 + popup_height + u16::from(app.notice().is_some());
+    // One row each for the usage, new-agent, and menu buttons stacked at the bottom.
+    let reserved = 3 + popup_height + u16::from(app.notice().is_some());
     Rect::new(
         inner.x,
         inner.y,
@@ -1233,6 +1282,24 @@ fn render_sidebar(
         frame.render_widget(
             Paragraph::new(message).style(warning(theme)),
             Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+
+    if let Some(usage_button) = usage_button_area(area, width) {
+        let usage_style = chrome_style(
+            theme,
+            hovered == Some(ClickAction::Management(ManagementCommand::OpenUsage)),
+            false,
+            text(theme),
+        );
+        frame.render_widget(
+            Paragraph::new(trailing_shortcut(
+                Span::styled(" % Usage", usage_style.add_modifier(Modifier::BOLD)),
+                Span::styled("^B u", usage_style),
+                usage_button.width,
+            ))
+            .style(usage_style),
+            usage_button,
         );
     }
 
@@ -1950,7 +2017,9 @@ fn render_resume_confirmation(
 }
 
 fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAction>) {
-    let mut lines = vec![Line::from("")];
+    // The binding rows start at the first inner row: with the full table plus the footer, a
+    // leading blank would push the hint outside the modal and make it unclickable.
+    let mut lines = Vec::with_capacity(MANAGEMENT_KEYBINDINGS.len() + 2);
     lines.extend(MANAGEMENT_KEYBINDINGS.iter().map(|binding| {
         Line::from(Span::styled(
             format!("  {:<27} {}", binding.keys, binding.action),
@@ -1964,6 +2033,288 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAct
     }));
     lines.push(hint_line(BACK_HINTS, theme, hovered));
     render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
+}
+
+/// Inner row the usage footer sits on. Fixed so the content above it can vary without moving the
+/// clickable hints out from under the pointer.
+const USAGE_HINT_LINE: u16 = 14;
+const USAGE_PROVENANCE_LINE: usize = 13;
+const USAGE_LABEL_WIDTH: usize = 14;
+const USAGE_BAR_WIDTH: usize = 18;
+
+fn render_usage(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+    now_ms: u64,
+) {
+    let inner = dialog_inner(ModalSize::Standard, frame.area());
+    let width = usize::from(inner.width);
+    let mut lines = vec![
+        Line::from(""),
+        usage_tabs(app, theme, hovered),
+        Line::from(""),
+    ];
+
+    match app.selected_usage() {
+        Some(provider) => {
+            lines.push(usage_header(provider, theme, width));
+            lines.push(Line::from(""));
+            lines.extend(usage_body(provider, theme, now_ms, width));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  No coding agent that publishes usage is installed.",
+                theme.muted(),
+            )));
+        }
+    }
+
+    while lines.len() < USAGE_PROVENANCE_LINE {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(USAGE_PROVENANCE_LINE);
+    lines.push(usage_provenance(app.selected_usage(), theme, now_ms, width));
+    while lines.len() < usize::from(USAGE_HINT_LINE) {
+        lines.push(Line::from(""));
+    }
+    lines.push(hint_line(USAGE_HINTS, theme, hovered));
+    render_dialog(frame, theme, " Usage ", ModalSize::Standard, lines);
+}
+
+fn usage_tabs(app: &App, theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
+    let selected = app.selected_usage().map(|provider| provider.kind);
+    Line::from(
+        app.usage()
+            .providers
+            .iter()
+            .map(|provider| {
+                Span::styled(
+                    format!("  {}  ", provider.kind.label()),
+                    chrome_style(
+                        theme,
+                        hovered == Some(ClickAction::UsageTab(provider.kind)),
+                        selected == Some(provider.kind),
+                        text(theme),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn usage_tab_area(kind: AgentKind, app: &App, inner: Rect, row: u16) -> Rect {
+    let x = inner.x
+        + app
+            .usage()
+            .providers
+            .iter()
+            .take_while(|provider| provider.kind != kind)
+            .map(|provider| provider.kind.label().chars().count() as u16 + 4)
+            .sum::<u16>();
+    Rect::new(x, row, kind.label().chars().count() as u16 + 4, 1)
+}
+
+/// Plan on the left, probe state on the right.
+fn usage_header(provider: &UsageProviderReport, theme: Theme, width: usize) -> Line<'static> {
+    // The tab already names the provider, so the header carries only the plan when there is one.
+    let plan = match &provider.report {
+        UsageReport::Available(evidence) => evidence.plan.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    let state = if provider.refreshing {
+        if provider.observed_at_ms.is_some() {
+            "refreshing…"
+        } else {
+            "checking…"
+        }
+    } else {
+        ""
+    };
+
+    let left = clip(
+        format!("  {plan}"),
+        width.saturating_sub(state.chars().count() + 2),
+    );
+    let gap = width
+        .saturating_sub(left.chars().count())
+        .saturating_sub(state.chars().count());
+    Line::from(vec![
+        Span::styled(left, accent(theme).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(state.to_owned(), theme.muted()),
+    ])
+}
+
+fn usage_body(
+    provider: &UsageProviderReport,
+    theme: Theme,
+    now_ms: u64,
+    width: usize,
+) -> Vec<Line<'static>> {
+    match &provider.report {
+        UsageReport::Available(evidence) => {
+            let mut lines: Vec<Line<'static>> = evidence
+                .windows
+                .iter()
+                .map(|window| usage_window_line(window, theme, now_ms, width))
+                .collect();
+            if !evidence.notes.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(evidence.notes.iter().map(|note| {
+                    Line::from(Span::styled(
+                        clip(format!("  {note}"), width),
+                        theme.muted(),
+                    ))
+                }));
+            }
+            lines
+        }
+        UsageReport::NotProbed => vec![Line::from(Span::styled("  Checking…", theme.muted()))],
+        UsageReport::Unavailable(unavailable) => vec![
+            Line::from(Span::styled(
+                clip(format!("  {}", unavailable.message), width),
+                warning(theme),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                clip("  Press [r] to check again.".to_owned(), width),
+                theme.muted(),
+            )),
+        ],
+    }
+}
+
+fn usage_window_line(
+    window: &UsageWindow,
+    theme: Theme,
+    now_ms: u64,
+    width: usize,
+) -> Line<'static> {
+    let percent = window.whole_percent();
+    let label = format!(
+        "  {:<USAGE_LABEL_WIDTH$}",
+        clip_plain(&window.label, USAGE_LABEL_WIDTH)
+    );
+    let bar = usage_bar(window.used_tenths, USAGE_BAR_WIDTH);
+    let reset = format_reset(window.resets_at_ms, now_ms);
+    let detail = window
+        .detail
+        .as_deref()
+        .filter(|_| !reset.is_empty())
+        .map(|detail| format!(" · {detail}"))
+        .unwrap_or_default();
+
+    let used = label.chars().count() + bar.chars().count() + 6;
+    let tail = clip_plain(&format!("{reset}{detail}"), width.saturating_sub(used));
+    Line::from(vec![
+        Span::styled(label, text(theme)),
+        Span::styled(bar, usage_style(theme, percent)),
+        Span::styled(format!(" {percent:>3}%  "), text(theme)),
+        Span::styled(tail, theme.muted()),
+    ])
+}
+
+/// A filled/empty bar. The numeric percentage always accompanies it, so the bar never carries
+/// meaning on its own and the modal stays readable without colour.
+fn usage_bar(used_tenths: u16, width: usize) -> String {
+    let used = usize::from(used_tenths.min(1000));
+    // Round down so the bar only reads as full at 100%, but never show an empty bar for usage
+    // that has actually started.
+    let mut filled = (used * width) / 1000;
+    if used > 0 && filled == 0 {
+        filled = 1;
+    }
+    let filled = filled.min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn usage_style(theme: Theme, percent: u16) -> Style {
+    match percent {
+        0..=59 => success(theme),
+        60..=89 => warning(theme),
+        _ => danger(theme),
+    }
+}
+
+/// Describe a reset as a countdown plus, when it is close enough to matter, the local clock time.
+fn format_reset(resets_at_ms: Option<u64>, now_ms: u64) -> String {
+    let Some(resets_at) = resets_at_ms else {
+        return "reset time not reported".to_owned();
+    };
+    let Some(remaining) = resets_at.checked_sub(now_ms) else {
+        return "resetting now".to_owned();
+    };
+    let minutes = remaining / 60_000;
+    let (hours, days) = (minutes / 60, minutes / 1_440);
+    let countdown = if days > 0 {
+        format!("in {}d {}h", days, hours % 24)
+    } else if hours > 0 {
+        format!("in {}h {}m", hours, minutes % 60)
+    } else {
+        format!("in {minutes}m")
+    };
+    match local_clock(resets_at).filter(|_| days == 0) {
+        Some(clock) => format!("resets {clock} ({countdown})"),
+        None => format!("resets {countdown}"),
+    }
+}
+
+/// Local wall-clock `HH:MM` for an instant, via libc so no date dependency is needed.
+fn local_clock(unix_ms: u64) -> Option<String> {
+    let seconds = libc::time_t::try_from(unix_ms / 1000).ok()?;
+    // SAFETY: `localtime_r` writes into the caller-provided `tm`, which is fully initialised
+    // before it is read, and takes the time by pointer without retaining it.
+    let time = unsafe {
+        let mut out: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&seconds, &mut out).is_null() {
+            return None;
+        }
+        out
+    };
+    Some(format!("{:02}:{:02}", time.tm_hour, time.tm_min))
+}
+
+fn usage_provenance(
+    provider: Option<&UsageProviderReport>,
+    theme: Theme,
+    now_ms: u64,
+    width: usize,
+) -> Line<'static> {
+    let Some(provider) = provider else {
+        return Line::from("");
+    };
+    let text = provider
+        .observed_at_ms
+        .map(|at| format!("  checked {} ago", elapsed_label(now_ms.saturating_sub(at))))
+        .unwrap_or_default();
+    Line::from(Span::styled(clip(text, width), theme.muted()))
+}
+
+fn elapsed_label(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1000;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86_399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// `render_dialog` wraps rather than clips, so an over-long line would shift every row below it
+/// and desynchronise hit-testing. Every dynamic line goes through here.
+fn clip(text: String, width: usize) -> String {
+    clip_plain(&text, width)
+}
+
+fn clip_plain(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme, hovered: Option<ClickAction>) {
@@ -2151,6 +2502,10 @@ fn warning(theme: Theme) -> Style {
     Style::default().fg(theme.warn)
 }
 
+fn danger(theme: Theme) -> Style {
+    Style::default().fg(theme.error)
+}
+
 fn border(theme: Theme) -> Style {
     Style::default().fg(theme.border)
 }
@@ -2285,6 +2640,10 @@ mod tests {
             None,
         );
         assert_eq!(
+            usage_button_area(area, SIDEBAR_WIDTH),
+            Some(Rect::new(0, 37, 27, 1))
+        );
+        assert_eq!(
             new_agent_button_area(area, SIDEBAR_WIDTH),
             Some(Rect::new(0, 38, 27, 1))
         );
@@ -2292,6 +2651,8 @@ mod tests {
             menu_button_area(area, SIDEBAR_WIDTH),
             Some(Rect::new(0, 39, 27, 1))
         );
+        // The three buttons stack bottom-up with no gap, and none exists without a sidebar.
+        assert_eq!(usage_button_area(area, 0), None);
         let popup = menu_popup_area(menu_button_area(area, SIDEBAR_WIDTH).unwrap());
         assert_eq!(popup, Rect::new(0, 33, 27, 6));
         assert_eq!(menu_item_at(&app, area, 2, 36), Some(MenuItem::Keybinds));
@@ -2322,6 +2683,7 @@ mod tests {
                         theme: app.theme().theme(false),
                         colors_enabled: false,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 );
@@ -2335,12 +2697,273 @@ mod tests {
                 .map(|x| buffer[(x, button.y)].symbol())
                 .collect::<String>()
         };
+        let usage_button = row(usage_button_area(area, SIDEBAR_WIDTH).unwrap());
         let new_button = row(new_agent_button_area(area, SIDEBAR_WIDTH).unwrap());
         let menu_button = row(menu_button_area(area, SIDEBAR_WIDTH).unwrap());
+        assert!(usage_button.starts_with(" % Usage"));
+        assert!(usage_button.ends_with("^B u"));
         assert!(new_button.starts_with(" + New agent"));
         assert!(new_button.ends_with("^B n"));
         assert!(menu_button.starts_with(" ≡ Menu"));
         assert!(menu_button.ends_with("^B m"));
+    }
+
+    fn selected_tab(app: &App) -> Option<AgentKind> {
+        app.selected_usage().map(|provider| provider.kind)
+    }
+
+    fn usage_window(label: &str, percent: f64, resets_at_ms: Option<u64>) -> UsageWindow {
+        let mut window = UsageWindow::from_percent(label, percent);
+        window.resets_at_ms = resets_at_ms;
+        window
+    }
+
+    fn usage_provider(
+        kind: AgentKind,
+        report: UsageReport,
+        refreshing: bool,
+    ) -> UsageProviderReport {
+        UsageProviderReport {
+            kind,
+            report,
+            observed_at_ms: Some(1_000),
+            refreshing,
+        }
+    }
+
+    fn available_usage(windows: Vec<UsageWindow>) -> UsageReport {
+        UsageReport::Available(svarm_agent::protocol::UsageEvidence {
+            plan: Some("Max".into()),
+            windows,
+            notes: Vec::new(),
+            source: "GET api.anthropic.com/api/oauth/usage".into(),
+        })
+    }
+
+    fn usage_app(providers: Vec<UsageProviderReport>) -> App {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        app.set_usage(svarm_agent::protocol::UsageOverview { providers });
+        app.open_usage();
+        app
+    }
+
+    fn two_provider_app() -> App {
+        usage_app(vec![
+            usage_provider(
+                AgentKind::Codex,
+                available_usage(vec![usage_window("Weekly", 8.0, Some(3_600_000))]),
+                false,
+            ),
+            usage_provider(
+                AgentKind::Claude,
+                available_usage(vec![
+                    usage_window("5-hour", 42.0, Some(4_500_000)),
+                    usage_window("Weekly", 17.0, None),
+                ]),
+                false,
+            ),
+        ])
+    }
+
+    #[test]
+    fn usage_modal_shows_each_window_with_its_percentage_and_reset_at_80x24() {
+        let mut app = two_provider_app();
+        app.select_usage_tab(AgentKind::Claude);
+        let rendered = render_app_text(&app);
+
+        assert!(rendered.contains("Claude Code"), "{rendered}");
+        assert!(rendered.contains("5-hour"));
+        assert!(
+            rendered.contains("42%"),
+            "the number must be shown, not only a bar"
+        );
+        assert!(rendered.contains("17%"));
+        // 4_500_000ms from a zero clock is 1h15m away.
+        assert!(rendered.contains("in 1h 15m"), "{rendered}");
+        // A window the provider gave no reset for must say so rather than imply one.
+        assert!(rendered.contains("reset time not reported"));
+        assert!(
+            !rendered.contains("api.anthropic.com"),
+            "the probe source is not shown"
+        );
+        assert!(rendered.contains("checked"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_bars_never_stand_in_for_the_number() {
+        // Empty and full are exact; anything in between is non-empty and not yet full.
+        assert_eq!(usage_bar(0, 10), "░".repeat(10));
+        assert_eq!(usage_bar(1000, 10), "█".repeat(10));
+        assert_eq!(usage_bar(1, 10).chars().filter(|c| *c == '█').count(), 1);
+        assert_eq!(usage_bar(999, 10).chars().filter(|c| *c == '░').count(), 1);
+        for tenths in [0, 1, 250, 500, 999, 1000, 2000] {
+            assert_eq!(usage_bar(tenths, 18).chars().count(), 18);
+        }
+    }
+
+    #[test]
+    fn resets_are_described_relatively_and_absence_is_stated() {
+        assert_eq!(format_reset(None, 0), "reset time not reported");
+        assert_eq!(format_reset(Some(0), 1_000), "resetting now");
+        assert!(format_reset(Some(600_000), 0).contains("in 10m"));
+        assert!(format_reset(Some(4_500_000), 0).contains("in 1h 15m"));
+        // Beyond a day the clock time stops being useful, so only the countdown is shown.
+        let far = format_reset(Some(280_800_000), 0);
+        assert_eq!(far, "resets in 3d 6h");
+    }
+
+    #[test]
+    fn usage_tabs_switch_by_click_and_by_key_to_the_same_place() {
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = dialog_inner(ModalSize::Standard, area);
+        let tab_row = inner.y + 1;
+
+        let mut clicked = two_provider_app();
+        let claude_tab = usage_tab_area(AgentKind::Claude, &clicked, inner, tab_row);
+        assert_eq!(
+            click_action(&clicked, area, claude_tab.x + 1, tab_row),
+            Some(ClickAction::UsageTab(AgentKind::Claude))
+        );
+        clicked.select_usage_tab(AgentKind::Claude);
+
+        let mut keyed = two_provider_app();
+        keyed.move_usage_tab(1);
+
+        assert_eq!(selected_tab(&keyed), Some(AgentKind::Claude));
+        assert_eq!(render_app_text(&keyed), render_app_text(&clicked));
+    }
+
+    #[test]
+    fn usage_hints_and_the_sidebar_button_are_clickable() {
+        let app = two_provider_app();
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = dialog_inner(ModalSize::Standard, area);
+        assert_hint_clicks(&app, area, inner.x, inner.y + USAGE_HINT_LINE, USAGE_HINTS);
+
+        let button = usage_button_area(area, SIDEBAR_WIDTH).unwrap();
+        assert_eq!(
+            click_action(&app, area, button.x + 2, button.y),
+            Some(ClickAction::Management(ManagementCommand::OpenUsage))
+        );
+    }
+
+    /// The keyboard and the mouse must reach the same canonical action: `apply_click_action`
+    /// forwards `ClickAction::Management` straight into `handle_management_command`, so proving
+    /// both produce the same command proves both paths do the same thing.
+    #[test]
+    fn clicking_the_usage_button_and_pressing_the_key_produce_one_command() {
+        let app = two_provider_app();
+        let area = Rect::new(0, 0, 80, 24);
+        let button = usage_button_area(area, SIDEBAR_WIDTH).unwrap();
+
+        let clicked = click_action(&app, area, button.x + 2, button.y);
+        let keyed = crate::input::management_command(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(clicked, Some(ClickAction::Management(keyed)));
+        assert_eq!(keyed, ManagementCommand::OpenUsage);
+    }
+
+    #[test]
+    fn the_usage_button_is_covered_by_the_menu_popover() {
+        let mut app = two_provider_app();
+        app.set_mode(Mode::Menu);
+        let area = Rect::new(0, 0, 80, 24);
+        let button = usage_button_area(area, SIDEBAR_WIDTH).unwrap();
+        assert_ne!(
+            click_action(&app, area, button.x + 2, button.y),
+            Some(ClickAction::Management(ManagementCommand::OpenUsage))
+        );
+    }
+
+    #[test]
+    fn a_refreshing_provider_keeps_its_numbers_and_says_it_is_rechecking() {
+        let app = usage_app(vec![usage_provider(
+            AgentKind::Claude,
+            available_usage(vec![usage_window("5-hour", 42.0, None)]),
+            true,
+        )]);
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("42%"), "stale numbers stay on screen");
+        assert!(rendered.contains("refreshing…"), "{rendered}");
+    }
+
+    #[test]
+    fn a_provider_that_cannot_be_read_states_the_reason() {
+        let app = usage_app(vec![usage_provider(
+            AgentKind::Codex,
+            UsageReport::Unavailable(svarm_agent::protocol::UsageUnavailable {
+                reason: svarm_agent::protocol::UsageUnavailableReason::NotSignedIn,
+                message: "Not signed in. Run `codex login`, then refresh.".into(),
+                evidence: "codex app-server account/read reported no signed-in account".into(),
+            }),
+            false,
+        )]);
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("Not signed in"), "{rendered}");
+        assert!(rendered.contains("codex login"));
+        assert!(
+            !rendered.contains("app-server"),
+            "probe evidence is not shown: {rendered}"
+        );
+        // No percentage may be shown for a provider that reported none. (The sidebar's
+        // "% Usage" button is not a reading, so look for a digit before the sign.)
+        let digits: Vec<char> = rendered.chars().collect();
+        assert!(
+            !digits
+                .windows(2)
+                .any(|pair| pair[0].is_ascii_digit() && pair[1] == '%'),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn usage_modal_survives_having_no_providers_at_all() {
+        let app = usage_app(Vec::new());
+        let rendered = render_app_text(&app);
+        assert!(rendered.contains("No coding agent"), "{rendered}");
+    }
+
+    /// `render_dialog` wraps rather than clips, so an over-long line would push the footer down
+    /// and break hit-testing for every hint.
+    #[test]
+    fn usage_lines_never_exceed_the_modal_width() {
+        let theme = crate::theme::ThemeName::Monochrome.theme(false);
+        let width = usize::from(dialog_inner(ModalSize::Standard, Rect::new(0, 0, 80, 24)).width);
+        let long = "x".repeat(400);
+        let provider = UsageProviderReport {
+            kind: AgentKind::Claude,
+            report: UsageReport::Available(svarm_agent::protocol::UsageEvidence {
+                plan: Some(long.clone()),
+                windows: vec![usage_window(&long, 100.0, Some(u64::MAX))],
+                notes: vec![long.clone()],
+                source: long.clone(),
+            }),
+            observed_at_ms: Some(0),
+            refreshing: true,
+        };
+
+        let mut lines = vec![usage_header(&provider, theme, width)];
+        lines.extend(usage_body(&provider, theme, 0, width));
+        lines.push(usage_provenance(Some(&provider), theme, 0, width));
+        for line in lines {
+            let rendered: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(
+                rendered.chars().count() <= width,
+                "line is {} wide, limit {width}: {rendered}",
+                rendered.chars().count()
+            );
+        }
     }
 
     #[test]
@@ -2394,6 +3017,7 @@ mod tests {
                             theme: app.theme().theme(true),
                             colors_enabled: true,
                             nerd_fonts: false,
+                            now_ms: 0,
                             pointer: None,
                         },
                     );
@@ -2444,6 +3068,7 @@ mod tests {
                             theme: app.theme().theme(true),
                             colors_enabled: true,
                             nerd_fonts: false,
+                            now_ms: 0,
                             pointer: None,
                         },
                     );
@@ -2688,7 +3313,7 @@ mod tests {
         app.set_mode(Mode::Keybinds);
         for (index, binding) in MANAGEMENT_KEYBINDINGS.iter().enumerate() {
             assert_eq!(
-                click_action(&app, area, standard.x, standard.y + 1 + index as u16),
+                click_action(&app, area, standard.x, standard.y + index as u16),
                 Some(ClickAction::Management(binding.command))
             );
         }
@@ -2696,7 +3321,7 @@ mod tests {
             &app,
             area,
             standard.x,
-            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16 + 1,
+            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16,
             BACK_HINTS,
         );
 
@@ -3361,6 +3986,7 @@ mod tests {
                         theme,
                         colors_enabled: true,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 )
@@ -3532,6 +4158,11 @@ mod tests {
         app.scroll_sidebar(-1, agent_list_page_size(&app, area), 3);
         assert_eq!(agent_item_at(&app, area, 2, 1), Some(0));
         let rendered = render_app_text(&app);
+        assert!(!rendered.contains("8 · Conversation 8"));
+
+        // Scrolling all the way up brings the first card fully into view.
+        app.scroll_sidebar(-8, agent_list_page_size(&app, area), 3);
+        let rendered = render_app_text(&app);
         assert!(rendered.contains("1 · Conversation 1"));
         assert_eq!(agent_item_at(&app, area, 2, 0), Some(0));
     }
@@ -3562,6 +4193,7 @@ mod tests {
                         theme: app.theme().theme(true),
                         colors_enabled: true,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 )
@@ -3605,6 +4237,7 @@ mod tests {
                         theme: app.theme().theme(true),
                         colors_enabled: true,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                     frame.area(),
@@ -3650,6 +4283,7 @@ mod tests {
                         theme: app.theme().theme(true),
                         colors_enabled: true,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 )
@@ -3697,6 +4331,7 @@ mod tests {
                         theme: app.theme().theme(true),
                         colors_enabled: true,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 )
@@ -3734,6 +4369,7 @@ mod tests {
                         theme: app.theme().theme(false),
                         colors_enabled: false,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer,
                     },
                 )
@@ -3765,6 +4401,7 @@ mod tests {
                         theme: app.theme().theme(false),
                         colors_enabled: false,
                         nerd_fonts: false,
+                        now_ms: 0,
                         pointer: None,
                     },
                 )
@@ -3805,6 +4442,7 @@ mod tests {
                         colors_enabled: false,
                         nerd_fonts,
                         pointer: None,
+                        now_ms: 0,
                     },
                 )
             })
