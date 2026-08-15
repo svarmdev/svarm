@@ -235,8 +235,7 @@ fn text_content(value: &Value) -> Option<&str> {
 }
 
 fn normalize_prompt(prompt: &str) -> Option<String> {
-    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!prompt.is_empty() && !prompt.starts_with('/')).then_some(prompt)
+    crate::naming::naming_prompt(prompt)
 }
 
 fn encode_grok_directory(directory: &Path) -> String {
@@ -365,6 +364,40 @@ mod tests {
                 .find_map(opencode_prompt),
             Some("resume the release work".into())
         );
+    }
+
+    #[test]
+    fn model_and_effort_commands_are_skipped_for_the_next_real_prompt() {
+        let home = temp_home();
+        let id = "019ff1d3-375e-4a72-a176-c47497827e49";
+        write(
+            &home.join(format!(".codex/sessions/rollout-{id}.jsonl")),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"/model opus\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"/effort high\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"implement the sidebar\"}}\n",
+        );
+
+        let history = ConversationHistory::from_home(&home);
+        assert_eq!(
+            history.first_user_message(AgentKind::Codex, id, Path::new("/work")),
+            Some("implement the sidebar".into())
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_goal_command_is_kept_as_the_first_user_prompt() {
+        let home = temp_home();
+        let id = "019ff1d3-375e-4a72-a176-c47497827e49";
+        write(
+            &home.join(format!(".codex/sessions/rollout-{id}.jsonl")),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"/goal implement the sidebar\"}}\n",
+        );
+
+        let history = ConversationHistory::from_home(&home);
+        assert_eq!(
+            history.first_user_message(AgentKind::Codex, id, Path::new("/work")),
+            Some("/goal implement the sidebar".into())
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -267,6 +267,10 @@ impl ServerSessionState {
         self.id
     }
 
+    pub const fn last_user_activity_ms(&self) -> u64 {
+        self.last_user_activity_ms
+    }
+
     pub const fn selected_agent_id(&self) -> Option<AgentId> {
         self.selected_agent_id
     }
