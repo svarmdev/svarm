@@ -27,6 +27,7 @@ use crate::{
         WorkspaceChoice,
     },
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
+    review::{HunkLaunchError, HunkReview, HunkReviewResult},
     selection::{ScrollDirection, TerminalSelection},
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled, nerd_fonts_enabled},
@@ -41,6 +42,7 @@ const EVENT_QUEUE: usize = 1_024;
 const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(75);
 const SELECTION_SCROLL_ROWS: isize = 3;
 const TOAST_DURATION: Duration = Duration::from_secs(2);
+const NOTICE_DURATION: Duration = Duration::from_secs(10);
 
 struct Toast {
     message: String,
@@ -52,6 +54,8 @@ struct InteractionState {
     selection: Option<TerminalSelection>,
     selection_scroll_at: Option<Instant>,
     toast: Option<Toast>,
+    notice_revision: Option<u64>,
+    notice_expires_at: Option<Instant>,
     resizing_sidebar: bool,
 }
 
@@ -60,8 +64,29 @@ impl InteractionState {
         self.selection_scroll_at
             .into_iter()
             .chain(self.toast.as_ref().map(|toast| toast.expires_at))
+            .chain(self.notice_expires_at)
             .map(|deadline| deadline.saturating_duration_since(now))
             .min()
+    }
+
+    fn observe_notice(&mut self, app: &App, now: Instant) {
+        if self.notice_revision != Some(app.notice_revision()) {
+            self.notice_revision = Some(app.notice_revision());
+            self.notice_expires_at = app.notice().map(|_| now + NOTICE_DURATION);
+        }
+    }
+
+    fn dismiss_expired_notice(&mut self, app: &mut App, now: Instant) -> bool {
+        if !self
+            .notice_expires_at
+            .is_some_and(|deadline| deadline <= now)
+        {
+            return false;
+        }
+        self.notice_expires_at = None;
+        app.clear_notice();
+        self.notice_revision = Some(app.notice_revision());
+        true
     }
 
     fn schedule_selection_scroll(&mut self, now: Instant) {
@@ -139,6 +164,17 @@ pub fn run(
     );
     let (events_tx, events) = mpsc::sync_channel(EVENT_QUEUE);
     let embedded_pending = std::sync::Arc::new(AtomicBool::new(false));
+    let embedded_notify: std::sync::Arc<dyn Fn() + Send + Sync> = {
+        let events = events_tx.clone();
+        let pending = embedded_pending.clone();
+        std::sync::Arc::new(move || {
+            if !pending.swap(true, Ordering::AcqRel)
+                && events.try_send(ClientEvent::EmbeddedToolChanged).is_err()
+            {
+                pending.store(false, Ordering::Release);
+            }
+        })
+    };
     let worktrees = WorktreeCreator::new(events_tx.clone());
     let mut browser = BrowserRuntime {
         loader: DirectoryLoader::new(events_tx.clone()),
@@ -148,17 +184,12 @@ pub fn run(
         palette,
         yazi: None,
         embedded_pending: embedded_pending.clone(),
-        embedded_notify: {
-            let events = events_tx.clone();
-            let pending = embedded_pending;
-            std::sync::Arc::new(move || {
-                if !pending.swap(true, Ordering::AcqRel)
-                    && events.try_send(ClientEvent::EmbeddedToolChanged).is_err()
-                {
-                    pending.store(false, Ordering::Release);
-                }
-            })
-        },
+        embedded_notify: embedded_notify.clone(),
+    };
+    let mut review = ReviewRuntime {
+        hunk: None,
+        palette,
+        notify: embedded_notify,
     };
     let (mut agents, snapshot, available_harnesses) = RemoteAgents::connect(
         &socket_path,
@@ -208,13 +239,24 @@ pub fn run(
     'runtime: while app.exit_intent() == ExitIntent::None && connection_failure.is_none() {
         // Tick before drawing so an in-progress selection can scroll even when
         // drag events keep arriving faster than the scroll interval.
-        dirty |= interaction.tick(&mut agents, Instant::now())?;
+        let now = Instant::now();
+        interaction.observe_notice(&app, now);
+        dirty |= interaction.dismiss_expired_notice(&mut app, now);
+        dirty |= interaction.tick(&mut agents, now)?;
+        if let Some(result) = review.poll(now) {
+            finish_hunk_review(&mut app, &mut agents, result)?;
+            dirty = true;
+        }
         if dirty {
             if let Some((id, generation)) = app.mark_selected_seen() {
                 agents.mark_seen(id, generation)?;
             }
             let selected = app.selected_agent_id();
-            let embedded = browser.snapshot();
+            let embedded = if matches!(app.mode(), Mode::Review | Mode::ReviewToolPrefix) {
+                review.snapshot()
+            } else {
+                browser.snapshot()
+            };
             let screen = selected.and_then(|id| agents.screen(id));
             let model = UiModel {
                 app: &app,
@@ -253,7 +295,13 @@ pub fn run(
 
         // Sleep until something actually happens, then absorb everything else already queued so a
         // burst of agent output costs one redraw instead of one redraw per frame.
-        let first = if let Some(timeout) = interaction.next_timeout(Instant::now()) {
+        let now = Instant::now();
+        let timeout = interaction
+            .next_timeout(now)
+            .into_iter()
+            .chain(review.next_timeout(now))
+            .min();
+        let first = if let Some(timeout) = timeout {
             match events.recv_timeout(timeout) {
                 Ok(event) => event,
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -317,6 +365,7 @@ pub fn run(
                         settings: &mut settings_value,
                         events: &events,
                         browser: &mut browser,
+                        review: &mut review,
                         worktrees: &worktrees,
                         host_area,
                     };
@@ -348,6 +397,9 @@ pub fn run(
                 ClientEvent::EmbeddedToolChanged => {
                     browser.embedded_pending.store(false, Ordering::Release);
                     browser.poll_yazi(&mut app);
+                    if let Some(result) = review.poll(Instant::now()) {
+                        finish_hunk_review(&mut app, &mut agents, result)?;
+                    }
                     dirty = true;
                 }
             }
@@ -408,6 +460,11 @@ fn handle_host_event(
                 app.set_notice(format!("could not paste into Yazi: {error}"));
             }
         }
+        HostEvent::Paste(text) if app.mode() == Mode::Review => {
+            if let Err(error) = resources.review.paste(&text) {
+                app.set_notice(format!("could not paste into Hunk: {error}"));
+            }
+        }
         HostEvent::Resize(width, height) => {
             interaction.selection = None;
             interaction.selection_scroll_at = None;
@@ -417,6 +474,12 @@ fn handle_host_event(
             if let Err(error) = resources.browser.resize(area) {
                 app.set_notice(format!("could not resize Yazi: {error}"));
                 resources.browser.force_close(app);
+            }
+            if let Err(error) = resources.review.resize(area) {
+                app.set_notice(format!("could not resize Hunk: {error}"));
+                if let Some(result) = resources.review.force_close() {
+                    finish_hunk_review(app, agents, result)?;
+                }
             }
         }
         HostEvent::Mouse(mouse) => {
@@ -574,6 +637,26 @@ fn handle_key(
                 app.set_notice(format!("could not send input to Yazi: {error}"));
             }
         }
+        Mode::Review if is_management_prefix(key) => app.set_mode(Mode::ReviewToolPrefix),
+        Mode::Review => {
+            if let Err(error) = resources.review.send_key(key) {
+                app.set_notice(format!("could not send input to Hunk: {error}"));
+            }
+        }
+        Mode::ReviewToolPrefix => {
+            if is_management_prefix(key) {
+                if let Err(error) = resources.review.send_literal_prefix() {
+                    app.set_notice(format!("could not send input to Hunk: {error}"));
+                }
+                app.set_mode(Mode::Review);
+            } else if key.code == KeyCode::Char('x') {
+                if let Some(result) = resources.review.force_close() {
+                    finish_hunk_review(app, agents, result)?;
+                }
+            } else {
+                app.set_mode(Mode::Review);
+            }
+        }
         Mode::ToolPrefix => {
             if is_management_prefix(key) {
                 if let Err(error) = resources.browser.send_literal_prefix() {
@@ -618,11 +701,11 @@ fn handle_key(
         Mode::Menu => match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.select_next_menu_item(),
             KeyCode::Char('k') | KeyCode::Up => app.select_previous_menu_item(),
-            KeyCode::Enter => app.open_selected_menu_item(),
+            KeyCode::Enter => activate_menu_item(app, resources),
             KeyCode::Char(digit @ '1'..='9') => {
                 if let Some(item) = MenuItem::ALL.get(digit as usize - '1' as usize) {
                     app.select_menu_item(*item);
-                    app.open_selected_menu_item();
+                    activate_menu_item(app, resources);
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Terminal),
@@ -765,6 +848,7 @@ fn handle_management_command(
             // Show whatever is cached immediately and re-probe behind it.
             agents.request_usage(true)?;
         }
+        ManagementCommand::OpenReview => resources.review.open(app, resources.host_area),
         ManagementCommand::SelectAgent(index) => {
             if app.select_sidebar_index(index) {
                 sync_selection(app, agents)?;
@@ -777,6 +861,38 @@ fn handle_management_command(
         }
     }
     Ok((resize, true))
+}
+
+fn activate_menu_item(app: &mut App, resources: &mut InteractionResources<'_>) {
+    if app.menu_selected() == MenuItem::ReviewChanges {
+        resources.review.open(app, resources.host_area);
+    } else {
+        app.open_selected_menu_item();
+    }
+}
+
+fn finish_hunk_review(
+    app: &mut App,
+    agents: &mut RemoteAgents,
+    result: HunkReviewResult,
+) -> Result<()> {
+    app.close_review();
+    if let Some(prompt) = result.prompt {
+        if app
+            .agents()
+            .iter()
+            .any(|agent| agent.id() == result.target_agent)
+        {
+            agents.show_live(result.target_agent);
+            agents.paste(result.target_agent, prompt)?;
+        } else {
+            app.set_notice("the reviewed agent is no longer available");
+        }
+    }
+    if let Some(error) = result.error {
+        app.set_notice(error);
+    }
+    Ok(())
 }
 
 fn handle_mouse(
@@ -849,6 +965,14 @@ fn handle_mouse(
     if app.mode() == Mode::NewAgent(NewAgentPage::EmbeddedBrowser) {
         if let Err(error) = resources.browser.mouse(mouse, area) {
             app.set_notice(format!("could not send mouse input to Yazi: {error}"));
+            return Ok((false, true));
+        }
+        return Ok((false, false));
+    }
+
+    if app.mode() == Mode::Review {
+        if let Err(error) = resources.review.mouse(mouse, area) {
+            app.set_notice(format!("could not send mouse input to Hunk: {error}"));
             return Ok((false, true));
         }
         return Ok((false, false));
@@ -953,7 +1077,7 @@ fn apply_click_action(
         }
         ui::ClickAction::MenuItem(item) => {
             app.select_menu_item(item);
-            app.open_selected_menu_item();
+            activate_menu_item(app, resources);
             Ok((false, true))
         }
         ui::ClickAction::Next => {
@@ -1052,10 +1176,6 @@ fn apply_click_action(
             save_theme(app, resources.settings_store, resources.settings, 1);
             Ok((false, true))
         }
-        ui::ClickAction::SettingsPrevious => {
-            app.move_settings_tab(-1);
-            Ok((false, true))
-        }
         ui::ClickAction::SettingsNext => {
             app.move_settings_tab(1);
             Ok((false, true))
@@ -1092,6 +1212,30 @@ fn apply_click_action(
         }
         ui::ClickAction::EmbeddedForceClose => {
             resources.browser.force_close(app);
+            Ok((false, true))
+        }
+        ui::ClickAction::ReviewComment => {
+            if let Err(error) = resources.review.send_key(KeyEvent::new(
+                KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::NONE,
+            )) {
+                app.set_notice(format!("could not send input to Hunk: {error}"));
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::ReviewFinish => {
+            if let Err(error) = resources.review.send_key(KeyEvent::new(
+                KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            )) {
+                app.set_notice(format!("could not send input to Hunk: {error}"));
+            }
+            Ok((false, true))
+        }
+        ui::ClickAction::ReviewForceClose => {
+            if let Some(result) = resources.review.force_close() {
+                finish_hunk_review(app, agents, result)?;
+            }
             Ok((false, true))
         }
     }
@@ -1242,6 +1386,7 @@ struct InteractionResources<'a> {
     settings: &'a mut Settings,
     events: &'a mpsc::Receiver<ClientEvent>,
     browser: &'a mut BrowserRuntime,
+    review: &'a mut ReviewRuntime,
     worktrees: &'a WorktreeCreator,
     host_area: Rect,
 }
@@ -1285,6 +1430,138 @@ fn activate_native_browser(app: &mut App, browser: &mut BrowserRuntime) {
         },
         Some(BrowserAction::Load(path)) => browser.load(app, path),
         None => {}
+    }
+}
+
+struct ReviewRuntime {
+    hunk: Option<HunkReview>,
+    palette: Option<TerminalPalette>,
+    notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ReviewRuntime {
+    fn open(&mut self, app: &mut App, area: Rect) {
+        if self.hunk.is_some() {
+            return;
+        }
+        let Some(agent) = app.selected_agent() else {
+            app.set_notice("start an agent before reviewing changes");
+            app.set_mode(Mode::Terminal);
+            return;
+        };
+        let target_agent = agent.id();
+        let directory = agent
+            .git()
+            .map(|git| git.worktree.clone())
+            .or_else(|| agent.working_directory().map(PathBuf::from))
+            .unwrap_or_else(|| agent.launch_directory().to_path_buf());
+        let content = ui::embedded_terminal_area(area);
+        let size = svarm_agent::PtySize {
+            rows: content.height.max(1),
+            cols: content.width.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        match HunkReview::spawn(
+            target_agent,
+            &directory,
+            size,
+            self.palette,
+            self.notify.clone(),
+        ) {
+            Ok(hunk) => {
+                self.hunk = Some(hunk);
+                app.open_review();
+            }
+            Err(HunkLaunchError::NotFound) => {
+                app.set_notice("Hunk is not installed; install it from github.com/modem-dev/hunk")
+            }
+            Err(HunkLaunchError::NotRepository) => {
+                app.set_notice("the selected agent is not working in a Git repository")
+            }
+            Err(HunkLaunchError::NoChanges) => app.set_notice("no changes to review"),
+            Err(HunkLaunchError::Failed(error)) => app.set_notice(error),
+        }
+    }
+
+    fn snapshot(&self) -> Option<TerminalProcessSnapshot> {
+        self.hunk.as_ref().map(HunkReview::snapshot)
+    }
+
+    fn next_timeout(&self, now: Instant) -> Option<Duration> {
+        self.hunk.as_ref().map(|hunk| hunk.next_timeout(now))
+    }
+
+    fn poll(&mut self, now: Instant) -> Option<HunkReviewResult> {
+        let result = self.hunk.as_mut()?.poll(now);
+        if result.is_some() {
+            self.hunk = None;
+        }
+        result
+    }
+
+    fn send_key(&self, key: KeyEvent) -> std::result::Result<(), String> {
+        let Some(hunk) = &self.hunk else {
+            return Ok(());
+        };
+        let snapshot = hunk.snapshot();
+        if let Some(input) = key_input(key)
+            && let Some(bytes) = encode_key(&input, snapshot.modes)
+        {
+            hunk.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn send_literal_prefix(&self) -> std::result::Result<(), String> {
+        if let Some(hunk) = &self.hunk {
+            hunk.send(&[0x02])?;
+        }
+        Ok(())
+    }
+
+    fn paste(&self, text: &str) -> std::result::Result<(), String> {
+        if let Some(hunk) = &self.hunk {
+            let bytes = encode_paste(text, hunk.snapshot().modes);
+            hunk.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn mouse(&self, mouse: MouseEvent, area: Rect) -> std::result::Result<(), String> {
+        let Some(hunk) = &self.hunk else {
+            return Ok(());
+        };
+        let content = ui::embedded_terminal_area(area);
+        if !contains(content, mouse.column, mouse.row) {
+            return Ok(());
+        }
+        let translated = MouseEvent {
+            column: mouse.column - content.x,
+            row: mouse.row - content.y,
+            ..mouse
+        };
+        if let Some(bytes) = encode_mouse(&mouse_input(translated), hunk.snapshot().modes) {
+            hunk.send(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn resize(&self, area: Rect) -> std::result::Result<(), String> {
+        if let Some(hunk) = &self.hunk {
+            let content = ui::embedded_terminal_area(area);
+            hunk.resize(content.height.max(1), content.width.max(1))?;
+        }
+        Ok(())
+    }
+
+    fn force_close(&mut self) -> Option<HunkReviewResult> {
+        let mut hunk = self.hunk.take()?;
+        let error = hunk
+            .stop()
+            .err()
+            .map(|error| format!("could not close Hunk: {error}"));
+        Some(hunk.into_result(error))
     }
 }
 
@@ -1764,6 +2041,30 @@ mod tests {
             KeyCode::Char('b'),
             KeyModifiers::ALT
         )));
+    }
+
+    #[test]
+    fn notices_expire_after_ten_seconds_and_repeated_notices_restart_the_timer() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            Some("warning".into()),
+        );
+        let mut interaction = InteractionState::default();
+        let started_at = Instant::now();
+
+        interaction.observe_notice(&app, started_at);
+        assert!(!interaction.dismiss_expired_notice(&mut app, started_at + Duration::from_secs(9)));
+
+        app.set_notice("warning");
+        let restarted_at = started_at + Duration::from_secs(9);
+        interaction.observe_notice(&app, restarted_at);
+        assert!(
+            !interaction.dismiss_expired_notice(&mut app, restarted_at + Duration::from_secs(9))
+        );
+        assert!(interaction.dismiss_expired_notice(&mut app, restarted_at + NOTICE_DURATION));
+        assert_eq!(app.notice(), None);
     }
 
     #[test]
