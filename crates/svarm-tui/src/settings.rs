@@ -6,15 +6,31 @@ use std::{
 use serde::{Deserialize, Serialize};
 use svarm_agent::AgentKind;
 
-use crate::{app::Checkout, theme::ThemeName};
+use crate::{
+    app::{Checkout, SIDEBAR_DEFAULT_WIDTH},
+    theme::ThemeName,
+};
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeName,
     pub workspaces: Vec<PathBuf>,
     pub last_agent: Option<AgentKind>,
     pub last_checkout: Checkout,
+    pub sidebar_width: u16,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeName::default(),
+            workspaces: Vec::new(),
+            last_agent: None,
+            last_checkout: Checkout::default(),
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+        }
+    }
 }
 
 pub(crate) struct SettingsStore {
@@ -112,6 +128,7 @@ mod tests {
             workspaces: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
             last_agent: Some(AgentKind::Claude),
             last_checkout: Checkout::NewWorktree,
+            sidebar_width: 16,
         };
 
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
@@ -130,6 +147,7 @@ mod tests {
         assert!(settings.workspaces.is_empty());
         assert_eq!(settings.last_agent, None);
         assert_eq!(settings.last_checkout, Checkout::Local);
+        assert_eq!(settings.sidebar_width, SIDEBAR_DEFAULT_WIDTH);
     }
 
     #[test]
@@ -141,6 +159,7 @@ mod tests {
                 .collect(),
             last_agent: Some(AgentKind::Claude),
             last_checkout: Checkout::Local,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
         };
 
         settings.record_successful_launch(
