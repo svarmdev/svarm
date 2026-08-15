@@ -92,8 +92,16 @@ impl AgentKind {
         }
     }
 
-    /// Claude and Grok accept a client-chosen UUID on spawn, so archive/resume can start immediately.
+    /// Claude accepts a client-chosen UUID on spawn, so archive/resume can start immediately.
+    ///
+    /// Grok's `--session-id` only names a *new* conversation and does not bind the TUI to that
+    /// session when the user continues or switches chats, so Grok IDs are observed instead.
     pub const fn preassigns_conversation_id(self) -> bool {
+        matches!(self, Self::Claude)
+    }
+
+    /// Claude and Grok report the live session id on SessionStart via `__conversation-hook`.
+    pub const fn reports_session_id_via_hook(self) -> bool {
         matches!(self, Self::Claude | Self::Grok)
     }
 }
@@ -168,6 +176,8 @@ mod tests {
 
     #[test]
     fn claude_hook_accepts_only_a_valid_session_id() {
+        let previous = std::env::var_os("GROK_SESSION_ID");
+        unsafe { std::env::remove_var("GROK_SESSION_ID") };
         assert_eq!(
             claude_hook_session_id(
                 r#"{"session_id":"019FF1D3-375E-7A72-A176-C47497827E49","source":"clear"}"#,
@@ -184,5 +194,32 @@ mod tests {
         );
         assert_eq!(claude_hook_session_id(r#"{"session_id":"bad"}"#), None);
         assert_eq!(claude_hook_session_id("not json"), None);
+        assert_eq!(
+            claude_hook_session_id(
+                r#"{"hookEventName":"session_start","sessionId":"019FF1D3-375E-7A72-A176-C47497827E49","source":"new"}"#,
+            )
+            .as_deref(),
+            Some("019ff1d3-375e-7a72-a176-c47497827e49")
+        );
+        unsafe {
+            std::env::set_var("GROK_SESSION_ID", "019FF1D3-375E-7A72-A176-C47497827E49");
+        }
+        assert_eq!(
+            claude_hook_session_id("").as_deref(),
+            Some("019ff1d3-375e-7a72-a176-c47497827e49")
+        );
+        match previous {
+            Some(value) => unsafe { std::env::set_var("GROK_SESSION_ID", value) },
+            None => unsafe { std::env::remove_var("GROK_SESSION_ID") },
+        }
+    }
+
+    #[test]
+    fn only_claude_preassigns_a_conversation_id() {
+        assert!(AgentKind::Claude.preassigns_conversation_id());
+        assert!(!AgentKind::Grok.preassigns_conversation_id());
+        assert!(AgentKind::Grok.reports_session_id_via_hook());
+        assert!(AgentKind::Claude.reports_session_id_via_hook());
+        assert!(!AgentKind::Codex.reports_session_id_via_hook());
     }
 }

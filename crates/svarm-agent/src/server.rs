@@ -2774,6 +2774,49 @@ mod tests {
     }
 
     #[test]
+    fn grok_title_chrome_does_not_complete_a_working_turn() {
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let mut session = SessionSnapshot {
+            id: AgentId(1),
+            kind: AgentKind::Grok,
+            launch_directory: cwd,
+            status: SessionStatus::Running,
+            output_generation: 1,
+            read_error: None,
+            exit: None,
+            conversation_id: None,
+        };
+
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process(
+            "\x1b]2;Thinking - Refactor sidebar - grok\x07\x1b[20;1HWaiting for response"
+                .as_bytes(),
+        );
+        let working = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let observed = runtime.observe_with_terminal(session.clone(), Some(&working));
+        assert_eq!(observed.activity, AgentActivity::Working);
+        assert_eq!(observed.completed_generation, 0);
+        runtime.previous.insert(session.id, observed);
+
+        session.output_generation = 2;
+        let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
+        backend.process("\x1b]2;Refactor sidebar - grok\x07\x1b[20;1HType a message...".as_bytes());
+        let flickered = backend.snapshot(CursorStyle::default(), backend.modes(false, false));
+        let observed = runtime.observe_with_terminal(session, Some(&flickered));
+        assert_eq!(observed.activity, AgentActivity::Unknown);
+        assert_eq!(
+            observed.completed_generation, 0,
+            "default grok title chrome must not stamp a Working → Idle completion"
+        );
+        assert_eq!(
+            observed.last_affirmative_activity,
+            Some(AgentActivity::Working)
+        );
+    }
+
+    #[test]
     fn runtime_archives_and_resumes_only_compact_conversation_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();

@@ -62,7 +62,7 @@ impl ConversationTracking {
             kind,
             initial_id,
             signal: kind
-                .preassigns_conversation_id()
+                .reports_session_id_via_hook()
                 .then(ConversationSignal::bind)
                 .transpose()?,
             leader_socket: (kind == AgentKind::Grok)
@@ -158,6 +158,7 @@ pub struct AgentSession {
     conversation_id: Arc<Mutex<Option<String>>>,
     conversation_signal: Option<ConversationSignal>,
     pi_session_probe: Option<Mutex<PiSessionProbe>>,
+    grok_session_probe: Option<Mutex<GrokSessionProbe>>,
     _leader_socket: Option<TempPath>,
 }
 
@@ -214,6 +215,14 @@ impl AgentSession {
                 probe
             })
             .map(Mutex::new);
+        let grok_session_probe = (kind == AgentKind::Grok)
+            .then(|| GrokSessionProbe::new(cwd))
+            .flatten()
+            .map(|mut probe| {
+                probe.current = initial_id.clone();
+                probe
+            })
+            .map(Mutex::new);
         let notify = notify.map(|notify| Arc::new(move || notify(id)) as _);
         let conversation_id = Arc::new(Mutex::new(initial_id));
         let detected_id = conversation_id.clone();
@@ -242,6 +251,7 @@ impl AgentSession {
             conversation_id,
             conversation_signal: signal,
             pi_session_probe,
+            grok_session_probe,
             _leader_socket: leader_socket,
         })
     }
@@ -286,6 +296,17 @@ impl AgentSession {
 
     pub fn snapshot(&self) -> SessionSnapshot {
         if let Some(probe) = &self.pi_session_probe
+            && let Some(id) = probe
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .current_id()
+        {
+            *self
+                .conversation_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+        }
+        if let Some(probe) = &self.grok_session_probe
             && let Some(id) = probe
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
@@ -382,6 +403,114 @@ impl PiSessionProbe {
         }
         self.current.clone()
     }
+}
+
+struct GrokSessionProbe {
+    root: PathBuf,
+    cwd: PathBuf,
+    known: HashSet<String>,
+    current: Option<String>,
+    current_modified: Option<std::time::SystemTime>,
+}
+
+impl GrokSessionProbe {
+    fn new(cwd: &Path) -> Option<Self> {
+        Self::from_root(grok_session_directory()?, cwd)
+    }
+
+    fn from_root(root: PathBuf, cwd: &Path) -> Option<Self> {
+        let known = grok_session_files(&root, cwd)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        Some(Self {
+            root,
+            cwd: cwd.to_owned(),
+            known,
+            current: None,
+            current_modified: None,
+        })
+    }
+
+    fn current_id(&mut self) -> Option<String> {
+        let candidates = grok_session_files(&self.root, &self.cwd);
+        if let Some(current) = &self.current
+            && let Some((_, modified)) = candidates.iter().find(|(id, _)| id == current)
+        {
+            self.current_modified = Some(*modified);
+        }
+
+        let candidate = if self.current.is_none() {
+            candidates
+                .iter()
+                .filter(|(id, _)| !self.known.contains(id))
+                .max_by_key(|(_, modified)| *modified)
+        } else {
+            candidates
+                .iter()
+                .filter(|(id, modified)| {
+                    Some(id) != self.current.as_ref()
+                        && self
+                            .current_modified
+                            .is_none_or(|current| *modified > current)
+                })
+                .max_by_key(|(_, modified)| *modified)
+        };
+        if let Some((id, modified)) = candidate {
+            self.current = Some(id.clone());
+            self.current_modified = Some(*modified);
+        }
+        self.current.clone()
+    }
+}
+
+fn grok_session_directory() -> Option<PathBuf> {
+    grok_home().map(|home| home.join("sessions"))
+}
+
+fn grok_session_files(root: &Path, cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
+    let mut directories = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if crate::recognition::looks_like_uuid(name) {
+                if let Some(session) = grok_session_entry(&path, cwd) {
+                    files.push(session);
+                }
+            } else {
+                directories.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn grok_session_entry(directory: &Path, cwd: &Path) -> Option<(String, std::time::SystemTime)> {
+    let id = directory.file_name()?.to_str()?;
+    crate::recognition::looks_like_uuid(id).then_some(())?;
+    let summary = directory.join("summary.json");
+    let value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&summary).ok()?).ok()?;
+    let session_cwd = value.get("info")?.get("cwd")?.as_str()?;
+    (Path::new(session_cwd) == cwd).then_some(())?;
+    let modified = summary
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Some((id.to_ascii_lowercase(), modified))
 }
 
 fn pi_session_directory() -> Option<PathBuf> {
@@ -492,7 +621,9 @@ pub(crate) fn resume_agent_command(
     let mut command = agent_command(kind, cwd, None)?;
     match kind {
         AgentKind::Codex => command.args(["resume", conversation_id]),
-        AgentKind::Claude | AgentKind::Grok => command.args(["--resume", conversation_id]),
+        AgentKind::Claude => command.args(["--resume", conversation_id]),
+        // Equals form so clap's optional `--resume [<id>]` cannot treat the id as a prompt.
+        AgentKind::Grok => command.arg(format!("--resume={conversation_id}")),
         AgentKind::Pi => command.args(["--session", conversation_id]),
         AgentKind::OpenCode => command.args(["--session", conversation_id]),
     }
@@ -549,25 +680,39 @@ fn ensure_grok_conversation_hook() -> Result<()> {
 fn write_grok_conversation_hook(home: &Path) -> Result<()> {
     let directory = home.join("hooks");
     let path = directory.join("svarm-conversation.json");
+    let body = grok_conversation_hook_body()?;
     if path.exists() {
-        return Ok(());
+        let existing = std::fs::read(&path)?;
+        if !existing
+            .windows(b"__conversation-hook".len())
+            .any(|window| window == b"__conversation-hook")
+        {
+            return Ok(());
+        }
+        if existing == body {
+            return Ok(());
+        }
     }
     std::fs::create_dir_all(&directory)?;
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+fn grok_conversation_hook_body() -> Result<Vec<u8>> {
     let executable = std::env::current_exe()?;
     let command = format!(
         "{} __conversation-hook",
         shell_quote(&executable.to_string_lossy())
     );
-    let body = serde_json::json!({
+    // Grok's SessionStart source for a new chat is `new`, not Claude's `startup`.
+    // Omit the matcher so resume/clear/compact/new all report the live session id.
+    Ok(serde_json::to_vec_pretty(&serde_json::json!({
         "hooks": {
             "SessionStart": [{
-                "matcher": "startup|resume|clear|compact",
                 "hooks": [{ "type": "command", "command": command }]
             }]
         }
-    });
-    std::fs::write(path, serde_json::to_vec_pretty(&body)?)?;
-    Ok(())
+    }))?)
 }
 
 fn claude_hook_settings() -> Result<String> {
@@ -712,9 +857,14 @@ mod tests {
 
         let grok = resume_agent_command(AgentKind::Grok, &cwd, id).unwrap();
         let grok_args = grok.get_argv();
-        assert!(grok_args.windows(2).any(|args| args == ["--resume", id]));
+        assert!(
+            grok_args
+                .iter()
+                .any(|arg| arg == format!("--resume={id}").as_str())
+        );
         assert!(grok_args.iter().any(|arg| arg == "--fullscreen"));
         assert!(!grok_args.iter().any(|arg| arg == "--session-id"));
+        assert!(!grok_args.iter().any(|arg| arg == "--resume"));
 
         let pi = resume_agent_command(AgentKind::Pi, &cwd, id).unwrap();
         assert!(
@@ -797,6 +947,10 @@ mod tests {
     #[test]
     fn grok_isolates_its_leader_socket() {
         let tracking = ConversationTracking::new(AgentKind::Grok, None).unwrap();
+        assert!(
+            tracking.signal.is_some(),
+            "Grok still reports session ids over the conversation hook"
+        );
         let cwd = std::env::current_dir().unwrap();
         let mut command = agent_command(AgentKind::Grok, &cwd, None).unwrap();
         tracking.configure(&mut command);
@@ -824,11 +978,73 @@ mod tests {
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(first.contains("SessionStart"));
         assert!(first.contains("__conversation-hook"));
-        assert!(first.contains("startup|resume|clear|compact"));
+        assert!(
+            !first.contains("\"matcher\""),
+            "Grok SessionStart uses source=new, so the hook must not filter Claude sources"
+        );
         std::fs::write(&path, "user-owned").unwrap();
         write_grok_conversation_hook(&home).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "user-owned");
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn grok_hook_file_refreshes_a_stale_svarm_matcher() {
+        let home = std::env::temp_dir().join(format!(
+            "svarm-grok-hooks-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = home.join("hooks/svarm-conversation.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command":"svarm __conversation-hook"}]}]}}"#,
+        )
+        .unwrap();
+        write_grok_conversation_hook(&home).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("__conversation-hook"));
+        assert!(!updated.contains("\"matcher\""));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn grok_session_probe_picks_up_a_new_session_for_the_launch_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "svarm-grok-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = PathBuf::from("/tmp/project");
+        let other = PathBuf::from("/tmp/other");
+        let known = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let fresh = "129ff1d3-375e-7a72-a176-c47497827e49";
+        write_grok_summary(&root, known, &cwd);
+        let mut probe = GrokSessionProbe::from_root(root.clone(), &cwd).unwrap();
+        assert_eq!(probe.current_id(), None);
+
+        write_grok_summary(&root, fresh, &cwd);
+        write_grok_summary(&root, "229ff1d3-375e-7a72-a176-c47497827e49", &other);
+        assert_eq!(probe.current_id().as_deref(), Some(fresh));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_grok_summary(root: &Path, id: &str, cwd: &Path) {
+        let encoded = cwd.to_string_lossy().replace('/', "%2F");
+        let directory = root.join(encoded).join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("summary.json"),
+            format!(r#"{{"info":{{"id":"{id}","cwd":"{}"}}}}"#, cwd.display()),
+        )
+        .unwrap();
     }
 
     #[test]
