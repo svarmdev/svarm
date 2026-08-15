@@ -529,6 +529,37 @@ fn run_generator(mut command: Command, stdin: Option<&str>) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// Collapse a submitted line into a prompt that can name a conversation.
+///
+/// Slash commands are skipped so setup lines such as `/new`, `/model opus`, and `/effort high`
+/// do not become titles. `/goal …` is kept because the rest of the line is the work itself.
+pub(crate) fn naming_prompt(raw: &str) -> Option<String> {
+    let prompt = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if prompt.is_empty() {
+        return None;
+    }
+    if prompt.starts_with('/') && !is_goal_prompt(&prompt) {
+        return None;
+    }
+    Some(prompt)
+}
+
+/// `/goal` carries the work on the same line. Bare `/goal` and lookalikes such as `/goals` do not.
+fn is_goal_prompt(prompt: &str) -> bool {
+    let rest = match prompt.get(..5) {
+        Some(head) if head.eq_ignore_ascii_case("/goal") => &prompt[5..],
+        _ => return false,
+    };
+    let rest = if let Some(rest) = rest.strip_prefix(':') {
+        rest
+    } else if rest.starts_with(char::is_whitespace) {
+        rest
+    } else {
+        return false;
+    };
+    !rest.trim().is_empty()
+}
+
 /// Build the message log handed to the generator.
 ///
 /// The first message states what the work was started for, so it is always kept; the remaining
@@ -702,6 +733,32 @@ mod tests {
     #[test]
     fn no_messages_produce_no_log() {
         assert!(prompt_log(&[], 1500).is_empty());
+    }
+
+    #[test]
+    fn slash_commands_are_not_naming_prompts_unless_they_are_a_goal() {
+        assert_eq!(naming_prompt(""), None);
+        assert_eq!(naming_prompt("   \n\t "), None);
+        assert_eq!(naming_prompt("/new"), None);
+        assert_eq!(naming_prompt("/status"), None);
+        assert_eq!(naming_prompt("/model opus"), None);
+        assert_eq!(naming_prompt("/effort high"), None);
+        assert_eq!(naming_prompt("/quit"), None);
+        assert_eq!(naming_prompt("/exit"), None);
+        assert_eq!(naming_prompt("/goal"), None);
+        assert_eq!(naming_prompt("/goals ship the parser"), None);
+        assert_eq!(
+            naming_prompt("  /goal   implement   the sidebar  ").as_deref(),
+            Some("/goal implement the sidebar")
+        );
+        assert_eq!(
+            naming_prompt("/Goal: add auth").as_deref(),
+            Some("/Goal: add auth")
+        );
+        assert_eq!(
+            naming_prompt("refactor the sidebar").as_deref(),
+            Some("refactor the sidebar")
+        );
     }
 
     #[test]
