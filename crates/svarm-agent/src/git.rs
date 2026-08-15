@@ -1,9 +1,14 @@
 use std::{
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{Receiver, SyncSender, sync_channel},
     thread,
 };
+
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use crate::protocol::GitContext;
 
@@ -32,6 +37,7 @@ pub(crate) fn context(path: &Path) -> Option<GitContext> {
     {
         (context.additions, context.deletions) = parse_diff(&output);
     }
+    context.additions = context.additions.saturating_add(untracked_additions(path));
     if let Some(output) = git_output(
         path,
         &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
@@ -141,6 +147,54 @@ fn parse_diff(output: &[u8]) -> (u64, u64) {
         })
 }
 
+fn untracked_additions(path: &Path) -> u64 {
+    let Some(output) = git_output(
+        path,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    ) else {
+        return 0;
+    };
+    output
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(git_path)
+        .filter_map(|relative| text_lines(&path.join(relative)))
+        .fold(0_u64, u64::saturating_add)
+}
+
+#[cfg(unix)]
+fn git_path(name: &[u8]) -> Option<PathBuf> {
+    Some(OsString::from_vec(name.to_vec()).into())
+}
+
+#[cfg(not(unix))]
+fn git_path(name: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(name.to_vec()).ok().map(PathBuf::from)
+}
+
+fn text_lines(path: &Path) -> Option<u64> {
+    if !path.symlink_metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut lines = 0_u64;
+    let mut last = None;
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        if bytes.contains(&0) {
+            return None;
+        }
+        lines = lines.saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count() as u64);
+        last = bytes.last().copied();
+    }
+    Some(lines.saturating_add(u64::from(last.is_some_and(|byte| byte != b'\n'))))
+}
+
 fn parse_tracking(output: &[u8]) -> (Option<u64>, Option<u64>) {
     let mut counts = output.split(|byte| byte.is_ascii_whitespace());
     let ahead = counts
@@ -247,11 +301,23 @@ mod tests {
             ],
         );
         fs::write(root.join("tracked.txt"), "new\nmore\n").unwrap();
+        fs::write(root.join("untracked.txt"), "one\ntwo\nthree").unwrap();
+        fs::write(root.join("binary.dat"), b"not text\0more").unwrap();
+        fs::write(root.join(".git/info/exclude"), "ignored.txt\n").unwrap();
+        fs::write(root.join("ignored.txt"), "ignored\nlines\n").unwrap();
         let feature_context = context(&root).unwrap();
         assert_eq!(feature_context.branch, "feature/sidebar");
         assert_eq!(
             (feature_context.additions, feature_context.deletions),
-            (2, 1)
+            (5, 1)
+        );
+
+        run(&root, &["add", "untracked.txt"]);
+        let staged_context = context(&root).unwrap();
+        assert_eq!(
+            (staged_context.additions, staged_context.deletions),
+            (5, 1),
+            "staged files must not be counted twice"
         );
 
         run(
