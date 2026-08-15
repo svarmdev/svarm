@@ -95,7 +95,9 @@ pub fn run_server() -> Result<()> {
     }
     let process_id = std::process::id();
     let result = run_foreground_ready(
-        ServerConfig::new(paths.socket.clone(), env!("CARGO_PKG_VERSION")).with_signal_handling(),
+        ServerConfig::new(paths.socket.clone(), env!("CARGO_PKG_VERSION"))
+            .with_conversation_directory(paths.conversation_directory.clone())
+            .with_signal_handling(),
         || {
             paths
                 .write_pid(process_id)
