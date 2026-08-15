@@ -15,6 +15,7 @@ use std::{
 
 use crate::{
     AgentId, AgentKind, AgentManager, Result as AgentResult, SessionSnapshot, SessionStatus,
+    conversation_store::{ActiveConversation, ConversationIndex, ConversationStore},
     framing::{read_frame, write_frame},
     git,
     history::ConversationHistory,
@@ -47,6 +48,7 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub application_version: String,
+    conversation_directory: Option<PathBuf>,
     handle_signals: bool,
     #[cfg(test)]
     test_agent_command: Option<(String, Vec<String>)>,
@@ -57,6 +59,7 @@ impl ServerConfig {
         Self {
             socket_path,
             application_version: application_version.into(),
+            conversation_directory: None,
             handle_signals: false,
             #[cfg(test)]
             test_agent_command: None,
@@ -65,6 +68,11 @@ impl ServerConfig {
 
     pub const fn with_signal_handling(mut self) -> Self {
         self.handle_signals = true;
+        self
+    }
+
+    pub fn with_conversation_directory(mut self, directory: PathBuf) -> Self {
+        self.conversation_directory = Some(directory);
         self
     }
 
@@ -527,6 +535,16 @@ impl SessionRuntime {
         }
     }
 
+    fn restore(
+        state: ServerSessionState,
+        wake: Option<crate::session::OutputNotifier>,
+        archived: Vec<ArchivedConversation>,
+    ) -> Self {
+        let mut runtime = Self::new(state, wake);
+        runtime.archived = archived;
+        runtime
+    }
+
     fn spawn(
         &mut self,
         kind: AgentKind,
@@ -698,6 +716,31 @@ impl SessionRuntime {
             agents,
             archived: self.archived.clone(),
         }
+    }
+
+    fn conversation_index(&self) -> ConversationIndex {
+        let active = self
+            .agents
+            .agent_ids()
+            .iter()
+            .filter_map(|id| {
+                let observed = self.previous.get(id)?;
+                let conversation_id = observed.session.conversation_id.clone();
+                let title = self
+                    .input_drafts
+                    .get(id)
+                    .and_then(InputDraft::title)
+                    .map(str::to_owned)
+                    .or_else(|| observed.conversation_title.clone());
+                (conversation_id.is_some() || title.is_some()).then_some(ActiveConversation {
+                    conversation_id,
+                    title,
+                    kind: observed.session.kind,
+                    launch_directory: observed.session.launch_directory.clone(),
+                })
+            })
+            .collect();
+        ConversationIndex::new(self.state.id(), active, self.archived.clone())
     }
 
     fn agent_snapshot(&self, snapshot: SessionSnapshot) -> AgentSnapshot {
@@ -1360,6 +1403,7 @@ struct Server {
     output_wake: Arc<OutputWake>,
     stopping: bool,
     empty_since: Option<Instant>,
+    conversation_store: Option<ConversationStore>,
     usage: crate::usage::UsageCache,
 }
 
@@ -1372,6 +1416,28 @@ impl Server {
             input: input_tx.clone(),
             pending: AtomicBool::new(false),
         });
+        let (conversation_store, restored) = match config.conversation_directory.clone() {
+            Some(directory) => {
+                let (store, indexes) = ConversationStore::open(directory)?;
+                (Some(store), indexes)
+            }
+            None => (None, Vec::new()),
+        };
+        let mut sessions = BTreeMap::new();
+        let mut next_session_id = 1;
+        for index in restored {
+            next_session_id = next_session_id.max(index.session_id.0.saturating_add(1));
+            let state = ServerSessionState::new(index.session_id, 24, 80, None, started_ms)
+                .map_err(|error| error.message)?;
+            sessions.insert(
+                index.session_id,
+                SessionRuntime::restore(
+                    state,
+                    Some(output_wake.notifier()),
+                    index.restored_conversations(),
+                ),
+            );
+        }
         Ok(Self {
             config,
             listener,
@@ -1379,17 +1445,31 @@ impl Server {
             started_ms,
             instance_id: ServerInstanceId(format!("{:x}-{:x}", std::process::id(), started_ms)),
             connections: BTreeMap::new(),
-            sessions: BTreeMap::new(),
+            sessions,
             next_connection_id: 1,
-            next_session_id: 1,
+            next_session_id,
             next_token: 1,
             input_tx,
             input_rx,
             output_wake,
             stopping: false,
             empty_since: Some(Instant::now()),
+            conversation_store,
             usage: crate::usage::UsageCache::from_environment(),
         })
+    }
+
+    fn persist_conversations(&mut self) {
+        let indexes = self
+            .sessions
+            .values()
+            .map(SessionRuntime::conversation_index)
+            .collect();
+        if let Some(store) = &mut self.conversation_store
+            && let Err(error) = store.sync(indexes)
+        {
+            eprintln!("could not persist conversation index: {error}");
+        }
     }
 
     /// Providers the interface can offer usage for, recomputed rather than cached because a
@@ -1465,6 +1545,7 @@ impl Server {
     }
 
     fn begin_shutdown(&mut self) {
+        self.persist_conversations();
         let connections = self.connections.keys().copied().collect::<Vec<_>>();
         for connection_id in connections {
             self.send_event(connection_id, Event::ServerStopping);
@@ -1535,8 +1616,12 @@ impl Server {
             );
             return;
         };
+        let preserve_conversations = matches!(&request, Request::StopServer { .. });
         match self.apply_request(id, request) {
             Ok(outcome) => {
+                if !preserve_conversations {
+                    self.persist_conversations();
+                }
                 self.send_response(id, request_id, outcome.response);
                 for (target, event) in outcome.events {
                     self.send_event(target, event);
@@ -1852,6 +1937,7 @@ impl Server {
             }
             Request::StopServer { confirmed } => {
                 require_confirmation(confirmed)?;
+                self.persist_conversations();
                 let session_count = self.sessions.len();
                 let agent_count = self
                     .sessions
@@ -2162,10 +2248,12 @@ impl Server {
                 }
             }
         }
+        self.persist_conversations();
     }
 
     fn disconnect(&mut self, id: ConnectionId) {
         self.remove_connection(id, true);
+        self.persist_conversations();
     }
 
     fn disconnect_after_flush(&mut self, id: ConnectionId) {
@@ -2309,6 +2397,9 @@ impl Server {
     }
 
     fn finish_shutdown(&mut self) {
+        if !self.sessions.is_empty() {
+            self.persist_conversations();
+        }
         for runtime in self.sessions.values_mut() {
             runtime.state.stop();
             let _ = runtime.agents.stop_all();
@@ -3010,6 +3101,104 @@ mod tests {
             Some("Keep this title")
         );
         runtime.agents.stop_all();
+    }
+
+    #[test]
+    fn server_restart_restores_active_conversations_as_archived() {
+        let directory = temp_dir();
+        let conversation_directory = directory.join("conversations");
+        let cwd = std::env::current_dir().unwrap();
+        let state = ServerSessionState::new(SessionId(7), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(directory.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", "sleep 60"]);
+        let snapshot = runtime.spawn(AgentKind::Claude, &cwd, 0, &config).unwrap();
+        runtime.record_paste(snapshot.id, "Restore this conversation\n");
+        let partial = runtime.conversation_index();
+        assert_eq!(partial.active.len(), 1);
+        assert_eq!(partial.active[0].conversation_id, None);
+        assert_eq!(
+            partial.active[0].title.as_deref(),
+            Some("Restore this conversation")
+        );
+        runtime
+            .previous
+            .get_mut(&snapshot.id)
+            .unwrap()
+            .session
+            .conversation_id = Some("019ff1d3-375e-7a72-a176-c47497827e49".into());
+        let expected = ArchivedConversation {
+            conversation_id: "019ff1d3-375e-7a72-a176-c47497827e49".into(),
+            title: "Restore this conversation".into(),
+            kind: AgentKind::Claude,
+            launch_directory: cwd,
+        };
+
+        let (mut store, _) = ConversationStore::open(conversation_directory.clone()).unwrap();
+        store.sync(vec![runtime.conversation_index()]).unwrap();
+        drop(store);
+        runtime.agents.stop_all();
+
+        let socket = directory.join("server.sock");
+        let server = Server::new(
+            ServerConfig::new(socket, "test").with_conversation_directory(conversation_directory),
+        )
+        .unwrap();
+        let restored = server.sessions[&SessionId(7)].snapshot();
+        assert!(restored.agents.is_empty());
+        assert_eq!(restored.archived, vec![expected]);
+        assert_eq!(server.next_session_id, 8);
+
+        drop(server);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_server_stop_keeps_the_conversation_index() {
+        let directory = temp_dir();
+        let conversation_directory = directory.join("conversations");
+        let expected = ArchivedConversation {
+            conversation_id: "019ff1d3-375e-7a72-a176-c47497827e49".into(),
+            title: "Survive server stop".into(),
+            kind: AgentKind::Codex,
+            launch_directory: directory.clone(),
+        };
+        let (mut store, _) = ConversationStore::open(conversation_directory.clone()).unwrap();
+        store
+            .sync(vec![ConversationIndex::new(
+                SessionId(3),
+                Vec::new(),
+                vec![expected.clone()],
+            )])
+            .unwrap();
+        drop(store);
+
+        let socket = directory.join("server.sock");
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            run_foreground(
+                ServerConfig::new(server_socket, "test")
+                    .with_conversation_directory(conversation_directory),
+            )
+            .unwrap();
+        });
+        let mut control = Client::connect(&socket, ConnectionRole::Control);
+        let (_, response) = control.request(Request::StopServer { confirmed: true });
+        assert!(matches!(response, Response::Stopped(_)));
+        drop(control);
+        server.join().unwrap();
+
+        let (_, restored) = ConversationStore::open(directory.join("conversations")).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored
+                .into_iter()
+                .next()
+                .unwrap()
+                .restored_conversations(),
+            vec![expected]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

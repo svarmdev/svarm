@@ -14,6 +14,10 @@ use svarm_agent::{
 
 use crate::theme::ThemeName;
 
+pub const SIDEBAR_MIN_WIDTH: u16 = 3;
+pub const SIDEBAR_DEFAULT_WIDTH: u16 = 28;
+pub const SIDEBAR_MAX_WIDTH: u16 = 48;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum Mode {
     #[default]
@@ -479,6 +483,7 @@ pub(crate) struct App {
     sidebar_scroll: Option<usize>,
     mode: Mode,
     sidebar_visible: bool,
+    sidebar_width: u16,
     menu_selected: MenuItem,
     theme: ThemeName,
     settings_tab: SettingsTab,
@@ -508,6 +513,7 @@ impl App {
             sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             menu_selected: MenuItem::default(),
             theme,
             settings_tab: SettingsTab::default(),
@@ -544,6 +550,7 @@ impl App {
             sidebar_scroll: None,
             mode: Mode::Terminal,
             sidebar_visible: true,
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             menu_selected: MenuItem::default(),
             theme,
             settings_tab: SettingsTab::default(),
@@ -761,14 +768,17 @@ impl App {
         }
     }
 
-    pub fn scroll_sidebar(&mut self, rows: isize, visible: usize) {
-        let max = self.sidebar_content_height().saturating_sub(visible.max(1));
+    pub fn scroll_sidebar(&mut self, rows: isize, visible: usize, card_height: usize) {
+        let card_height = card_height.max(1);
+        let max = self
+            .sidebar_content_height(card_height)
+            .saturating_sub(visible.max(1));
         let current = self.sidebar_scroll.unwrap_or_else(|| {
-            (self.selected * 3)
-                .saturating_sub(visible.saturating_sub(3))
+            (self.selected * card_height)
+                .saturating_sub(visible.saturating_sub(card_height))
                 .min(max)
         });
-        let rows = rows.saturating_mul(3);
+        let rows = rows.saturating_mul(card_height as isize);
         self.sidebar_scroll = Some(if rows >= 0 {
             current.saturating_add(rows as usize).min(max)
         } else {
@@ -817,6 +827,10 @@ impl App {
         self.sidebar_visible = true;
     }
 
+    pub fn set_sidebar_width(&mut self, width: u16) {
+        self.sidebar_width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    }
+
     pub fn request_detach(&mut self) {
         self.exit_intent = ExitIntent::Detach;
     }
@@ -850,10 +864,13 @@ impl App {
         &self.archived
     }
 
-    pub fn sidebar_content_height(&self) -> usize {
-        self.agents.len() * 3
+    pub fn sidebar_content_height(&self, card_height: usize) -> usize {
+        let card_height = card_height.max(1);
+        self.agents.len() * card_height
             + if self.archived.is_empty() {
                 0
+            } else if card_height == 1 {
+                self.archived.len()
             } else {
                 1 + self.archived.len()
             }
@@ -954,6 +971,10 @@ impl App {
 
     pub const fn sidebar_visible(&self) -> bool {
         self.sidebar_visible
+    }
+
+    pub const fn sidebar_width(&self) -> u16 {
+        self.sidebar_width
     }
 
     #[cfg(test)]
@@ -1473,13 +1494,30 @@ mod tests {
             app.add_agent(snapshot(id, 0));
         }
 
-        app.scroll_sidebar(-1, 7);
+        app.scroll_sidebar(-1, 7, 3);
         assert_eq!(app.sidebar_scroll(), Some(14));
-        app.scroll_sidebar(99, 7);
+        app.scroll_sidebar(99, 7, 3);
         assert_eq!(app.sidebar_scroll(), Some(17));
 
         app.select_previous();
         assert_eq!(app.sidebar_scroll(), None);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_to_the_icon_rail_and_a_usable_maximum() {
+        let mut app = app();
+        assert_eq!(app.sidebar_width(), SIDEBAR_DEFAULT_WIDTH);
+        app.set_sidebar_width(0);
+        assert_eq!(app.sidebar_width(), SIDEBAR_MIN_WIDTH);
+        app.set_sidebar_width(u16::MAX);
+        assert_eq!(app.sidebar_width(), SIDEBAR_MAX_WIDTH);
+        app.set_sidebar_width(16);
+        assert_eq!(app.sidebar_width(), 16);
+        assert_eq!(app.sidebar_content_height(1), 0);
+        app.add_agent(snapshot(1, 0));
+        app.add_agent(snapshot(2, 0));
+        assert_eq!(app.sidebar_content_height(1), 2);
+        assert_eq!(app.sidebar_content_height(3), 6);
     }
 
     #[test]
