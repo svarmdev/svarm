@@ -38,9 +38,9 @@ Do not add another crate merely to enforce a conceptual layer. Prefer a focused 
 
 ## TUI modal sizes
 
-- **Compact — 64x12.** Short forms and pickers, including the new-agent flow.
-- **Standard — 72x18.** Confirmations, settings, and help.
-- **Large — responsive, capped at 100x30.** Content-heavy or embedded interactive views, currently the native filesystem browser and Yazi; leave 2 rows and 4 columns around it.
+- **Compact — 50% x 40%.** Short forms and pickers, including the new-agent flow.
+- **Standard — 60% x 50%.** Confirmations and settings.
+- **Large — terminal minus 4 columns and 2 rows.** Content-heavy or embedded interactive views, including keybind help, the native filesystem browser, Yazi, and diff review.
 
 Always center and clamp modals to the terminal. Every centered modal must pass one of these tiers to `render_dialog`; never pass raw dimensions or a precomputed `Rect`. The sidebar-anchored menu popover and full-screen startup chooser are not modals. Add another tier only when content demonstrably cannot fit an existing one at 80x24.
 

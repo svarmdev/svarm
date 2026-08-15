@@ -24,10 +24,6 @@ use svarm_agent::{
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
-const COMPACT_MODAL_WIDTH: u16 = 64;
-const COMPACT_MODAL_HEIGHT: u16 = 12;
-const STANDARD_MODAL_WIDTH: u16 = 72;
-const STANDARD_MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = SIDEBAR_DEFAULT_WIDTH;
 const AGENT_CARD_HEIGHT: u16 = 3;
 const COLLAPSED_CARD_HEIGHT: u16 = 1;
@@ -73,11 +69,19 @@ enum ModalSize {
 impl ModalSize {
     fn area(self, terminal: Rect) -> Rect {
         match self {
-            Self::Compact => centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, terminal),
-            Self::Standard => centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, terminal),
+            Self::Compact => centered_rect(
+                terminal.width.saturating_mul(50) / 100,
+                terminal.height.saturating_mul(40) / 100,
+                terminal,
+            ),
+            Self::Standard => centered_rect(
+                terminal.width.saturating_mul(60) / 100,
+                terminal.height.saturating_mul(50) / 100,
+                terminal,
+            ),
             Self::Large => centered_rect(
-                terminal.width.saturating_sub(4).min(100),
-                terminal.height.saturating_sub(2).min(30),
+                terminal.width.saturating_sub(4),
+                terminal.height.saturating_sub(2),
                 terminal,
             ),
         }
@@ -121,7 +125,6 @@ pub(crate) enum ClickAction {
     NativeBrowserParent,
     ThemePrevious,
     ThemeNext,
-    SettingsPrevious,
     SettingsNext,
     SettingsTab(SettingsTab),
     UsageNext,
@@ -130,6 +133,9 @@ pub(crate) enum ClickAction {
     EmbeddedAccept,
     EmbeddedCancel,
     EmbeddedForceClose,
+    ReviewComment,
+    ReviewFinish,
+    ReviewForceClose,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,14 +191,6 @@ const SESSION_HINTS: &[SessionActionHint] = &[
 
 const FORM_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[j] next",
-        action: ClickAction::Next,
-    },
-    ActionHint {
-        text: "[k] previous",
-        action: ClickAction::Previous,
-    },
-    ActionHint {
         text: "[Enter] open",
         action: ClickAction::Confirm,
     },
@@ -211,14 +209,6 @@ const WORKSPACE_HINTS: &[ActionHint] = &[
         action: ClickAction::BrowseWorkspaces,
     },
     ActionHint {
-        text: "[j] next",
-        action: ClickAction::Next,
-    },
-    ActionHint {
-        text: "[k] previous",
-        action: ClickAction::Previous,
-    },
-    ActionHint {
         text: "[Esc] back",
         action: ClickAction::Cancel,
     },
@@ -227,14 +217,6 @@ const LOCATION_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[Enter] use",
         action: ClickAction::Confirm,
-    },
-    ActionHint {
-        text: "[j] next",
-        action: ClickAction::Next,
-    },
-    ActionHint {
-        text: "[k] previous",
-        action: ClickAction::Previous,
     },
     ActionHint {
         text: "[Esc] back",
@@ -249,14 +231,6 @@ const AGENT_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[Enter] use",
         action: ClickAction::Confirm,
-    },
-    ActionHint {
-        text: "[j] next",
-        action: ClickAction::Next,
-    },
-    ActionHint {
-        text: "[k] previous",
-        action: ClickAction::Previous,
     },
     ActionHint {
         text: "[Esc] back",
@@ -307,14 +281,6 @@ const STOP_HINTS: &[ActionHint] = &[
 ];
 const RESUME_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[j] next",
-        action: ClickAction::Next,
-    },
-    ActionHint {
-        text: "[k] previous",
-        action: ClickAction::Previous,
-    },
-    ActionHint {
         text: "[y] Reactivate",
         action: ClickAction::Confirm,
     },
@@ -333,20 +299,16 @@ const BACK_HINTS: &[ActionHint] = &[ActionHint {
 }];
 const SETTINGS_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[←/h] previous",
+        text: "[h] prev",
         action: ClickAction::ThemePrevious,
     },
     ActionHint {
-        text: "[→/l] next",
+        text: "[l] next",
         action: ClickAction::ThemeNext,
     },
     ActionHint {
-        text: "[Tab] next tab",
+        text: "[Tab] tab",
         action: ClickAction::SettingsNext,
-    },
-    ActionHint {
-        text: "[S-Tab] previous tab",
-        action: ClickAction::SettingsPrevious,
     },
     ActionHint {
         text: "[Esc] back",
@@ -355,12 +317,8 @@ const SETTINGS_HINTS: &[ActionHint] = &[
 ];
 const HARNESS_SETTINGS_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[Tab] next tab",
+        text: "[Tab] tab",
         action: ClickAction::SettingsNext,
-    },
-    ActionHint {
-        text: "[S-Tab] previous tab",
-        action: ClickAction::SettingsPrevious,
     },
     ActionHint {
         text: "[Esc] back",
@@ -369,7 +327,7 @@ const HARNESS_SETTINGS_HINTS: &[ActionHint] = &[
 ];
 const USAGE_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[Tab] next tab",
+        text: "[Tab] tab",
         action: ClickAction::UsageNext,
     },
     ActionHint {
@@ -393,6 +351,20 @@ const EMBEDDED_HINTS: &[ActionHint] = &[
     ActionHint {
         text: "[Ctrl+B x] force close",
         action: ClickAction::EmbeddedForceClose,
+    },
+];
+const REVIEW_HINTS: &[ActionHint] = &[
+    ActionHint {
+        text: "[c] comment",
+        action: ClickAction::ReviewComment,
+    },
+    ActionHint {
+        text: "[q] finish and paste comments",
+        action: ClickAction::ReviewFinish,
+    },
+    ActionHint {
+        text: "[Ctrl+B x] force close",
+        action: ClickAction::ReviewForceClose,
     },
 ];
 
@@ -464,6 +436,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         }
         Mode::NewAgent(NewAgentPage::EmbeddedBrowser) | Mode::ToolPrefix => {
             render_embedded_browser(frame, model.embedded, theme, hovered)
+        }
+        Mode::Review | Mode::ReviewToolPrefix => {
+            render_hunk_review(frame, model.embedded, theme, hovered)
         }
         Mode::ConfirmClose => {
             render_confirmation(frame, theme, "Close agent?", "Close this agent?", hovered)
@@ -791,10 +766,16 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
     }
 
     let sidebar_width = layout_sidebar_width(app, area);
+    let pointer_over_modal = match app.mode() {
+        Mode::Keybinds => contains(ModalSize::Large.area(area), column, row),
+        Mode::Settings | Mode::Usage => contains(ModalSize::Standard.area(area), column, row),
+        _ => false,
+    };
     if matches!(
         app.mode(),
         Mode::Terminal | Mode::Menu | Mode::Keybinds | Mode::Settings | Mode::Usage
-    ) {
+    ) && !pointer_over_modal
+    {
         if resize_handle_area(app, area).is_some_and(|handle| contains(handle, column, row)) {
             return Some(ClickAction::ResizeSidebar);
         }
@@ -864,7 +845,7 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
             if !contains(inner, column, row) {
                 return None;
             }
-            let visible = 7;
+            let visible = compact_list_capacity(area);
             let start = state.selected_workspace.saturating_sub(visible - 1);
             let count = state.workspaces.len().saturating_sub(start).min(visible);
             let line = usize::from(row - inner.y);
@@ -903,14 +884,21 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 .flatten()
         }
         Mode::NewAgent(NewAgentPage::Agents) => {
+            let state = app.new_agent()?;
             let inner = dialog_inner(ModalSize::Compact, area);
             if !contains(inner, column, row) {
                 return None;
             }
-            let count = app.available_harnesses().len();
+            let visible = compact_list_capacity(area);
+            let start = state.selected_agent.saturating_sub(visible - 1);
+            let count = app
+                .available_harnesses()
+                .len()
+                .saturating_sub(start)
+                .min(visible);
             let line = usize::from(row - inner.y);
             if (1..=count).contains(&line) {
-                return Some(ClickAction::AgentKind(line - 1));
+                return Some(ClickAction::AgentKind(start + line - 1));
             }
             (line == if count == 0 { 3 } else { count + 2 })
                 .then(|| hint_at(AGENT_HINTS, inner.x, column))
@@ -942,6 +930,13 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 .then(|| hint_at(EMBEDDED_HINTS, modal.x + 1, column))
                 .flatten()
         }
+        Mode::Review | Mode::ReviewToolPrefix => {
+            let modal = embedded_modal_area(area);
+            let footer_y = modal.bottom().saturating_sub(2);
+            (row == footer_y)
+                .then(|| hint_at(REVIEW_HINTS, modal.x + 1, column))
+                .flatten()
+        }
         Mode::ConfirmClose | Mode::ConfirmArchive => {
             let inner = dialog_inner(ModalSize::Standard, area);
             (row == inner.y + 3 && contains(inner, column, row))
@@ -967,7 +962,7 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 .flatten()
         }
         Mode::Keybinds => {
-            let inner = dialog_inner(ModalSize::Standard, area);
+            let inner = dialog_inner(ModalSize::Large, area);
             if !contains(inner, column, row) {
                 return None;
             }
@@ -1105,6 +1100,14 @@ const fn contains(area: Rect, column: u16, row: u16) -> bool {
 
 fn dialog_inner(size: ModalSize, terminal: Rect) -> Rect {
     Block::bordered().inner(size.area(terminal))
+}
+
+fn compact_list_capacity(terminal: Rect) -> usize {
+    usize::from(
+        dialog_inner(ModalSize::Compact, terminal)
+            .height
+            .saturating_sub(3),
+    )
 }
 
 fn hint_at(hints: &[ActionHint], start_x: u16, column: u16) -> Option<ClickAction> {
@@ -1645,7 +1648,7 @@ fn render_workspace_choices(
     let Some(state) = app.new_agent() else {
         return;
     };
-    let visible = 7;
+    let visible = compact_list_capacity(frame.area());
     let start = state.selected_workspace.saturating_sub(visible - 1);
     let mut lines = vec![Line::from("")];
     if state.workspaces.is_empty() {
@@ -1778,6 +1781,8 @@ fn render_agent_choices(
     let Some(state) = app.new_agent() else {
         return;
     };
+    let visible = compact_list_capacity(frame.area());
+    let start = state.selected_agent.saturating_sub(visible - 1);
     let mut lines = vec![Line::from("")];
     if app.available_harnesses().is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1789,6 +1794,8 @@ fn render_agent_choices(
             app.available_harnesses()
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(visible)
                 .map(|(index, kind)| {
                     let selected = index == state.selected_agent;
                     Line::from(vec![
@@ -1877,11 +1884,45 @@ fn render_embedded_browser(
     theme: Theme,
     hovered: Option<ClickAction>,
 ) {
+    render_embedded_terminal(
+        frame,
+        snapshot,
+        theme,
+        hovered,
+        " Select workspace · Yazi ",
+        EMBEDDED_HINTS,
+    );
+}
+
+fn render_hunk_review(
+    frame: &mut Frame<'_>,
+    snapshot: Option<&TerminalProcessSnapshot>,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+) {
+    render_embedded_terminal(
+        frame,
+        snapshot,
+        theme,
+        hovered,
+        " Review changes · Hunk ",
+        REVIEW_HINTS,
+    );
+}
+
+fn render_embedded_terminal(
+    frame: &mut Frame<'_>,
+    snapshot: Option<&TerminalProcessSnapshot>,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+    title: &str,
+    hints: &[ActionHint],
+) {
     let area = embedded_modal_area(frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::bordered()
-            .title(" Select workspace · Yazi ")
+            .title(title)
             .border_style(accent(theme))
             .style(theme.surface()),
         area,
@@ -1895,7 +1936,7 @@ fn render_embedded_browser(
         frame.render_widget(terminal, content);
     }
     frame.render_widget(
-        Paragraph::new(hint_line(EMBEDDED_HINTS, theme, hovered)),
+        Paragraph::new(hint_line(hints, theme, hovered)),
         Rect::new(
             area.x.saturating_add(1),
             area.bottom().saturating_sub(2),
@@ -1949,7 +1990,7 @@ fn render_archive_unavailable(frame: &mut Frame<'_>, theme: Theme, hovered: Opti
         vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Only named conversations can be archived.",
+                "  Name the conversation to archive it.",
                 warning(theme),
             )),
             Line::from(""),
@@ -2032,13 +2073,13 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAct
         ))
     }));
     lines.push(hint_line(BACK_HINTS, theme, hovered));
-    render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
+    render_dialog(frame, theme, " Keybinds ", ModalSize::Large, lines);
 }
 
 /// Inner row the usage footer sits on. Fixed so the content above it can vary without moving the
 /// clickable hints out from under the pointer.
-const USAGE_HINT_LINE: u16 = 14;
-const USAGE_PROVENANCE_LINE: usize = 13;
+const USAGE_HINT_LINE: u16 = 9;
+const USAGE_PROVENANCE_LINE: usize = 8;
 const USAGE_LABEL_WIDTH: usize = 14;
 const USAGE_BAR_WIDTH: usize = 18;
 
@@ -2194,11 +2235,6 @@ fn usage_window_line(
     width: usize,
 ) -> Line<'static> {
     let percent = window.whole_percent();
-    let label = format!(
-        "  {:<USAGE_LABEL_WIDTH$}",
-        clip_plain(&window.label, USAGE_LABEL_WIDTH)
-    );
-    let bar = usage_bar(window.used_tenths, USAGE_BAR_WIDTH);
     let reset = format_reset(window.resets_at_ms, now_ms);
     let detail = window
         .detail
@@ -2206,9 +2242,18 @@ fn usage_window_line(
         .filter(|_| !reset.is_empty())
         .map(|detail| format!(" · {detail}"))
         .unwrap_or_default();
+    let tail_text = format!("{reset}{detail}");
+    let label_width = USAGE_LABEL_WIDTH.min(width.saturating_sub(39).max(7));
+    let bar_width = USAGE_BAR_WIDTH.min(
+        width
+            .saturating_sub(label_width + 9)
+            .saturating_sub(tail_text.chars().count()),
+    );
+    let label = format!("  {:<label_width$}", clip_plain(&window.label, label_width));
+    let bar = usage_bar(window.used_tenths, bar_width);
 
-    let used = label.chars().count() + bar.chars().count() + 6;
-    let tail = clip_plain(&format!("{reset}{detail}"), width.saturating_sub(used));
+    let used = label.chars().count() + bar.chars().count() + 7;
+    let tail = clip_plain(&tail_text, width.saturating_sub(used));
     Line::from(vec![
         Span::styled(label, text(theme)),
         Span::styled(bar, usage_style(theme, percent)),
@@ -2654,7 +2699,7 @@ mod tests {
         // The three buttons stack bottom-up with no gap, and none exists without a sidebar.
         assert_eq!(usage_button_area(area, 0), None);
         let popup = menu_popup_area(menu_button_area(area, SIDEBAR_WIDTH).unwrap());
-        assert_eq!(popup, Rect::new(0, 33, 27, 6));
+        assert_eq!(popup, Rect::new(0, 32, 27, 7));
         assert_eq!(menu_item_at(&app, area, 2, 36), Some(MenuItem::Keybinds));
         assert_eq!(menu_item_at(&app, area, 2, 37), Some(MenuItem::Settings));
         assert_eq!(menu_item_at(&app, area, 50, 36), None);
@@ -2977,12 +3022,15 @@ mod tests {
     #[test]
     fn modal_tiers_have_canonical_areas() {
         let terminal = Rect::new(0, 0, 120, 40);
-        assert_eq!(ModalSize::Compact.area(terminal), Rect::new(28, 14, 64, 12));
+        assert_eq!(ModalSize::Compact.area(terminal), Rect::new(30, 12, 60, 16));
         assert_eq!(
             ModalSize::Standard.area(terminal),
-            Rect::new(24, 11, 72, 18)
+            Rect::new(24, 10, 72, 20)
         );
-        assert_eq!(ModalSize::Large.area(terminal), Rect::new(10, 5, 100, 30));
+        assert_eq!(ModalSize::Large.area(terminal), Rect::new(2, 1, 116, 38));
+        let minimum = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
+        assert_eq!(ModalSize::Compact.area(minimum), Rect::new(20, 7, 40, 9));
+        assert_eq!(ModalSize::Standard.area(minimum), Rect::new(16, 6, 48, 12));
         assert_eq!(
             embedded_modal_area(terminal),
             ModalSize::Large.area(terminal)
@@ -3249,7 +3297,8 @@ mod tests {
         assert_hint_clicks(&app, area, compact.x, compact.y + 3, WORKSPACE_HINTS);
 
         app.open_agent_choices();
-        for index in 0..app.available_harnesses().len() {
+        let visible_agents = compact_list_capacity(area);
+        for index in 0..visible_agents {
             assert_eq!(
                 click_action(&app, area, compact.x, compact.y + 1 + index as u16),
                 Some(ClickAction::AgentKind(index))
@@ -3259,8 +3308,14 @@ mod tests {
             &app,
             area,
             compact.x,
-            compact.y + app.available_harnesses().len() as u16 + 2,
+            compact.y + visible_agents as u16 + 2,
             AGENT_HINTS,
+        );
+        let last_agent = app.available_harnesses().len() - 1;
+        app.select_agent_kind(last_agent);
+        assert_eq!(
+            click_action(&app, area, compact.x, compact.y + visible_agents as u16),
+            Some(ClickAction::AgentKind(last_agent))
         );
 
         app.open_native_browser(PathBuf::from("/tmp"), 1);
@@ -3292,6 +3347,15 @@ mod tests {
             EMBEDDED_HINTS,
         );
 
+        app.set_mode(Mode::Review);
+        assert_hint_clicks(
+            &app,
+            area,
+            embedded.x + 1,
+            embedded.bottom() - 2,
+            REVIEW_HINTS,
+        );
+
         for mode in [Mode::ConfirmClose, Mode::ConfirmArchive] {
             app.set_mode(mode);
             assert_hint_clicks(&app, area, standard.x, standard.y + 3, CONFIRM_HINTS);
@@ -3304,7 +3368,7 @@ mod tests {
             compact.y + 3,
             ARCHIVE_UNAVAILABLE_HINTS,
         );
-        assert!(render_app_text(&app).contains("Only named conversations can be archived."));
+        assert!(render_app_text(&app).contains("Name the conversation to archive it."));
         app.set_mode(Mode::ConfirmResume);
         assert_hint_clicks(&app, area, standard.x, standard.y + 3, RESUME_HINTS);
         app.set_mode(Mode::ConfirmQuit);
@@ -3313,15 +3377,15 @@ mod tests {
         app.set_mode(Mode::Keybinds);
         for (index, binding) in MANAGEMENT_KEYBINDINGS.iter().enumerate() {
             assert_eq!(
-                click_action(&app, area, standard.x, standard.y + index as u16),
+                click_action(&app, area, large.x, large.y + index as u16),
                 Some(ClickAction::Management(binding.command))
             );
         }
         assert_hint_clicks(
             &app,
             area,
-            standard.x,
-            standard.y + MANAGEMENT_KEYBINDINGS.len() as u16,
+            large.x,
+            large.y + MANAGEMENT_KEYBINDINGS.len() as u16,
             BACK_HINTS,
         );
 
@@ -3758,7 +3822,8 @@ mod tests {
         assert!(menu.contains("Detach"));
         assert!(menu.contains("Stop session"));
         assert!(menu.contains("[1] Detach"));
-        assert!(menu.contains("[4] Settings"));
+        assert!(menu.contains("[2] Review with Hunk"));
+        assert!(menu.contains("[5] Settings"));
     }
 
     #[test]

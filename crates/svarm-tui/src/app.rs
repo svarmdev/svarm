@@ -24,6 +24,8 @@ pub(crate) enum Mode {
     Terminal,
     Prefix,
     ToolPrefix,
+    Review,
+    ReviewToolPrefix,
     NewAgent(NewAgentPage),
     ConfirmClose,
     ConfirmArchive,
@@ -267,14 +269,16 @@ impl SessionChooser {
 pub(crate) enum MenuItem {
     #[default]
     Detach,
+    ReviewChanges,
     StopSession,
     Keybinds,
     Settings,
 }
 
 impl MenuItem {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Detach,
+        Self::ReviewChanges,
         Self::StopSession,
         Self::Keybinds,
         Self::Settings,
@@ -283,6 +287,7 @@ impl MenuItem {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Detach => "Detach",
+            Self::ReviewChanges => "Review with Hunk",
             Self::StopSession => "Stop session",
             Self::Keybinds => "Keybinds",
             Self::Settings => "Settings",
@@ -292,9 +297,10 @@ impl MenuItem {
     fn cycle(self, delta: isize) -> Self {
         let current = match self {
             Self::Detach => 0,
-            Self::StopSession => 1,
-            Self::Keybinds => 2,
-            Self::Settings => 3,
+            Self::ReviewChanges => 1,
+            Self::StopSession => 2,
+            Self::Keybinds => 3,
+            Self::Settings => 4,
         };
         let next = (current + delta).rem_euclid(Self::ALL.len() as isize) as usize;
         Self::ALL[next]
@@ -488,6 +494,7 @@ pub(crate) struct App {
     theme: ThemeName,
     settings_tab: SettingsTab,
     notice: Option<String>,
+    notice_revision: u64,
     exit_intent: ExitIntent,
     session_id: Option<SessionId>,
     new_agent: Option<NewAgentState>,
@@ -518,6 +525,7 @@ impl App {
             theme,
             settings_tab: SettingsTab::default(),
             notice,
+            notice_revision: 0,
             exit_intent: ExitIntent::None,
             session_id: None,
             new_agent: None,
@@ -555,6 +563,7 @@ impl App {
             theme,
             settings_tab: SettingsTab::default(),
             notice,
+            notice_revision: 0,
             exit_intent: ExitIntent::None,
             session_id: Some(snapshot.summary.id),
             new_agent: None,
@@ -809,10 +818,12 @@ impl App {
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
+        self.notice_revision = self.notice_revision.wrapping_add(1);
     }
 
     pub fn clear_notice(&mut self) {
         self.notice = None;
+        self.notice_revision = self.notice_revision.wrapping_add(1);
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -846,6 +857,7 @@ impl App {
     pub fn open_selected_menu_item(&mut self) {
         match self.menu_selected {
             MenuItem::Detach => self.request_detach(),
+            MenuItem::ReviewChanges => {}
             MenuItem::StopSession => self.mode = Mode::ConfirmQuit,
             MenuItem::Keybinds => self.mode = Mode::Keybinds,
             MenuItem::Settings => self.mode = Mode::Settings,
@@ -854,6 +866,18 @@ impl App {
 
     pub fn selected_agent_id(&self) -> Option<AgentId> {
         self.agents.get(self.selected).map(AgentState::id)
+    }
+
+    pub fn selected_agent(&self) -> Option<&AgentState> {
+        self.agents.get(self.selected)
+    }
+
+    pub fn open_review(&mut self) {
+        self.mode = Mode::Review;
+    }
+
+    pub fn close_review(&mut self) {
+        self.mode = Mode::Terminal;
     }
 
     pub fn agents(&self) -> &[AgentState] {
@@ -977,7 +1001,6 @@ impl App {
         self.sidebar_width
     }
 
-    #[cfg(test)]
     pub const fn menu_selected(&self) -> MenuItem {
         self.menu_selected
     }
@@ -988,6 +1011,10 @@ impl App {
 
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    pub const fn notice_revision(&self) -> u64 {
+        self.notice_revision
     }
 
     pub const fn exit_intent(&self) -> ExitIntent {
