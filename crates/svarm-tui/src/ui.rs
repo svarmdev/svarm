@@ -24,10 +24,6 @@ use svarm_agent::{
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
-const COMPACT_MODAL_WIDTH: u16 = 64;
-const COMPACT_MODAL_HEIGHT: u16 = 12;
-const STANDARD_MODAL_WIDTH: u16 = 72;
-const STANDARD_MODAL_HEIGHT: u16 = 18;
 pub const SIDEBAR_WIDTH: u16 = SIDEBAR_DEFAULT_WIDTH;
 const AGENT_CARD_HEIGHT: u16 = 3;
 const COLLAPSED_CARD_HEIGHT: u16 = 1;
@@ -73,11 +69,19 @@ enum ModalSize {
 impl ModalSize {
     fn area(self, terminal: Rect) -> Rect {
         match self {
-            Self::Compact => centered_rect(COMPACT_MODAL_WIDTH, COMPACT_MODAL_HEIGHT, terminal),
-            Self::Standard => centered_rect(STANDARD_MODAL_WIDTH, STANDARD_MODAL_HEIGHT, terminal),
+            Self::Compact => centered_rect(
+                terminal.width.saturating_mul(80) / 100,
+                terminal.height.saturating_mul(50) / 100,
+                terminal,
+            ),
+            Self::Standard => centered_rect(
+                terminal.width.saturating_mul(90) / 100,
+                terminal.height.saturating_mul(75) / 100,
+                terminal,
+            ),
             Self::Large => centered_rect(
-                terminal.width.saturating_sub(4).min(100),
-                terminal.height.saturating_sub(2).min(30),
+                terminal.width.saturating_sub(4),
+                terminal.height.saturating_sub(2),
                 terminal,
             ),
         }
@@ -967,7 +971,7 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                 .flatten()
         }
         Mode::Keybinds => {
-            let inner = dialog_inner(ModalSize::Standard, area);
+            let inner = dialog_inner(ModalSize::Large, area);
             if !contains(inner, column, row) {
                 return None;
             }
@@ -2032,7 +2036,7 @@ fn render_keybinds(frame: &mut Frame<'_>, theme: Theme, hovered: Option<ClickAct
         ))
     }));
     lines.push(hint_line(BACK_HINTS, theme, hovered));
-    render_dialog(frame, theme, " Keybinds ", ModalSize::Standard, lines);
+    render_dialog(frame, theme, " Keybinds ", ModalSize::Large, lines);
 }
 
 /// Inner row the usage footer sits on. Fixed so the content above it can vary without moving the
@@ -2977,12 +2981,12 @@ mod tests {
     #[test]
     fn modal_tiers_have_canonical_areas() {
         let terminal = Rect::new(0, 0, 120, 40);
-        assert_eq!(ModalSize::Compact.area(terminal), Rect::new(28, 14, 64, 12));
-        assert_eq!(
-            ModalSize::Standard.area(terminal),
-            Rect::new(24, 11, 72, 18)
-        );
-        assert_eq!(ModalSize::Large.area(terminal), Rect::new(10, 5, 100, 30));
+        assert_eq!(ModalSize::Compact.area(terminal), Rect::new(12, 10, 96, 20));
+        assert_eq!(ModalSize::Standard.area(terminal), Rect::new(6, 5, 108, 30));
+        assert_eq!(ModalSize::Large.area(terminal), Rect::new(2, 1, 116, 38));
+        let minimum = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
+        assert_eq!(ModalSize::Compact.area(minimum), Rect::new(8, 6, 64, 12));
+        assert_eq!(ModalSize::Standard.area(minimum), Rect::new(4, 3, 72, 18));
         assert_eq!(
             embedded_modal_area(terminal),
             ModalSize::Large.area(terminal)
