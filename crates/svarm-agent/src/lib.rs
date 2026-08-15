@@ -27,6 +27,8 @@ mod terminal;
 mod terminal_backend;
 pub mod terminal_model;
 mod terminal_process;
+#[cfg(unix)]
+mod usage;
 pub mod worktree;
 
 pub use manager::{AgentManager, pty_size};
@@ -53,7 +55,7 @@ impl AgentId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     Codex,
@@ -103,6 +105,11 @@ impl AgentKind {
     /// Claude and Grok report the live session id on SessionStart via `__conversation-hook`.
     pub const fn reports_session_id_via_hook(self) -> bool {
         matches!(self, Self::Claude | Self::Grok)
+    }
+
+    /// Whether the vendor publishes remaining subscription limits somewhere svarm can read them.
+    pub const fn reports_usage(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Grok)
     }
 }
 
