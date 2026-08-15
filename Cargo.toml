@@ -1,9 +1,10 @@
 [package]
 name = "svarm"
-version = "0.2.0"
+version.workspace = true
 edition = "2024"
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "A terminal workspace for coding agents"
 
 [workspace]
@@ -15,6 +16,18 @@ version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/svarmdev/svarm"
+publish = false
+
+[workspace.metadata.release]
+shared-version = true
+consolidate-commits = true
+publish = false
+tag = false
+push = false
+pre-release-commit-message = "chore: prepare release v{{version}}"
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+allow-branch = ["main", "chore/release-*"]
 
 [profile.dev]
 opt-level = 1

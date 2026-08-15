@@ -108,3 +108,20 @@ directories; mouse-disabled and mouse-reporting children; bracketed and plain pa
 several agents in different directories; resize while browsing; abrupt terminal
 closure followed by attach; and sleep/wake while the operating system retains the
 server.
+
+```sh
+# Install once (needed by the version-bump script):
+cargo install cargo-release --locked
+
+# Open a version PR (patch, minor, major, or an explicit 0.3.0). Dry-run
+# unless --execute is passed:
+./scripts/prepare-release.sh minor --execute
+
+# After that PR is merged, tag main and push only that tag:
+./scripts/tag-release.sh --execute
+```
+
+Pushing the tag starts the Release workflow, which builds the four platform
+archives and publishes the GitHub release. `scripts/prepare-release.sh` must
+not tag; tagging an unmerged branch would publish a release before `main`
+has the new version.
