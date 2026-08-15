@@ -20,6 +20,7 @@ pub struct RuntimePaths {
     pub log_directory: PathBuf,
     pub server_log: PathBuf,
     pub client_log: PathBuf,
+    pub conversation_directory: PathBuf,
 }
 
 impl RuntimePaths {
@@ -55,6 +56,7 @@ impl RuntimePaths {
             pid: directory.join("server.pid"),
             server_log: log_directory.join("server.log"),
             client_log: log_directory.join("client.log"),
+            conversation_directory: log_directory.join("conversations"),
             log_directory,
             directory,
         })
@@ -197,6 +199,7 @@ mod tests {
             log_directory: directory.join("logs"),
             server_log: directory.join("logs/server.log"),
             client_log: directory.join("logs/client.log"),
+            conversation_directory: directory.join("logs/conversations"),
             directory: directory.clone(),
         };
         let lock = paths.acquire_server_lock().unwrap().unwrap();

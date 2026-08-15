@@ -2,6 +2,8 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+mod conversation_store;
 mod cwd;
 pub mod framing;
 mod git;
