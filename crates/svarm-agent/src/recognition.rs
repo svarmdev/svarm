@@ -314,18 +314,16 @@ fn recognize_grok_title(title: &str) -> Option<TitleRecognition> {
         }
     }
 
-    let (claim, rule, evidence) = if let Some(claim) = claim {
-        let rule = if claim == AgentActivity::Blocked {
-            "grok.title-action-required"
-        } else {
-            "grok.title-active"
-        };
-        (claim, rule, evidence.unwrap_or(trimmed))
-    } else if parts.last().is_some_and(|part| normalize(part) == "grok") {
-        (AgentActivity::Idle, "grok.title-ready", trimmed)
+    // A title of `grok` or `<name> - grok` is the default chrome, not an
+    // idle/ready signal. Claiming Idle here stamps a false completion when
+    // Grok drops the activity segment mid-turn.
+    let claim = claim?;
+    let rule = if claim == AgentActivity::Blocked {
+        "grok.title-action-required"
     } else {
-        return None;
+        "grok.title-active"
     };
+    let evidence = evidence.unwrap_or(trimmed);
 
     Some(title_recognition(
         AgentKind::Grok,
@@ -884,24 +882,18 @@ mod tests {
                 Some("Refactor sidebar"),
             ),
             ("Action Required - grok", AgentActivity::Blocked, None),
-            ("grok", AgentActivity::Idle, None),
-            (
-                "Simple 2+2 Arithmetic Question - grok",
-                AgentActivity::Idle,
-                Some("Simple 2+2 Arithmetic Question"),
-            ),
         ] {
             let recognized = recognize_title(AgentKind::Grok, title).unwrap();
             assert_eq!(recognized.evidence.claim, expected, "{title}");
             assert_eq!(recognized.conversation_title.as_deref(), session, "{title}");
         }
-        // A session name that merely mentions thinking is not an activity segment.
-        let named = recognize_title(AgentKind::Grok, "Thinking about rust - grok").unwrap();
-        assert_eq!(named.evidence.claim, AgentActivity::Idle);
-        assert_eq!(
-            named.conversation_title.as_deref(),
-            Some("Thinking about rust")
+        // Default chrome without an activity segment is not idle/ready evidence.
+        assert!(recognize_title(AgentKind::Grok, "grok").is_none());
+        assert!(
+            recognize_title(AgentKind::Grok, "Simple 2+2 Arithmetic Question - grok").is_none()
         );
+        // A session name that merely mentions thinking is not an activity segment.
+        assert!(recognize_title(AgentKind::Grok, "Thinking about rust - grok").is_none());
         assert!(recognize_title(AgentKind::Grok, "Conversation only").is_none());
         assert!(recognize_title(AgentKind::Grok, "Ready | Conversation").is_none());
     }
