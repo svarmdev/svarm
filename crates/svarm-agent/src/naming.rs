@@ -479,7 +479,7 @@ fn user_message(log: &str) -> String {
     format!("These are the messages a user sent during a work session. Name that work.\n\n{log}")
 }
 
-fn prepare_generator_environment(command: &mut Command) {
+pub(crate) fn prepare_generator_environment(command: &mut Command) {
     for key in SCRUBBED_ENV {
         command.env_remove(key);
     }
@@ -489,7 +489,7 @@ fn prepare_generator_environment(command: &mut Command) {
     }
 }
 
-fn home_directory() -> Option<OsString> {
+pub(crate) fn home_directory() -> Option<OsString> {
     std::env::var_os("HOME").filter(|home| !home.is_empty())
 }
 
