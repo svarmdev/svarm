@@ -251,13 +251,12 @@ fn read_windows(config: &BillingConfig) -> Vec<UsageWindow> {
     }
 
     for product in &config.product_usage {
-        let Some(percent) = product.usage_percent else {
-            continue;
-        };
         let Some(name) = product.product.as_deref() else {
             continue;
         };
-        let mut window = UsageWindow::from_percent(product_label(name), percent);
+        // proto3 omits a 0.0 percent, so a named product without the field is 0%.
+        let mut window =
+            UsageWindow::from_percent(product_label(name), product.usage_percent.unwrap_or(0.0));
         window.resets_at_ms = resets_at_ms;
         windows.push(window);
     }
@@ -266,17 +265,22 @@ fn read_windows(config: &BillingConfig) -> Vec<UsageWindow> {
 }
 
 /// Prefer `creditUsagePercent`; fall back to `used / monthlyLimit` from the
-/// deprecated billing shape. A missing pair is omitted, not shown as zero.
+/// deprecated billing shape. proto3 omits a 0.0 percent, so a described period
+/// with neither field is 0%, not "no window".
 fn period_percent(config: &BillingConfig) -> Option<f64> {
     if let Some(percent) = config.credit_usage_percent {
         return Some(percent);
     }
-    let used = config.used.as_ref()?.val;
-    let limit = config.monthly_limit.as_ref()?.val;
-    if limit <= 0 {
-        return None;
+    if let (Some(used), Some(limit)) = (config.used.as_ref(), config.monthly_limit.as_ref())
+        && limit.val > 0
+    {
+        return Some((used.val as f64) * 100.0 / (limit.val as f64));
     }
-    Some((used as f64) * 100.0 / (limit as f64))
+    described_period(config).then_some(0.0)
+}
+
+fn described_period(config: &BillingConfig) -> bool {
+    config.current_period.is_some() || config.billing_period_end.is_some()
 }
 
 fn period_label(config: &BillingConfig) -> &'static str {
@@ -519,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn a_product_without_a_percent_is_omitted_not_shown_as_zero() {
+    fn a_named_product_with_no_percent_is_zero_because_proto3_omits_it() {
         let body = r#"{"config":{
             "creditUsagePercent":8.0,
             "currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"},
@@ -534,7 +538,45 @@ mod tests {
             panic!("expected windows");
         };
         let labels: Vec<_> = evidence.windows.iter().map(|w| w.label.as_str()).collect();
-        assert_eq!(labels, ["Weekly", "Grok Chat"]);
+        assert_eq!(labels, ["Weekly", "Grok Build", "Grok Chat"]);
+        assert_eq!(evidence.windows[1].used_tenths, 0);
+        assert_eq!(evidence.windows[2].used_tenths, 10);
+    }
+
+    #[test]
+    fn a_weekly_period_with_omitted_zero_percent_is_shown_as_zero() {
+        // Trimmed from a live 200 at 0%: proto3 drops creditUsagePercent and
+        // product usagePercent, but still describes the weekly period.
+        let body = r#"{
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-08-19T18:21:01.790360+00:00",
+                    "end": "2026-08-26T18:21:01.790360+00:00"
+                },
+                "onDemandCap": {},
+                "onDemandUsed": {},
+                "productUsage": [{"product": "GrokBuild"}],
+                "isUnifiedBillingUser": true,
+                "prepaidBalance": {},
+                "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+                "billingPeriodStart": "2026-08-19T18:21:01.790360+00:00",
+                "billingPeriodEnd": "2026-08-26T18:21:01.790360+00:00"
+            }
+        }"#;
+        let UsageReport::Available(evidence) =
+            interpret(&credentials(), &HttpOutcome::Ok(body.into()), 1_000)
+        else {
+            panic!("expected windows, got a missing-usage report");
+        };
+        let labels: Vec<_> = evidence.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["Weekly", "Grok Build"]);
+        assert!(
+            evidence.windows.iter().all(|w| w.used_tenths == 0),
+            "{evidence:?}"
+        );
+        assert!(evidence.windows.iter().all(|w| w.resets_at_ms.is_some()));
+        assert!(evidence.notes.is_empty());
     }
 
     #[test]
