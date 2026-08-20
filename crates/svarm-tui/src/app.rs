@@ -681,7 +681,7 @@ impl App {
         if let Some(error) = snapshot.read_error
             && self.notice.as_deref() != Some(&error)
         {
-            self.notice = Some(error);
+            self.set_notice(error);
             changed = true;
         }
         changed
@@ -696,7 +696,7 @@ impl App {
         if let Some(error) = snapshot.read_error
             && self.notice.as_deref() != Some(&error)
         {
-            self.notice = Some(error);
+            self.set_notice(error);
             changed = true;
         }
         changed
