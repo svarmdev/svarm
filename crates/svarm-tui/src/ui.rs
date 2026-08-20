@@ -458,7 +458,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::Usage => render_usage(frame, app, theme, hovered, model.now_ms),
         _ => {}
     }
-    if let Some(toast) = model.toast {
+    if let Some(toast) = model.toast.or_else(|| app.notice()) {
         render_toast(frame, toast, theme);
     }
 }
@@ -466,19 +466,21 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
 fn render_toast(frame: &mut Frame<'_>, message: &str, theme: Theme) {
     let area = frame.area();
     let content = format!(" {message} ");
-    let width = u16::try_from(content.chars().count())
+    let inner_width = usize::from(area.width.saturating_sub(2).max(1));
+    let char_count = content.chars().count();
+    let text_width = char_count.min(inner_width);
+    let lines = char_count.div_ceil(text_width.max(1)).max(1);
+    let width = u16::try_from(text_width.saturating_add(2))
         .unwrap_or(u16::MAX)
-        .saturating_add(2)
         .min(area.width);
-    let toast = Rect::new(
-        area.right().saturating_sub(width),
-        area.y,
-        width,
-        3.min(area.height),
-    );
+    let height = u16::try_from(lines.saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let toast = Rect::new(area.right().saturating_sub(width), area.y, width, height);
     frame.render_widget(Clear, toast);
     frame.render_widget(
         Paragraph::new(content)
+            .wrap(Wrap { trim: false })
             .block(Block::bordered())
             .style(theme.selected()),
         toast,
@@ -1149,7 +1151,7 @@ fn agent_list_area(app: &App, sidebar: Rect, sidebar_width: u16) -> Rect {
         0
     };
     // One row each for the usage, new-agent, and menu buttons stacked at the bottom.
-    let reserved = 3 + popup_height + u16::from(app.notice().is_some());
+    let reserved = 3 + popup_height;
     Rect::new(
         inner.x,
         inner.y,
@@ -1202,7 +1204,6 @@ fn render_sidebar(
             border(theme)
         })
         .style(Style::default().bg(Color::Reset));
-    let inner = block.inner(sidebar);
     frame.render_widget(block, sidebar);
 
     let new_button =
@@ -1274,19 +1275,6 @@ fn render_sidebar(
     let scroll =
         u16::try_from(sidebar_row_start(app, agents_area, card_height)).unwrap_or(u16::MAX);
     frame.render_widget(Paragraph::new(rows).scroll((scroll, 0)), agents_area);
-
-    if let Some(notice) = app.notice() {
-        let y = agents_area.bottom();
-        let message = if collapsed {
-            " !".to_string()
-        } else {
-            format!(" ! {notice}")
-        };
-        frame.render_widget(
-            Paragraph::new(message).style(warning(theme)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-    }
 
     if let Some(usage_button) = usage_button_area(area, width) {
         let usage_style = chrome_style(
@@ -4451,17 +4439,48 @@ mod tests {
             false,
             None,
         );
+        let terminal = draw_toast(&app, Some("Copied 17 characters to clipboard"));
+        let (top, second) = toast_rows(&terminal);
+        assert!(top.ends_with("┐"));
+        assert!(second.contains("Copied 17 characters to clipboard"));
+    }
+
+    #[test]
+    fn notices_render_as_toasts_instead_of_sidebar_text() {
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            Some("could not copy selection: error".into()),
+        );
+        let terminal = draw_toast(&app, None);
+        let (top, second) = toast_rows(&terminal);
+        assert!(top.ends_with("┐"));
+        assert!(second.contains("could not copy selection: error"));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let usage = usage_button_area(area, SIDEBAR_WIDTH).unwrap();
+        let notice_row = (0..SIDEBAR_WIDTH)
+            .map(|x| terminal.backend().buffer()[(x, usage.y.saturating_sub(1))].symbol())
+            .collect::<String>();
+        assert!(
+            !notice_row.contains(" ! "),
+            "notice should not occupy a sidebar row: {notice_row:?}"
+        );
+    }
+
+    fn draw_toast(app: &App, toast: Option<&str>) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| {
                 render(
                     frame,
                     UiModel {
-                        app: &app,
+                        app,
                         screen: None,
                         scrolled: false,
                         selection: None,
-                        toast: Some("Copied 17 characters to clipboard"),
+                        toast,
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,
@@ -4472,17 +4491,14 @@ mod tests {
                 )
             })
             .unwrap();
+        terminal
+    }
 
-        let top = terminal.backend().buffer().content()[0..80]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(top.ends_with("┐"));
-        let second = terminal.backend().buffer().content()[80..160]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(second.contains("Copied 17 characters to clipboard"));
+    fn toast_rows(terminal: &Terminal<TestBackend>) -> (String, String) {
+        let content = &terminal.backend().buffer().content;
+        let top = content[0..80].iter().map(|cell| cell.symbol()).collect();
+        let second = content[80..160].iter().map(|cell| cell.symbol()).collect();
+        (top, second)
     }
 
     fn render_app_text(app: &App) -> String {
