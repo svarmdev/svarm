@@ -3044,7 +3044,7 @@ mod tests {
 
         let mut backend = Vt100Backend::new(TerminalSize::new(24, 80), 0);
         backend.process(
-            "\x1b]2;Thinking - Refactor sidebar - grok\x07\x1b[20;1HWaiting for response"
+            "\x1b]2;⠦ - Thinking - Refactor sidebar - grok\x07\x1b[20;1HWaiting for response"
                 .as_bytes(),
         );
         let working = backend.snapshot(CursorStyle::default(), backend.modes(false, false));

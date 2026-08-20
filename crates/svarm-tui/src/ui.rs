@@ -1497,9 +1497,8 @@ fn end_truncate(value: &str, width: usize) -> String {
 
 fn status_display(status: AgentDisplayStatus, colors_enabled: bool) -> (&'static str, Style) {
     match status {
-        AgentDisplayStatus::Unknown | AgentDisplayStatus::Idle => {
-            ("●", Style::default().add_modifier(Modifier::DIM))
-        }
+        AgentDisplayStatus::Unknown => ("○", Style::default().add_modifier(Modifier::DIM)),
+        AgentDisplayStatus::Idle => ("●", Style::default().add_modifier(Modifier::DIM)),
         AgentDisplayStatus::Working => ("●", status_color(Color::Yellow, colors_enabled)),
         AgentDisplayStatus::Done => ("●", status_color(Color::Green, colors_enabled)),
         AgentDisplayStatus::NeedsYou | AgentDisplayStatus::Failed => {
@@ -4121,13 +4120,9 @@ mod tests {
     }
 
     #[test]
-    fn status_markers_share_one_glyph_and_keep_fixed_colors_across_themes() {
-        assert_eq!(
-            status_display(AgentDisplayStatus::Unknown, true),
-            status_display(AgentDisplayStatus::Idle, true)
-        );
+    fn status_markers_distinguish_unknown_and_keep_fixed_colors_across_themes() {
+        assert_eq!(status_display(AgentDisplayStatus::Unknown, true).0, "○");
         for status in [
-            AgentDisplayStatus::Unknown,
             AgentDisplayStatus::Idle,
             AgentDisplayStatus::Working,
             AgentDisplayStatus::Done,
