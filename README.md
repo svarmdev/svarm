@@ -10,6 +10,8 @@ Codex, Claude Code, Grok Build, and/or Pi must already be installed and availabl
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
+[Hunk](https://github.com/modem-dev/hunk) is optional. Install it with `brew install hunk` or `npm install -g hunkdiff` to review an agent's working-tree changes inside Svarm.
+
 Nerd Font icons are optional and detected automatically. Set `SVARM_NERD_FONT=1` or `SVARM_NERD_FONT=0` to force the choice when the detection is wrong.
 
 ```bash
@@ -57,6 +59,12 @@ needed. To review the script before running it, download it separately and run
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
 
+## Diff review with Hunk
+
+Press `Ctrl+B v`, or choose **Review with Hunk** from the menu, to open `hunk diff --watch` in the selected agent's Git worktree. In Hunk, press `c` to comment on a line and save the note with `Ctrl+S`. Add as many notes as needed, then quit Hunk with `q`.
+
+Svarm collects the human review notes while Hunk is open and pastes one compact block into the same agent's composer. Each note includes its file, line range, available source lines, and `comment:` text. The prompt is left for you to edit or submit; Svarm never presses Enter. `Ctrl+B x` force-closes the embedded review.
+
 ## Session and server lifecycle
 
 Detach, session stop, and server stop are intentionally different:
@@ -81,6 +89,7 @@ The server exits after a short grace period when it has no sessions and no conne
 - After a client connection error, Svarm restores the host terminal and prints the exact `svarm --attach --session ID` command. Agents may still be running.
 - Missing remembered workspaces remain visible with a `missing` marker and cannot be selected. Press `b` to browse to another directory.
 - If Yazi cannot be found on `PATH`, the native browser opens automatically. Permission and invalid-executable errors are reported instead of being treated as absence.
+- If Hunk cannot be found on `PATH`, Svarm shows its install hint. If review comments cannot be read, update Hunk so its user-comment session API is available.
 
 ## Develop
 
@@ -104,7 +113,8 @@ Before a release, manually verify Linux and macOS; local terminals and SSH; nest
 tmux or another multiplexer; keyboard-only use; `NO_COLOR` and a basic 16-color
 terminal; 80x24, 120x40, and a large terminal; Yazi installed, absent, customized,
 cancelled, crashed, and force-closed; native browsing through hidden and symlinked
-directories; mouse-disabled and mouse-reporting children; bracketed and plain paste;
+directories; Hunk installed, absent, commented, resized, and force-closed;
+mouse-disabled and mouse-reporting children; bracketed and plain paste;
 several agents in different directories; resize while browsing; abrupt terminal
 closure followed by attach; and sleep/wake while the operating system retains the
 server.

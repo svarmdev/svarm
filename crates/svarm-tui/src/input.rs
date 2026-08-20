@@ -25,6 +25,7 @@ pub(crate) enum ManagementCommand {
     OpenMenu,
     OpenKeybinds,
     OpenUsage,
+    OpenReview,
     SelectAgent(usize),
     Cancel,
     Unknown,
@@ -103,6 +104,11 @@ pub(crate) const MANAGEMENT_KEYBINDINGS: &[Keybinding] = &[
         command: ManagementCommand::OpenUsage,
     },
     Keybinding {
+        keys: "Ctrl+B, v",
+        action: "review changes with Hunk",
+        command: ManagementCommand::OpenReview,
+    },
+    Keybinding {
         keys: "Ctrl+B, ?",
         action: "open keybinds",
         command: ManagementCommand::OpenKeybinds,
@@ -139,6 +145,7 @@ pub(crate) fn management_command(key: KeyEvent) -> ManagementCommand {
         HostKeyCode::Char('m') => ManagementCommand::OpenMenu,
         HostKeyCode::Char('?') => ManagementCommand::OpenKeybinds,
         HostKeyCode::Char('u') => ManagementCommand::OpenUsage,
+        HostKeyCode::Char('v') => ManagementCommand::OpenReview,
         HostKeyCode::Char(digit @ '1'..='9') => {
             ManagementCommand::SelectAgent(digit as usize - '1' as usize)
         }
