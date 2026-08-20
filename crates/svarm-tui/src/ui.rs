@@ -9,8 +9,9 @@ use svarm_agent::terminal_model::TerminalSnapshot;
 
 use crate::{
     app::{
-        AgentDisplayStatus, AgentState, App, Checkout, MenuItem, Mode, NewAgentField, NewAgentPage,
-        SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SessionChooser, SettingsTab,
+        AgentDisplayStatus, AgentState, App, Checkout, HarnessUpdateStatus, MenuItem, Mode,
+        NewAgentField, NewAgentPage, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+        SessionChooser, SettingsTab,
     },
     input::{MANAGEMENT_KEYBINDINGS, ManagementCommand},
     screen::TerminalScreen,
@@ -94,7 +95,7 @@ pub(crate) struct UiModel<'a> {
     pub screen: Option<&'a TerminalSnapshot>,
     pub scrolled: bool,
     pub selection: Option<VisibleSelection>,
-    pub toast: Option<&'a str>,
+    pub toast: Option<ToastView<'a>>,
     pub embedded: Option<&'a TerminalProcessSnapshot>,
     pub theme: Theme,
     pub colors_enabled: bool,
@@ -102,6 +103,17 @@ pub(crate) struct UiModel<'a> {
     pub pointer: Option<(u16, u16)>,
     /// Read by the runtime, not by rendering, so countdowns stay a pure function of the frame.
     pub now_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToastAction {
+    OpenHarnessSettings,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToastView<'a> {
+    pub message: &'a str,
+    pub action: Option<ToastAction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +139,12 @@ pub(crate) enum ClickAction {
     ThemeNext,
     SettingsNext,
     SettingsTab(SettingsTab),
+    HarnessIntervalPrevious,
+    HarnessIntervalNext,
+    HarnessRow(usize),
+    HarnessCheck,
+    HarnessUpdate(AgentKind),
+    HarnessUpdateSelected,
     UsageNext,
     UsageRefresh,
     UsageTab(AgentKind),
@@ -317,11 +335,15 @@ const SETTINGS_HINTS: &[ActionHint] = &[
 ];
 const HARNESS_SETTINGS_HINTS: &[ActionHint] = &[
     ActionHint {
-        text: "[Tab] tab",
-        action: ClickAction::SettingsNext,
+        text: "[r] Check",
+        action: ClickAction::HarnessCheck,
     },
     ActionHint {
-        text: "[Esc] back",
+        text: "[Enter] Update",
+        action: ClickAction::HarnessUpdateSelected,
+    },
+    ActionHint {
+        text: "[Esc] Back",
         action: ClickAction::Cancel,
     },
 ];
@@ -458,33 +480,57 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: UiModel<'_>) {
         Mode::Usage => render_usage(frame, app, theme, hovered, model.now_ms),
         _ => {}
     }
-    if let Some(toast) = model.toast.or_else(|| app.notice()) {
-        render_toast(frame, toast, theme);
+    if let Some(toast) = model.toast.or_else(|| {
+        app.notice().map(|message| ToastView {
+            message,
+            action: None,
+        })
+    }) {
+        render_toast(frame, toast, theme, model.pointer);
     }
 }
 
-fn render_toast(frame: &mut Frame<'_>, message: &str, theme: Theme) {
+fn render_toast(
+    frame: &mut Frame<'_>,
+    toast: ToastView<'_>,
+    theme: Theme,
+    pointer: Option<(u16, u16)>,
+) {
     let area = frame.area();
-    let content = format!(" {message} ");
+    let content = format!(" {} ", toast.message);
+    let toast_area = toast_area(toast.message, area);
+    let hovered = toast
+        .action
+        .is_some_and(|_| pointer.is_some_and(|(column, row)| contains(toast_area, column, row)));
+    let mut style = theme.selected();
+    if toast.action.is_some() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if hovered {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    frame.render_widget(Clear, toast_area);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered())
+            .style(style),
+        toast_area,
+    );
+}
+
+pub(crate) fn toast_area(message: &str, area: Rect) -> Rect {
+    let content_width = message.chars().count().saturating_add(2);
     let inner_width = usize::from(area.width.saturating_sub(2).max(1));
-    let char_count = content.chars().count();
-    let text_width = char_count.min(inner_width);
-    let lines = char_count.div_ceil(text_width.max(1)).max(1);
+    let text_width = content_width.min(inner_width);
+    let lines = content_width.div_ceil(text_width.max(1)).max(1);
     let width = u16::try_from(text_width.saturating_add(2))
         .unwrap_or(u16::MAX)
         .min(area.width);
     let height = u16::try_from(lines.saturating_add(2))
         .unwrap_or(u16::MAX)
         .min(area.height);
-    let toast = Rect::new(area.right().saturating_sub(width), area.y, width, height);
-    frame.render_widget(Clear, toast);
-    frame.render_widget(
-        Paragraph::new(content)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered())
-            .style(theme.selected()),
-        toast,
-    );
+    Rect::new(area.right().saturating_sub(width), area.y, width, height)
 }
 
 pub(crate) fn render_session_chooser(
@@ -1016,12 +1062,66 @@ pub(crate) fn click_action(app: &App, area: Rect, column: u16, row: u16) -> Opti
                     return Some(ClickAction::ThemeNext);
                 }
             }
+            if app.settings_tab() == SettingsTab::Harnesses {
+                if line == 3 {
+                    let value_width = format_harness_interval(app.harness_update_interval_minutes())
+                        .chars()
+                        .count() as u16;
+                    if contains(Rect::new(inner.x + 18, row, 2, 1), column, row) {
+                        return Some(ClickAction::HarnessIntervalPrevious);
+                    }
+                    if contains(
+                        Rect::new(inner.x + 20 + value_width, row, 2, 1),
+                        column,
+                        row,
+                    ) {
+                        return Some(ClickAction::HarnessIntervalNext);
+                    }
+                    return Some(ClickAction::HarnessRow(0));
+                }
+                if (4..4 + AgentKind::ALL.len() as u16).contains(&line) {
+                    let index = usize::from(line - 4);
+                    let kind = AgentKind::ALL[index];
+                    if harness_update_button_area(app, kind, inner, row)
+                        .is_some_and(|button| contains(button, column, row))
+                    {
+                        return Some(ClickAction::HarnessUpdate(kind));
+                    }
+                    return Some(ClickAction::HarnessRow(index + 1));
+                }
+            }
             (line == settings_hint_line(app.settings_tab()))
                 .then(|| hint_at(settings_hints(app.settings_tab()), inner.x, column))
                 .flatten()
         }
         Mode::Prefix | Mode::ToolPrefix => None,
     }
+}
+
+fn harness_update_button_area(app: &App, kind: AgentKind, inner: Rect, row: u16) -> Option<Rect> {
+    let status = &app.harness_update(kind)?.status;
+    let (message, button) = match status {
+        HarnessUpdateStatus::UpdateAvailable { current, latest } => {
+            (format!("{current}→{latest}"), " [Update]")
+        }
+        HarnessUpdateStatus::UpdateFailed {
+            current,
+            latest,
+            message,
+        } => (format!("! {current}→{latest} {message}"), " [Retry]"),
+        _ => return None,
+    };
+    let prefix_width = 14;
+    let available = usize::from(inner.width)
+        .saturating_sub(prefix_width)
+        .saturating_sub(button.len());
+    let message_width = clip_plain(&message, available).chars().count() as u16;
+    Some(Rect::new(
+        inner.x + prefix_width as u16 + message_width,
+        row,
+        button.len() as u16,
+        1,
+    ))
 }
 
 pub(crate) fn hover_action(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickAction> {
@@ -2388,42 +2488,121 @@ fn render_settings(frame: &mut Frame<'_>, app: &App, theme: Theme, hovered: Opti
             lines.push(Line::from(""));
         }
         SettingsTab::Harnesses => {
-            lines.extend(
-                AgentKind::ALL
-                    .iter()
-                    .map(|kind| render_harness_line(*kind, app, theme, inner.width)),
-            );
-            lines.push(Line::from(""));
+            lines.push(render_harness_interval(app, theme, hovered));
+            lines.extend(AgentKind::ALL.iter().enumerate().map(|(index, kind)| {
+                render_harness_line(index, *kind, app, theme, hovered, inner.width)
+            }));
         }
     }
     lines.push(hint_line(settings_hints(tab), theme, hovered));
     render_dialog(frame, theme, " Settings ", ModalSize::Standard, lines);
 }
 
-fn render_harness_line(kind: AgentKind, app: &App, theme: Theme, width: u16) -> Line<'static> {
-    let installed = app.harness_installed(kind);
-    let status = if installed {
-        "✓ installed"
-    } else {
-        "× not found"
+fn render_harness_interval(app: &App, theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
+    let selected = app.harness_settings_selection() == 0;
+    Line::from(vec![
+        Span::styled(if selected { "> " } else { "  " }, accent(theme)),
+        Span::styled("Check every     ", text(theme)),
+        Span::styled(
+            "‹ ",
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::HarnessIntervalPrevious),
+                false,
+                theme.muted(),
+            ),
+        ),
+        Span::styled(
+            format_harness_interval(app.harness_update_interval_minutes()),
+            accent(theme).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ›",
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::HarnessIntervalNext),
+                false,
+                theme.muted(),
+            ),
+        ),
+    ])
+}
+
+fn render_harness_line(
+    index: usize,
+    kind: AgentKind,
+    app: &App,
+    theme: Theme,
+    hovered: Option<ClickAction>,
+    width: u16,
+) -> Line<'static> {
+    let selected = app.harness_settings_selection() == index + 1;
+    let prefix = format!("{} {:<11} ", if selected { ">" } else { " " }, kind.label());
+    let status = app
+        .harness_update(kind)
+        .map(|harness| &harness.status)
+        .unwrap_or(&HarnessUpdateStatus::NotInstalled);
+    let (message, button, status_style) = match status {
+        HarnessUpdateStatus::NotInstalled => ("× not found".into(), None, warning(theme)),
+        HarnessUpdateStatus::NotChecked => ("not checked".into(), None, theme.muted()),
+        HarnessUpdateStatus::Checking => ("checking…".into(), None, accent(theme)),
+        HarnessUpdateStatus::UpToDate { current } => {
+            (format!("✓ {current} current"), None, success(theme))
+        }
+        HarnessUpdateStatus::UpdateAvailable { current, latest } => (
+            format!("{current}→{latest}"),
+            Some(" [Update]"),
+            warning(theme),
+        ),
+        HarnessUpdateStatus::Updating { current, latest } => {
+            (format!("updating {current}→{latest}…"), None, accent(theme))
+        }
+        HarnessUpdateStatus::CheckFailed { message } => {
+            (format!("! {message}"), None, warning(theme))
+        }
+        HarnessUpdateStatus::UpdateFailed {
+            current,
+            latest,
+            message,
+        } => (
+            format!("! {current}→{latest} {message}"),
+            Some(" [Retry]"),
+            warning(theme),
+        ),
     };
-    let mut line = Line::from(vec![
-        Span::styled("  ", text(theme)),
-        Span::styled(kind.label(), text(theme)),
-    ]);
-    let gap = usize::from(width)
-        .saturating_sub(line.width())
-        .saturating_sub(Line::from(status).width());
-    line.spans.push(Span::raw(" ".repeat(gap)));
-    line.spans.push(Span::styled(
-        status,
-        if installed {
-            success(theme)
-        } else {
-            warning(theme)
-        },
-    ));
-    line
+    let button_width = button.map_or(0, str::len);
+    let available = usize::from(width)
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(button_width);
+    let message = clip_plain(&message, available);
+    let mut spans = vec![
+        Span::styled(prefix, if selected { accent(theme) } else { text(theme) }),
+        Span::styled(message, status_style),
+    ];
+    if let Some(button) = button {
+        spans.push(Span::styled(
+            button,
+            chrome_style(
+                theme,
+                hovered == Some(ClickAction::HarnessUpdate(kind)),
+                selected,
+                accent(theme),
+            ),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn format_harness_interval(minutes: u64) -> String {
+    if minutes < 60 {
+        format!("{minutes} min")
+    } else if minutes == 60 {
+        "1 hour".into()
+    } else if minutes.is_multiple_of(60) {
+        format!("{} hours", minutes / 60)
+    } else {
+        format!("{minutes} min")
+    }
 }
 
 fn settings_tabs(app: &App, theme: Theme, hovered: Option<ClickAction>) -> Line<'static> {
@@ -2463,7 +2642,7 @@ fn settings_hints(tab: SettingsTab) -> &'static [ActionHint] {
 fn settings_hint_line(tab: SettingsTab) -> u16 {
     match tab {
         SettingsTab::Appearance => 5,
-        SettingsTab::Harnesses => 3 + AgentKind::ALL.len() as u16 + 1,
+        SettingsTab::Harnesses => 4 + AgentKind::ALL.len() as u16,
     }
 }
 
@@ -3510,7 +3689,7 @@ mod tests {
         let settings = render_app_text(&app);
         assert!(settings.contains("Harnesses"));
         assert!(settings.contains("Codex"));
-        assert!(settings.contains("✓ installed"));
+        assert!(settings.contains("not checked"));
         assert!(settings.contains("Claude Code"));
         assert!(settings.contains("× not found"));
 
@@ -3530,6 +3709,76 @@ mod tests {
             Some(ClickAction::Confirm)
         );
         assert_eq!(click_action(&app, area, compact.x + 2, compact.y + 2), None);
+    }
+
+    #[test]
+    fn harness_settings_show_interval_status_and_mouse_update_controls_at_80x24() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            None,
+        );
+        app.set_available_harnesses(vec![AgentKind::Codex]);
+        app.apply_harness_check(vec![(
+            AgentKind::Codex,
+            Ok(svarm_agent::harness_update::HarnessVersion {
+                kind: AgentKind::Codex,
+                current: "0.147.0".into(),
+                latest: "0.148.0".into(),
+                update_available: true,
+            }),
+        )]);
+        app.open_harness_settings();
+        let area = Rect::new(0, 0, 80, 24);
+        let inner = dialog_inner(ModalSize::Standard, area);
+        let text = render_app_text(&app);
+
+        assert!(text.contains("Check every"));
+        assert!(text.contains("1 hour"));
+        assert!(text.contains("0.147.0→0.148.0"));
+        assert!(text.contains("[Update]"));
+        assert!(text.contains("[r] Check"));
+        assert!(text.contains("[Enter] Update"));
+        assert!(text.contains("[Esc] Back"));
+        assert_eq!(
+            click_action(&app, area, inner.x + 18, inner.y + 3),
+            Some(ClickAction::HarnessIntervalPrevious)
+        );
+        let button = harness_update_button_area(&app, AgentKind::Codex, inner, inner.y + 4)
+            .expect("available update button");
+        assert_eq!(
+            click_action(&app, area, button.x + 1, button.y),
+            Some(ClickAction::HarnessUpdate(AgentKind::Codex))
+        );
+        assert_hint_clicks(
+            &app,
+            area,
+            inner.x,
+            inner.y + settings_hint_line(SettingsTab::Harnesses),
+            HARNESS_SETTINGS_HINTS,
+        );
+    }
+
+    #[test]
+    fn notices_render_as_toasts_without_reserving_a_sidebar_row() {
+        let app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Monochrome,
+            false,
+            Some("could not copy selection: error".into()),
+        );
+        let terminal = draw_app(&app, None);
+        let buffer = terminal.backend().buffer();
+        let second_row = (0..80).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        assert!(second_row.contains("could not copy selection: error"));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let usage = usage_button_area(area, SIDEBAR_WIDTH).unwrap();
+        let former_notice_row = (0..SIDEBAR_WIDTH)
+            .map(|x| buffer[(x, usage.y.saturating_sub(1))].symbol())
+            .collect::<String>();
+        assert!(!former_notice_row.contains(" ! "));
     }
 
     #[test]
@@ -4480,7 +4729,10 @@ mod tests {
                         screen: None,
                         scrolled: false,
                         selection: None,
-                        toast,
+                        toast: toast.map(|message| ToastView {
+                            message,
+                            action: None,
+                        }),
                         embedded: None,
                         theme: app.theme().theme(false),
                         colors_enabled: false,

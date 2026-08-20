@@ -7,6 +7,7 @@ mod conversation_store;
 mod cwd;
 pub mod framing;
 mod git;
+pub mod harness_update;
 #[cfg(unix)]
 mod history;
 pub mod input;

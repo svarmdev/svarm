@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use svarm_agent::SessionSnapshot;
 use svarm_agent::{
     AgentId, AgentKind, ProcessExit, SessionStatus,
+    harness_update::{HarnessUpdated, HarnessVersion},
     protocol::{
         AgentActivity, AgentSnapshot, ArchivedConversation, GitContext, RecognitionEvidence,
         SessionId, SessionSummary, SvarmSessionSnapshot, UsageOverview, UsageProviderReport,
@@ -72,6 +73,48 @@ impl SettingsTab {
         let next = (current as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize;
         Self::ALL[next]
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HarnessUpdateStatus {
+    NotInstalled,
+    NotChecked,
+    Checking,
+    UpToDate {
+        current: String,
+    },
+    UpdateAvailable {
+        current: String,
+        latest: String,
+    },
+    Updating {
+        current: String,
+        latest: String,
+    },
+    CheckFailed {
+        message: String,
+    },
+    UpdateFailed {
+        current: String,
+        latest: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HarnessUpdateState {
+    pub kind: AgentKind,
+    pub status: HarnessUpdateStatus,
+}
+
+fn default_harness_updates() -> Vec<HarnessUpdateState> {
+    AgentKind::ALL
+        .into_iter()
+        .map(|kind| HarnessUpdateState {
+            kind,
+            status: HarnessUpdateStatus::NotChecked,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -493,6 +536,10 @@ pub(crate) struct App {
     menu_selected: MenuItem,
     theme: ThemeName,
     settings_tab: SettingsTab,
+    harness_updates: Vec<HarnessUpdateState>,
+    known_harness_update_releases: Vec<(AgentKind, String)>,
+    harness_settings_selection: usize,
+    harness_update_interval_minutes: u64,
     notice: Option<String>,
     notice_revision: u64,
     exit_intent: ExitIntent,
@@ -524,6 +571,10 @@ impl App {
             menu_selected: MenuItem::default(),
             theme,
             settings_tab: SettingsTab::default(),
+            harness_updates: default_harness_updates(),
+            known_harness_update_releases: Vec::new(),
+            harness_settings_selection: 0,
+            harness_update_interval_minutes: 60,
             notice,
             notice_revision: 0,
             exit_intent: ExitIntent::None,
@@ -562,6 +613,10 @@ impl App {
             menu_selected: MenuItem::default(),
             theme,
             settings_tab: SettingsTab::default(),
+            harness_updates: default_harness_updates(),
+            known_harness_update_releases: Vec::new(),
+            harness_settings_selection: 0,
+            harness_update_interval_minutes: 60,
             notice,
             notice_revision: 0,
             exit_intent: ExitIntent::None,
@@ -579,6 +634,13 @@ impl App {
             .into_iter()
             .filter(|kind| available.contains(kind))
             .collect();
+        for harness in &mut self.harness_updates {
+            if !self.available_harnesses.contains(&harness.kind) {
+                harness.status = HarnessUpdateStatus::NotInstalled;
+            } else if harness.status == HarnessUpdateStatus::NotInstalled {
+                harness.status = HarnessUpdateStatus::NotChecked;
+            }
+        }
     }
 
     pub fn available_harnesses(&self) -> &[AgentKind] {
@@ -587,6 +649,162 @@ impl App {
 
     pub fn harness_installed(&self, kind: AgentKind) -> bool {
         self.available_harnesses.contains(&kind)
+    }
+
+    pub fn harness_update(&self, kind: AgentKind) -> Option<&HarnessUpdateState> {
+        self.harness_updates
+            .iter()
+            .find(|harness| harness.kind == kind)
+    }
+
+    pub const fn harness_update_interval_minutes(&self) -> u64 {
+        self.harness_update_interval_minutes
+    }
+
+    pub fn set_harness_update_interval_minutes(&mut self, minutes: u64) {
+        self.harness_update_interval_minutes = minutes;
+    }
+
+    pub const fn harness_settings_selection(&self) -> usize {
+        self.harness_settings_selection
+    }
+
+    pub fn move_harness_settings_selection(&mut self, delta: isize) {
+        let count = AgentKind::ALL.len() + 1;
+        self.harness_settings_selection =
+            (self.harness_settings_selection as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    pub fn select_harness_settings_row(&mut self, row: usize) {
+        if row <= AgentKind::ALL.len() {
+            self.harness_settings_selection = row;
+        }
+    }
+
+    pub fn selected_harness_update_kind(&self) -> Option<AgentKind> {
+        self.harness_settings_selection
+            .checked_sub(1)
+            .and_then(|index| AgentKind::ALL.get(index))
+            .copied()
+    }
+
+    pub fn begin_harness_check(&mut self) {
+        for harness in &mut self.harness_updates {
+            if self.available_harnesses.contains(&harness.kind)
+                && !matches!(harness.status, HarnessUpdateStatus::Updating { .. })
+            {
+                harness.status = HarnessUpdateStatus::Checking;
+            }
+        }
+    }
+
+    /// Applies a complete check and returns harnesses whose available release is newly observed.
+    pub fn apply_harness_check(
+        &mut self,
+        results: Vec<(AgentKind, Result<HarnessVersion, String>)>,
+    ) -> Vec<AgentKind> {
+        let mut newly_available = Vec::new();
+        for (kind, result) in results {
+            let Some(harness) = self
+                .harness_updates
+                .iter_mut()
+                .find(|harness| harness.kind == kind)
+            else {
+                continue;
+            };
+            if !self.available_harnesses.contains(&kind) {
+                harness.status = HarnessUpdateStatus::NotInstalled;
+                continue;
+            }
+            match result {
+                Ok(version) if version.update_available => {
+                    let already_known =
+                        self.known_harness_update_releases
+                            .iter()
+                            .any(|(known_kind, latest)| {
+                                *known_kind == kind && latest == &version.latest
+                            });
+                    if !already_known {
+                        newly_available.push(kind);
+                        self.known_harness_update_releases
+                            .retain(|(known_kind, _)| *known_kind != kind);
+                        self.known_harness_update_releases
+                            .push((kind, version.latest.clone()));
+                    }
+                    harness.status = HarnessUpdateStatus::UpdateAvailable {
+                        current: version.current,
+                        latest: version.latest,
+                    };
+                }
+                Ok(version) => {
+                    harness.status = HarnessUpdateStatus::UpToDate {
+                        current: version.current,
+                    };
+                }
+                Err(message) => harness.status = HarnessUpdateStatus::CheckFailed { message },
+            }
+        }
+        newly_available
+    }
+
+    pub fn begin_harness_update(&mut self, kind: AgentKind) -> bool {
+        let Some(harness) = self
+            .harness_updates
+            .iter_mut()
+            .find(|harness| harness.kind == kind)
+        else {
+            return false;
+        };
+        let (current, latest) = match &harness.status {
+            HarnessUpdateStatus::UpdateAvailable { current, latest }
+            | HarnessUpdateStatus::UpdateFailed {
+                current, latest, ..
+            } => (current.clone(), latest.clone()),
+            _ => return false,
+        };
+        harness.status = HarnessUpdateStatus::Updating { current, latest };
+        true
+    }
+
+    pub fn apply_harness_update(
+        &mut self,
+        kind: AgentKind,
+        result: &Result<HarnessUpdated, String>,
+    ) {
+        let Some(harness) = self
+            .harness_updates
+            .iter_mut()
+            .find(|harness| harness.kind == kind)
+        else {
+            return;
+        };
+        match result {
+            Ok(updated) => {
+                harness.status = HarnessUpdateStatus::UpToDate {
+                    current: updated.current.clone(),
+                };
+            }
+            Err(message) => {
+                if let HarnessUpdateStatus::Updating { current, latest } = &harness.status {
+                    harness.status = HarnessUpdateStatus::UpdateFailed {
+                        current: current.clone(),
+                        latest: latest.clone(),
+                        message: message.clone(),
+                    };
+                } else {
+                    harness.status = HarnessUpdateStatus::CheckFailed {
+                        message: message.clone(),
+                    };
+                }
+            }
+        }
+    }
+
+    pub fn running_harness_count(&self, kind: AgentKind) -> usize {
+        self.agents
+            .iter()
+            .filter(|agent| agent.kind() == kind && agent.status() == SessionStatus::Running)
+            .count()
     }
 
     pub const fn settings_tab(&self) -> SettingsTab {
@@ -599,6 +817,11 @@ impl App {
 
     pub fn select_settings_tab(&mut self, tab: SettingsTab) {
         self.settings_tab = tab;
+    }
+
+    pub fn open_harness_settings(&mut self) {
+        self.mode = Mode::Settings;
+        self.settings_tab = SettingsTab::Harnesses;
     }
 
     pub fn open_usage(&mut self) {
@@ -1449,6 +1672,93 @@ mod tests {
 
     fn app() -> App {
         App::new("workspace".into(), ThemeName::Dark, false, None)
+    }
+
+    fn available_update(kind: AgentKind, current: &str, latest: &str) -> HarnessVersion {
+        HarnessVersion {
+            kind,
+            current: current.into(),
+            latest: latest.into(),
+            update_available: true,
+        }
+    }
+
+    #[test]
+    fn harness_checks_track_each_provider_and_only_announce_a_release_once() {
+        let mut app = app();
+        app.set_available_harnesses(vec![AgentKind::Codex, AgentKind::Claude]);
+        app.begin_harness_check();
+
+        let newly_available = app.apply_harness_check(vec![
+            (
+                AgentKind::Codex,
+                Ok(available_update(AgentKind::Codex, "0.147.0", "0.148.0")),
+            ),
+            (AgentKind::Claude, Err("release service unavailable".into())),
+        ]);
+
+        assert_eq!(newly_available, vec![AgentKind::Codex]);
+        assert!(matches!(
+            &app.harness_update(AgentKind::Codex).unwrap().status,
+            HarnessUpdateStatus::UpdateAvailable { current, latest }
+                if current == "0.147.0" && latest == "0.148.0"
+        ));
+        assert!(matches!(
+            &app.harness_update(AgentKind::Claude).unwrap().status,
+            HarnessUpdateStatus::CheckFailed { message }
+                if message == "release service unavailable"
+        ));
+        assert_eq!(
+            app.harness_update(AgentKind::Grok).unwrap().status,
+            HarnessUpdateStatus::NotInstalled
+        );
+
+        app.begin_harness_check();
+        assert!(
+            app.apply_harness_check(vec![(
+                AgentKind::Codex,
+                Ok(available_update(AgentKind::Codex, "0.147.0", "0.148.0")),
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_updates_remain_retryable_and_open_agents_are_counted() {
+        let mut app = app();
+        app.set_available_harnesses(vec![AgentKind::Codex]);
+        app.apply_harness_check(vec![(
+            AgentKind::Codex,
+            Ok(available_update(AgentKind::Codex, "0.147.0", "0.148.0")),
+        )]);
+        app.add_agent(snapshot(1, 0));
+
+        assert!(app.begin_harness_update(AgentKind::Codex));
+        app.apply_harness_update(AgentKind::Codex, &Err("permission denied".into()));
+
+        assert_eq!(app.running_harness_count(AgentKind::Codex), 1);
+        assert!(matches!(
+            &app.harness_update(AgentKind::Codex).unwrap().status,
+            HarnessUpdateStatus::UpdateFailed { message, .. } if message == "permission denied"
+        ));
+        assert!(app.begin_harness_update(AgentKind::Codex));
+    }
+
+    #[test]
+    fn harness_settings_navigation_includes_the_interval_and_every_harness() {
+        let mut app = app();
+        assert_eq!(app.harness_settings_selection(), 0);
+        app.move_harness_settings_selection(-1);
+        assert_eq!(
+            app.selected_harness_update_kind(),
+            Some(AgentKind::OpenCode)
+        );
+        app.move_harness_settings_selection(1);
+        assert_eq!(app.selected_harness_update_kind(), None);
+
+        app.open_harness_settings();
+        assert_eq!(app.mode(), Mode::Settings);
+        assert_eq!(app.settings_tab(), SettingsTab::Harnesses);
     }
 
     #[test]

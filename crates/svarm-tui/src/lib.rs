@@ -1,5 +1,6 @@
 mod agents;
 mod app;
+mod harness_updates;
 mod input;
 mod review;
 mod runtime;

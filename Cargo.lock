@@ -1067,6 +1067,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "portable-pty",
+ "semver",
  "serde",
  "serde_json",
  "terminal-colorsaurus",

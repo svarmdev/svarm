@@ -26,12 +26,13 @@ use crate::{
         App, BrowserAction, Checkout, ExitIntent, MenuItem, Mode, NewAgentField, NewAgentPage,
         WorkspaceChoice,
     },
+    harness_updates::{HarnessUpdateEvent, HarnessUpdateRuntime},
     input::{ManagementCommand, is_management_prefix, key_input, management_command, mouse_input},
     review::{HunkLaunchError, HunkReview, HunkReviewResult},
     selection::{ScrollDirection, TerminalSelection},
     settings::{Settings, SettingsStore},
     terminal::{TerminalSession, colors_enabled, nerd_fonts_enabled},
-    ui::{self, UiModel},
+    ui::{self, ToastAction, ToastView, UiModel},
     workspace::{
         DirectoryLoader, WorktreeCreateResult, WorktreeCreator, YaziLaunchError, YaziPicker,
         YaziResult,
@@ -47,6 +48,7 @@ const NOTICE_DURATION: Duration = Duration::from_secs(10);
 struct Toast {
     message: String,
     expires_at: Instant,
+    action: Option<ToastAction>,
 }
 
 #[derive(Default)]
@@ -54,6 +56,7 @@ struct InteractionState {
     selection: Option<TerminalSelection>,
     selection_scroll_at: Option<Instant>,
     toast: Option<Toast>,
+    notification: Option<Toast>,
     notice_revision: Option<u64>,
     notice_expires_at: Option<Instant>,
     resizing_sidebar: bool,
@@ -64,6 +67,7 @@ impl InteractionState {
         self.selection_scroll_at
             .into_iter()
             .chain(self.toast.as_ref().map(|toast| toast.expires_at))
+            .chain(self.notification.as_ref().map(|toast| toast.expires_at))
             .chain(self.notice_expires_at)
             .map(|deadline| deadline.saturating_duration_since(now))
             .min()
@@ -110,7 +114,60 @@ impl InteractionState {
         self.toast = Some(Toast {
             message: format!("Copied {characters} characters to clipboard"),
             expires_at: now + TOAST_DURATION,
+            action: None,
         });
+    }
+
+    fn show_harness_updates(&mut self, kinds: &[AgentKind], now: Instant) {
+        let message = if kinds.len() == 1 {
+            format!(
+                "{} update available — click or press Ctrl+B s",
+                kinds[0].label()
+            )
+        } else {
+            format!(
+                "{} harness updates available — click or press Ctrl+B s",
+                kinds.len()
+            )
+        };
+        self.notification = Some(Toast {
+            message,
+            expires_at: now + NOTICE_DURATION,
+            action: Some(ToastAction::OpenHarnessSettings),
+        });
+    }
+
+    fn show_update_result(&mut self, message: String, now: Instant) {
+        self.notification = Some(Toast {
+            message,
+            expires_at: now + NOTICE_DURATION,
+            action: None,
+        });
+    }
+
+    fn visible_toast(&self) -> Option<&Toast> {
+        self.toast.as_ref().or(self.notification.as_ref())
+    }
+
+    fn visible_toast_view(&self) -> Option<ToastView<'_>> {
+        self.visible_toast().map(|toast| ToastView {
+            message: &toast.message,
+            action: toast.action,
+        })
+    }
+
+    fn dismiss_redundant_harness_notification(&mut self, app: &App) -> bool {
+        if app.mode() != Mode::Settings
+            || app.settings_tab() != crate::app::SettingsTab::Harnesses
+            || !self
+                .notification
+                .as_ref()
+                .is_some_and(|toast| toast.action == Some(ToastAction::OpenHarnessSettings))
+        {
+            return false;
+        }
+        self.notification = None;
+        true
     }
 
     fn tick(&mut self, agents: &mut RemoteAgents, now: Instant) -> Result<bool> {
@@ -121,6 +178,14 @@ impl InteractionState {
             .is_some_and(|toast| toast.expires_at <= now)
         {
             self.toast = None;
+            dirty = true;
+        }
+        if self
+            .notification
+            .as_ref()
+            .is_some_and(|toast| toast.expires_at <= now)
+        {
+            self.notification = None;
             dirty = true;
         }
         if self
@@ -202,6 +267,13 @@ pub fn run(
     let mut app = App::hydrate(snapshot, settings_value.theme, settings_notice);
     app.set_sidebar_width(settings_value.sidebar_width);
     app.set_available_harnesses(available_harnesses);
+    let harness_update_interval = settings_value.effective_harness_update_interval_minutes();
+    app.set_harness_update_interval_minutes(harness_update_interval);
+    let mut harness_updates =
+        HarnessUpdateRuntime::new(events_tx.clone(), harness_update_interval, Instant::now())?;
+    if harness_updates.request_check(app.available_harnesses(), Instant::now()) {
+        app.begin_harness_check();
+    }
     let explicit_kind = initial_agent.kind;
     let explicit_workspace = initial_agent.workspace;
     let default_kind = explicit_kind.or(settings_value.last_agent);
@@ -242,7 +314,13 @@ pub fn run(
         let now = Instant::now();
         interaction.observe_notice(&app, now);
         dirty |= interaction.dismiss_expired_notice(&mut app, now);
+        dirty |= interaction.dismiss_redundant_harness_notification(&app);
         dirty |= interaction.tick(&mut agents, now)?;
+        if harness_updates.tick(app.available_harnesses(), now) {
+            app.begin_harness_check();
+            dirty = true;
+        }
+        dirty |= drain_harness_updates(&mut app, &mut interaction, &mut harness_updates, now);
         if let Some(result) = review.poll(now) {
             finish_hunk_review(&mut app, &mut agents, result)?;
             dirty = true;
@@ -269,10 +347,7 @@ pub fn run(
                         .filter(|selection| selection.agent_id() == id)
                         .and_then(|selection| selection.visible(screen))
                 }),
-                toast: interaction
-                    .toast
-                    .as_ref()
-                    .map(|toast| toast.message.as_str()),
+                toast: interaction.visible_toast_view(),
                 embedded: embedded.as_ref(),
                 now_ms: crate::startup::unix_time_ms(),
                 theme: app.theme().theme(colors_enabled),
@@ -300,6 +375,7 @@ pub fn run(
             .next_timeout(now)
             .into_iter()
             .chain(review.next_timeout(now))
+            .chain(Some(harness_updates.next_timeout(now)))
             .min();
         let first = if let Some(timeout) = timeout {
             match events.recv_timeout(timeout) {
@@ -367,6 +443,7 @@ pub fn run(
                         browser: &mut browser,
                         review: &mut review,
                         worktrees: &worktrees,
+                        harness_updates: &mut harness_updates,
                         host_area,
                     };
                     dirty |= handle_host_event(
@@ -401,6 +478,14 @@ pub fn run(
                         finish_hunk_review(&mut app, &mut agents, result)?;
                     }
                     dirty = true;
+                }
+                ClientEvent::HarnessUpdateReady => {
+                    dirty |= drain_harness_updates(
+                        &mut app,
+                        &mut interaction,
+                        &mut harness_updates,
+                        Instant::now(),
+                    );
                 }
             }
         }
@@ -484,10 +569,14 @@ fn handle_host_event(
         }
         HostEvent::Mouse(mouse) => {
             let area = terminal.terminal().size()?.into();
+            let previous_toast_hover =
+                pointer.is_some_and(|(column, row)| toast_hovered(interaction, area, column, row));
             let previous =
                 pointer.and_then(|(column, row)| ui::hover_action(app, area, column, row));
             *pointer = Some((mouse.column, mouse.row));
             dirty |= previous != ui::hover_action(app, area, mouse.column, mouse.row);
+            dirty |=
+                previous_toast_hover != toast_hovered(interaction, area, mouse.column, mouse.row);
             let (resize, redraw) = handle_mouse(
                 app,
                 agents,
@@ -599,6 +688,65 @@ fn apply_remote_update(
             dirty = true;
         }
         RemoteUpdate::Disconnected(error) => *connection_failure = Some(error),
+    }
+    dirty
+}
+
+fn apply_harness_update_event(
+    app: &mut App,
+    interaction: &mut InteractionState,
+    event: HarnessUpdateEvent,
+    now: Instant,
+) {
+    match event {
+        HarnessUpdateEvent::Checked(results) => {
+            let newly_available = app.apply_harness_check(results);
+            if !newly_available.is_empty() {
+                interaction.show_harness_updates(&newly_available, now);
+            }
+        }
+        HarnessUpdateEvent::Updated { kind, result } => {
+            let running = app.running_harness_count(kind);
+            app.apply_harness_update(kind, &result);
+            match result {
+                Ok(updated) => {
+                    let message = if running == 0 {
+                        format!(
+                            "{} updated to {}; new sessions will use it",
+                            kind.label(),
+                            updated.current
+                        )
+                    } else {
+                        format!(
+                            "{} updated to {}; restart {running} open {} session{} to use it",
+                            kind.label(),
+                            updated.current,
+                            kind.label(),
+                            if running == 1 { "" } else { "s" }
+                        )
+                    };
+                    interaction.show_update_result(message, now);
+                }
+                Err(error) => {
+                    interaction.notification = None;
+                    app.set_notice(error);
+                }
+            }
+        }
+    }
+}
+
+fn drain_harness_updates(
+    app: &mut App,
+    interaction: &mut InteractionState,
+    updates: &mut HarnessUpdateRuntime,
+    now: Instant,
+) -> bool {
+    let events = updates.poll();
+    let dirty = !events.is_empty();
+    for event in events {
+        updates.finish(&event);
+        apply_harness_update_event(app, interaction, event, now);
     }
     dirty
 }
@@ -732,6 +880,36 @@ fn handle_key(
             {
                 save_theme(app, resources.settings_store, resources.settings, 1)
             }
+            KeyCode::Char('j') | KeyCode::Down
+                if app.settings_tab() == crate::app::SettingsTab::Harnesses =>
+            {
+                app.move_harness_settings_selection(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if app.settings_tab() == crate::app::SettingsTab::Harnesses =>
+            {
+                app.move_harness_settings_selection(-1)
+            }
+            KeyCode::Char('h') | KeyCode::Left
+                if app.settings_tab() == crate::app::SettingsTab::Harnesses
+                    && app.harness_settings_selection() == 0 =>
+            {
+                save_harness_update_interval(app, resources, -1)
+            }
+            KeyCode::Char('l') | KeyCode::Right
+                if app.settings_tab() == crate::app::SettingsTab::Harnesses
+                    && app.harness_settings_selection() == 0 =>
+            {
+                save_harness_update_interval(app, resources, 1)
+            }
+            KeyCode::Char('r') if app.settings_tab() == crate::app::SettingsTab::Harnesses => {
+                request_harness_check(app, resources.harness_updates)
+            }
+            KeyCode::Enter | KeyCode::Char('u')
+                if app.settings_tab() == crate::app::SettingsTab::Harnesses =>
+            {
+                request_selected_harness_update(app, resources.harness_updates)
+            }
             KeyCode::Esc | KeyCode::Char('q') => app.set_mode(Mode::Menu),
             _ => {}
         },
@@ -848,6 +1026,7 @@ fn handle_management_command(
             // Show whatever is cached immediately and re-probe behind it.
             agents.request_usage(true)?;
         }
+        ManagementCommand::OpenHarnessUpdates => app.open_harness_settings(),
         ManagementCommand::OpenReview => resources.review.open(app, resources.host_area),
         ManagementCommand::SelectAgent(index) => {
             if app.select_sidebar_index(index) {
@@ -904,6 +1083,12 @@ fn handle_mouse(
     mouse: MouseEvent,
     area: Rect,
 ) -> Result<(bool, bool)> {
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(action) = take_toast_action(interaction, area, mouse.column, mouse.row)
+    {
+        apply_toast_action(app, action);
+        return Ok((false, true));
+    }
     if let Some(result) = handle_sidebar_resize(app, resources, interaction, mouse, area) {
         return Ok(result);
     }
@@ -1026,6 +1211,33 @@ fn handle_mouse(
     };
     agents.mouse(id, mouse_input(translated))?;
     Ok((false, redraw))
+}
+
+fn toast_hovered(interaction: &InteractionState, area: Rect, column: u16, row: u16) -> bool {
+    interaction.visible_toast().is_some_and(|toast| {
+        toast.action.is_some() && contains(ui::toast_area(&toast.message, area), column, row)
+    })
+}
+
+fn take_toast_action(
+    interaction: &mut InteractionState,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<ToastAction> {
+    let toast = interaction.visible_toast()?;
+    if !contains(ui::toast_area(&toast.message, area), column, row) {
+        return None;
+    }
+    let action = toast.action?;
+    interaction.notification = None;
+    Some(action)
+}
+
+fn apply_toast_action(app: &mut App, action: ToastAction) {
+    match action {
+        ToastAction::OpenHarnessSettings => app.open_harness_settings(),
+    }
 }
 
 fn relative_mouse(mouse: MouseEvent, area: Rect) -> MouseEvent {
@@ -1182,6 +1394,38 @@ fn apply_click_action(
         }
         ui::ClickAction::SettingsTab(tab) => {
             app.select_settings_tab(tab);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessIntervalPrevious => {
+            app.select_harness_settings_row(0);
+            save_harness_update_interval(app, resources, -1);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessIntervalNext => {
+            app.select_harness_settings_row(0);
+            save_harness_update_interval(app, resources, 1);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessRow(row) => {
+            app.select_harness_settings_row(row);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessCheck => {
+            request_harness_check(app, resources.harness_updates);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessUpdate(kind) => {
+            if let Some(index) = AgentKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+            {
+                app.select_harness_settings_row(index + 1);
+            }
+            request_harness_update(app, resources.harness_updates, kind);
+            Ok((false, true))
+        }
+        ui::ClickAction::HarnessUpdateSelected => {
+            request_selected_harness_update(app, resources.harness_updates);
             Ok((false, true))
         }
         ui::ClickAction::UsageTab(kind) => {
@@ -1388,6 +1632,7 @@ struct InteractionResources<'a> {
     browser: &'a mut BrowserRuntime,
     review: &'a mut ReviewRuntime,
     worktrees: &'a WorktreeCreator,
+    harness_updates: &'a mut HarnessUpdateRuntime,
     host_area: Rect,
 }
 
@@ -1911,6 +2156,48 @@ fn save_theme(
     }
 }
 
+fn save_harness_update_interval(
+    app: &mut App,
+    resources: &mut InteractionResources<'_>,
+    delta: isize,
+) {
+    resources.settings.cycle_harness_update_interval(delta);
+    let minutes = resources.settings.harness_update_interval_minutes;
+    app.set_harness_update_interval_minutes(minutes);
+    resources
+        .harness_updates
+        .set_interval(minutes, Instant::now());
+    match resources.settings_store.save(resources.settings) {
+        Ok(()) => app.clear_notice(),
+        Err(error) => app.set_notice(error),
+    }
+}
+
+fn request_harness_check(app: &mut App, updates: &mut HarnessUpdateRuntime) {
+    if updates.request_check(app.available_harnesses(), Instant::now()) {
+        app.begin_harness_check();
+    }
+}
+
+fn request_selected_harness_update(app: &mut App, updates: &mut HarnessUpdateRuntime) {
+    if let Some(kind) = app.selected_harness_update_kind() {
+        request_harness_update(app, updates, kind);
+    }
+}
+
+fn request_harness_update(app: &mut App, updates: &mut HarnessUpdateRuntime, kind: AgentKind) {
+    let available = app.harness_update(kind).is_some_and(|harness| {
+        matches!(
+            harness.status,
+            crate::app::HarnessUpdateStatus::UpdateAvailable { .. }
+                | crate::app::HarnessUpdateStatus::UpdateFailed { .. }
+        )
+    });
+    if available && updates.request_update(kind) {
+        debug_assert!(app.begin_harness_update(kind));
+    }
+}
+
 fn save_sidebar_width(app: &mut App, settings_store: &SettingsStore, settings: &mut Settings) {
     settings.sidebar_width = app.sidebar_width();
     match settings_store.save(settings) {
@@ -2065,6 +2352,109 @@ mod tests {
         );
         assert!(interaction.dismiss_expired_notice(&mut app, restarted_at + NOTICE_DURATION));
         assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn a_new_harness_release_creates_one_actionable_notification() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        app.set_available_harnesses(vec![AgentKind::Codex]);
+        let result = || {
+            HarnessUpdateEvent::Checked(vec![(
+                AgentKind::Codex,
+                Ok(svarm_agent::harness_update::HarnessVersion {
+                    kind: AgentKind::Codex,
+                    current: "0.147.0".into(),
+                    latest: "0.148.0".into(),
+                    update_available: true,
+                }),
+            )])
+        };
+        let mut interaction = InteractionState::default();
+        let now = Instant::now();
+
+        apply_harness_update_event(&mut app, &mut interaction, result(), now);
+        let toast = interaction.visible_toast().unwrap();
+        assert!(toast.message.contains("Codex update available"));
+        assert_eq!(toast.action, Some(ToastAction::OpenHarnessSettings));
+
+        interaction.notification = None;
+        apply_harness_update_event(&mut app, &mut interaction, result(), now);
+        assert!(interaction.notification.is_none());
+    }
+
+    #[test]
+    fn harness_update_toast_hitbox_produces_the_navigation_action() {
+        let now = Instant::now();
+        let mut interaction = InteractionState::default();
+        interaction.show_harness_updates(&[AgentKind::Codex], now);
+        let area = Rect::new(0, 0, 80, 24);
+        let toast = interaction.visible_toast().unwrap();
+        let hitbox = ui::toast_area(&toast.message, area);
+
+        assert_eq!(
+            take_toast_action(&mut interaction, area, hitbox.x, hitbox.y),
+            Some(ToastAction::OpenHarnessSettings)
+        );
+        assert!(interaction.notification.is_none());
+
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        apply_toast_action(&mut app, ToastAction::OpenHarnessSettings);
+        assert_eq!(app.mode(), Mode::Settings);
+        assert_eq!(app.settings_tab(), crate::app::SettingsTab::Harnesses);
+    }
+
+    #[test]
+    fn successful_update_explains_that_open_harnesses_need_restart() {
+        let mut app = App::new(
+            "workspace".into(),
+            crate::theme::ThemeName::Dark,
+            false,
+            None,
+        );
+        app.set_available_harnesses(vec![AgentKind::Codex]);
+        app.add_agent(SessionSnapshot {
+            id: AgentId::new(1),
+            kind: AgentKind::Codex,
+            launch_directory: PathBuf::from("/tmp/workspace"),
+            status: SessionStatus::Running,
+            output_generation: 0,
+            read_error: None,
+            exit: None,
+            conversation_id: None,
+        });
+        let mut interaction = InteractionState::default();
+
+        apply_harness_update_event(
+            &mut app,
+            &mut interaction,
+            HarnessUpdateEvent::Updated {
+                kind: AgentKind::Codex,
+                result: Ok(svarm_agent::harness_update::HarnessUpdated {
+                    kind: AgentKind::Codex,
+                    previous: "0.147.0".into(),
+                    current: "0.148.0".into(),
+                }),
+            },
+            Instant::now(),
+        );
+
+        assert!(
+            interaction
+                .visible_toast()
+                .unwrap()
+                .message
+                .contains("restart 1 open Codex session")
+        );
     }
 
     #[test]
