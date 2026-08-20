@@ -6,7 +6,7 @@ Svarm is a terminal workspace for coding agents. It runs the native agent harnes
 
 ## Install and run
 
-Codex, Claude Code, Grok Build, and/or Pi must already be installed and available on `PATH`.
+Codex, Claude Code, Grok Build, Pi, and/or OpenCode must already be installed and available on `PATH`.
 
 Yazi is optional. When installed, Svarm can use it for browsing directories; otherwise it uses its built-in browser.
 
@@ -34,6 +34,7 @@ svarm --agent codex .         # Start Codex here
 svarm --agent claude ../repo  # Claude Code in ../repo
 svarm --agent grok .          # Grok Build here
 svarm --agent pi .            # Pi here
+svarm --agent opencode .      # OpenCode here
 svarm --new-session ../repo   # New session; seed the new-agent form
 svarm --attach                # Attach only; never create
 svarm list                    # List live Svarm sessions
@@ -58,6 +59,19 @@ needed. To review the script before running it, download it separately and run
 
 Svarm requires a terminal of at least 80 columns by 24 rows. `NO_COLOR` applies to
 Svarm's sidebar and custom UI; native agent applications keep control of their own colors.
+
+## Harness updates
+
+Svarm checks every installed harness for stable updates when the UI starts and once per hour
+afterward. Press `Ctrl+B s`, or open **Settings → Harnesses**, to inspect Codex, Claude Code,
+Grok Build, Pi, and OpenCode, check immediately, install an available update, or change the
+interval to 15 or 30 minutes; 1, 3, 6, 12, or 24 hours. The interval is saved in the user settings
+file.
+
+A newly available release produces a clickable toast that opens the Harnesses tab. Updating a
+harness never stops an open agent: new sessions use the updated executable, while existing sessions
+continue on their running version until they are restarted. Svarm reports the number of affected
+open sessions after an update.
 
 ## Diff review with Hunk
 
