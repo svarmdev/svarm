@@ -588,12 +588,18 @@ impl SessionRuntime {
                 "conversation is not resumable yet",
             )
         })?;
-        let title = observed.conversation_title.clone().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                "unnamed conversations cannot be archived",
-            )
-        })?;
+        let title = self
+            .input_drafts
+            .get(&id)
+            .and_then(InputDraft::title)
+            .map(str::to_owned)
+            .or_else(|| observed.conversation_title.clone())
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    "unnamed conversations cannot be archived",
+                )
+            })?;
         let conversation = ArchivedConversation {
             conversation_id,
             title,
@@ -1036,23 +1042,43 @@ impl SessionRuntime {
         self.agents.terminal_modes(id)
     }
 
-    fn record_key(&mut self, id: AgentId, input: &KeyInput) {
-        if self
-            .input_drafts
-            .get_mut(&id)
-            .is_some_and(|draft| draft.apply_key(input))
-        {
+    fn record_key(&mut self, id: AgentId, input: &KeyInput) -> bool {
+        let Some(draft) = self.input_drafts.get_mut(&id) else {
+            return false;
+        };
+        let should_name = draft.apply_key(input);
+        let quit_requested = draft.quit_requested;
+        if should_name {
             self.request_name(id);
         }
+        quit_requested
     }
 
-    fn record_paste(&mut self, id: AgentId, text: &str) {
-        if self
-            .input_drafts
-            .get_mut(&id)
-            .is_some_and(|draft| draft.apply_paste(text))
-        {
+    fn record_paste(&mut self, id: AgentId, text: &str) -> bool {
+        let Some(draft) = self.input_drafts.get_mut(&id) else {
+            return false;
+        };
+        let should_name = draft.apply_paste(text);
+        let quit_requested = draft.quit_requested;
+        if should_name {
             self.request_name(id);
+        }
+        quit_requested
+    }
+
+    fn quit_event(&mut self, id: AgentId, now_ms: u64) -> Event {
+        let result = self.archive_after_quit(id, now_ms);
+        let revision = self.state.revision();
+        match result {
+            Ok(conversation) => Event::AgentArchived {
+                revision,
+                agent_id: id,
+                conversation,
+            },
+            Err(_) => Event::AgentRemoved {
+                revision,
+                agent_id: id,
+            },
         }
     }
 
@@ -1978,8 +2004,12 @@ impl Server {
                 let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
                 let bytes = encode_key(&event, modes).unwrap_or_default();
                 runtime.send_input(agent_id, &bytes, now)?;
-                runtime.record_key(agent_id, &event);
-                Ok(Outcome::new(Response::Ok))
+                let quit_requested = runtime.record_key(agent_id, &event);
+                let mut outcome = Outcome::new(Response::Ok);
+                if quit_requested {
+                    outcome.events.push((id, runtime.quit_event(agent_id, now)));
+                }
+                Ok(outcome)
             }
             Request::Paste {
                 lease_token,
@@ -1992,8 +2022,12 @@ impl Server {
                 let modes = runtime.input_modes(agent_id).ok_or_else(agent_not_found)?;
                 let bytes = encode_paste(&text, modes);
                 runtime.send_input(agent_id, &bytes, now)?;
-                runtime.record_paste(agent_id, &text);
-                Ok(Outcome::new(Response::Ok))
+                let quit_requested = runtime.record_paste(agent_id, &text);
+                let mut outcome = Outcome::new(Response::Ok);
+                if quit_requested {
+                    outcome.events.push((id, runtime.quit_event(agent_id, now)));
+                }
+                Ok(outcome)
             }
             Request::Mouse {
                 lease_token,
@@ -3257,6 +3291,44 @@ mod tests {
             runtime.snapshot().archived[0].conversation_id,
             conversation_id
         );
+    }
+
+    #[test]
+    fn quit_command_archives_and_closes_before_the_child_exits() {
+        let cwd = std::env::current_dir().unwrap();
+        let conversation_id = "019ff1d3-375e-7a72-a176-c47497827e49";
+        let script = format!("printf '\\033]2;Ready | {conversation_id}\\a'; exec sleep 60");
+        let state = ServerSessionState::new(SessionId(1), 24, 80, None, 0).unwrap();
+        let mut runtime = SessionRuntime::new(state, None);
+        let config = ServerConfig::new(cwd.join("unused.sock"), "test")
+            .with_test_agent_command("sh", &["-c", &script]);
+        let snapshot = runtime.spawn(AgentKind::Codex, &cwd, 0, &config).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().agents[0].conversation_id.as_deref() != Some(conversation_id)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            runtime.poll_events();
+        }
+        runtime.record_paste(snapshot.id, "implement the sidebar\n");
+        runtime.poll_events();
+        assert!(runtime.record_paste(snapshot.id, "/exit\n"));
+
+        let event = runtime.quit_event(snapshot.id, 0);
+        assert!(matches!(
+            event,
+            Event::AgentArchived {
+                conversation: ArchivedConversation {
+                    conversation_id: id,
+                    title,
+                    ..
+                },
+                ..
+            } if id == conversation_id && title == "implement the sidebar"
+        ));
+        assert!(runtime.snapshot().agents.is_empty());
+        assert_eq!(runtime.snapshot().archived.len(), 1);
     }
 
     #[test]
